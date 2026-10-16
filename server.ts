@@ -1,0 +1,1592 @@
+/**
+ * bb-plugin-radar — backend entry.
+ *
+ * A live, storage-free view of the PR/issue queues that need you. Each "lane"
+ * is a saved query over one or more hosts: GitHub (`gh api graphql` search) and,
+ * when configured in settings, a Gitstream repo (`gs api repos/<repo>/pulls`) and a
+ * Delta repo (`dt api search/issues`). The server polls every lane on an interval, keeps
+ * only the latest result in memory, and pushes a realtime signal so the panel
+ * re-reads it. The only persisted state is configuration: the lane list and
+ * which items you have already seen (so new arrivals can be badged).
+ *
+ * "Track something" sends a natural-language description to an OpenAI-compatible
+ * endpoint (set in settings), which drafts a lane; the panel previews its live results before you
+ * add it.
+ */
+import { execFile } from "node:child_process";
+import { homedir } from "node:os";
+import { promisify } from "node:util";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+
+const DEFAULT_AI_BASE_URL = "https://api.openai.com";
+const DEFAULT_AI_KEY_ENV = "OPENAI_API_KEY";
+const DEFAULT_AI_MODEL = "gpt-4.1-mini";
+import {
+  applyFilter,
+  findSection,
+  threadsToSection,
+  DEFAULT_LANES,
+  draftPrompt,
+  fromGithubNode,
+  GITHUB_SEARCH_GRAPHQL,
+  githubSearchQuery,
+  withWindow,
+  DEFAULT_MAX_AGE_DAYS,
+  maxAgeDays,
+  deltaArgs,
+  deltaQuery,
+  fromDelta,
+  SOURCE_LABEL,
+  type Source,
+  fromGitstream,
+  gitstreamArgs,
+  laneSchema,
+  lanesSchema,
+  MAX_LANES,
+  parseDraft,
+  slugify,
+  type Item,
+  type Lane,
+  classifyToolError,
+  gitstreamFallbackEmail,
+  laneQueryKey,
+  markNew,
+  remoteRepo,
+  reviewPrompt,
+  reviewTitle,
+  CATEGORIES,
+  itemInView,
+  laneInView,
+  requestedCategory,
+  type View,
+} from "./lanes";
+import { enabledSources } from "./lanes";
+import { hosts, hostsSchema, readHosts, setHosts } from "./hosts";
+import { actionFor, DEFAULT_SKILL_SETTINGS, hostSkillFor, selectedSkills, withSkillMention } from "./review-skills";
+import {
+  applyScopeOp,
+  catalogKeys,
+  describeScope,
+  effectiveScope,
+  EMPTY_SCOPE,
+  FOCUS_OFF,
+  focusPrompt,
+  focusStateSchema,
+  heuristicFocus,
+  isActive,
+  parseFocusReply,
+  type FocusState,
+  itemAreas,
+  resolveScope,
+  scopeCatalog,
+  scopeFilterSchema,
+  scopePredicate,
+  type ScopeEntry,
+  type ScopeFilter,
+  type ScopeOp,
+} from "./scope";
+import {
+  classifyRebaseFailure,
+  githubCompareArgs,
+  githubPrArgs,
+  githubRebaseArgs,
+  gitstreamPrArgs,
+  gitstreamRebaseArgs,
+  gitstreamRebaseResult,
+  parseRebaseTarget,
+  REBASE_SOURCES,
+  REPO_PATTERN,
+  verifyGithubPr,
+  verifyGitstreamPr,
+  type RebaseResult,
+  type RebaseTarget,
+} from "./rebase";
+
+const run = promisify(execFile);
+
+const CHANGED = "radar-changed";
+const TOOL_TIMEOUT_MS = 30_000;
+const AI_TIMEOUT_MS = 45_000;
+const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+const LANE_CONCURRENCY = 3;
+const CLI_ROW_LIMIT = 80;
+
+/** The bb server may start with a GUI-app PATH; add the usual dev toolchain dirs. */
+const EXTRA_PATH = [
+  `${homedir()}/.local/state/tec/toolchain/base_profile/bin`,
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/opt/dev/bin",
+];
+const toolEnv = {
+  ...process.env,
+  PATH: [process.env.PATH ?? "", ...EXTRA_PATH].filter(Boolean).join(":"),
+  GH_PROMPT_DISABLED: "1",
+  NO_COLOR: "1",
+};
+
+class UserError extends Error {}
+
+// ---------------------------------------------------------------------------
+// RPC contract (types shared with app.tsx)
+// ---------------------------------------------------------------------------
+
+const itemSchema = z.object({
+  key: z.string(),
+  source: z.enum(["gitstream", "delta", "github"]),
+  kind: z.enum(["pr", "issue"]),
+  repo: z.string(),
+  number: z.number(),
+  title: z.string(),
+  url: z.string(),
+  author: z.string(),
+  draft: z.boolean(),
+  state: z.string(),
+  labels: z.array(z.string()),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  isNew: z.boolean(),
+});
+
+const laneResultSchema = z.object({
+  laneId: z.string(),
+  items: z.array(itemSchema),
+  /** Rows the provider returned before client-side filters. */
+  fetched: z.number(),
+  error: z.string(),
+  fetchedAt: z.string(),
+  loading: z.boolean(),
+});
+
+const snapshotSchema = z.object({
+  lanes: z.array(z.any()),
+  results: z.record(z.string(), laneResultSchema),
+  fetchedAt: z.string(),
+  refreshing: z.boolean(),
+  githubLogin: z.string(),
+  /** Your Gitstream principal (email), as Gitstream items carry it in `author`. */
+  gitstreamLogin: z.string(),
+  /** Item key → bb thread started from Radar for it. */
+  reviews: z.record(z.string(), z.object({ threadId: z.string(), at: z.string() })),
+  ai: z.object({ available: z.boolean(), model: z.string(), detail: z.string() }),
+  /** Focus filter in effect (empty while Focus is off), applied to every lane, view and the rail badge. */
+  scope: scopeFilterSchema,
+  /** Focus mode: the described focus, kept while off so it can be resumed. */
+  focus: focusStateSchema,
+  /** Host skills Radar threads invoke, so rows can name them before a thread starts. */
+  /** The "Max age" setting in days (0 = no limit), for the lane editor's hint. */
+  maxAgeDays: z.number(),
+  /** Configured Gitstream / Delta hosts and area repo; the panel mirrors them. */
+  hosts: hostsSchema,
+  skills: z.object({ reviewSkill: z.string(), gitstreamReviewSkill: z.string(), triageSkill: z.string() }),
+});
+
+export type RadarItem = z.infer<typeof itemSchema>;
+export type ReviewContext = { title: string; prompt: string; defaultProjectId: string | null };
+export type LaneResult = z.infer<typeof laneResultSchema>;
+export type RadarSnapshot = Omit<z.infer<typeof snapshotSchema>, "lanes"> & { lanes: Lane[] };
+export type { FocusState, Lane, RebaseResult, ScopeEntry, ScopeFilter };
+
+export const rpcContract = defineRpcContract({
+  radar_snapshot: { input: z.null(), output: z.any() },
+  radar_refresh: { input: z.object({ laneId: z.string().optional() }).nullable(), output: z.any() },
+  radar_lane_upsert: { input: z.object({ lane: z.any() }), output: z.any() },
+  radar_lane_delete: { input: z.object({ laneId: z.string() }), output: z.any() },
+  radar_lanes_reorder: { input: z.object({ ids: z.array(z.string()) }), output: z.any() },
+  radar_lanes_reset: { input: z.null(), output: z.any() },
+  radar_mark_seen: {
+    /** `view` limits it to what that view shows; `kind` is the pre-category form (pr = prs, issue = issues). */
+    input: z.object({ laneId: z.string().optional(), view: z.enum(CATEGORIES).optional(), kind: z.enum(["pr", "issue"]).optional() }),
+    output: z.any(),
+  },
+  /** Seeds bb's new-thread composer for reviewing one item. */
+  radar_review_context: { input: z.object({ key: z.string() }), output: z.any() },
+  /** Spawns the review thread from the composer's resolved request. */
+  radar_review_start: {
+    input: z.object({ key: z.string(), request: z.record(z.string(), z.unknown()) }),
+    output: z.object({ threadId: z.string() }),
+  },
+  /** Edits the focus filter: focus (replace), add-focus, hide, show, clear. */
+  radar_scope: {
+    input: z.object({ op: z.enum(["focus", "add-focus", "hide", "show", "clear"]), keys: z.array(z.string().max(200)).max(60) }),
+    output: z.any(),
+  },
+  /** Turns a plain-English focus ("no billing stuff") into the filter and turns Focus on. */
+  radar_focus_describe: { input: z.object({ description: z.string().trim().min(2).max(600) }), output: z.any() },
+  /** Turns Focus off (board back to normal) or resumes the last focus. */
+  radar_focus_set: { input: z.object({ enabled: z.boolean() }), output: z.any() },
+  radar_draft: {
+    input: z.object({ description: z.string().min(3).max(600) }),
+    output: z.any(),
+  },
+  /** Server-side rebase of one of your open PRs; authorship and state are re-checked on the host. */
+  radar_rebase: {
+    input: z.object({
+      source: z.enum(["github", "gitstream", "delta"]),
+      repo: z.string().max(200).regex(REPO_PATTERN),
+      number: z.number().int().positive().max(1e9),
+    }),
+    output: z.object({ status: z.enum(["rebased", "up-to-date"]), message: z.string(), headSha: z.string() }),
+  },
+});
+
+export type DraftResult = { lane: Lane; preview: LaneResult };
+
+// ---------------------------------------------------------------------------
+
+export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    refreshSeconds: {
+      type: "number",
+      label: "Refresh interval in seconds (min 30)",
+      default: 90,
+      experimental_schema: z.number().finite().min(30),
+    },
+    maxAgeDays: {
+      type: "number",
+      label: "Max age in days: hide anything not updated for longer, in every lane (0 = no limit)",
+      default: DEFAULT_MAX_AGE_DAYS,
+      experimental_schema: z.number().finite().int().min(0).max(3650),
+    },
+    ghPath: { type: "string", label: "GitHub CLI executable", default: "gh" },
+    gitstreamRepo: { type: "string", label: "Gitstream repo, owner/name (empty = Gitstream off)", default: "" },
+    gitstreamWebUrl: { type: "string", label: "Gitstream web URL PRs open at, https origin (e.g. https://gitstream.example.com)", default: "" },
+    gitstreamLabel: { type: "string", label: "Name shown for Gitstream", default: "Gitstream" },
+    gsPath: { type: "string", label: "Gitstream CLI executable", default: "gs" },
+    deltaHost: { type: "string", label: "Delta host name (e.g. delta.example.com)", default: "" },
+    deltaRepo: { type: "string", label: "Delta repo, owner/name (empty = Delta off)", default: "" },
+    deltaLabel: { type: "string", label: "Name shown for Delta", default: "Delta" },
+    dtPath: { type: "string", label: "Delta CLI executable", default: "dt" },
+    areaRepo: {
+      type: "string",
+      label: "Monorepo whose //path labels become Focus areas, owner/name (empty = none)",
+      default: "",
+    },
+    aiModel: {
+      type: "string",
+      label: "Model for drafting lanes and focus",
+      default: DEFAULT_AI_MODEL,
+    },
+    aiBaseUrl: {
+      type: "string",
+      label: "OpenAI-compatible https base URL for drafting (receives the key below; /v1/chat/completions is appended)",
+      default: DEFAULT_AI_BASE_URL,
+    },
+    aiKeyEnv: {
+      type: "string",
+      label: "Environment variable holding the AI key",
+      default: DEFAULT_AI_KEY_ENV,
+    },
+    draftNotes: {
+      type: "string",
+      label: "Notes for the lane drafter: your repos, teams and labels, in plain words (optional)",
+      default: "",
+    },
+    reviewSection: {
+      type: "string",
+      label: "Thread section for review threads (created if missing; empty = none)",
+      default: "Reviews",
+    },
+    reviewSkill: {
+      type: "string",
+      label: "Skill to invoke when reviewing a GitHub or Delta PR (empty = none)",
+      default: DEFAULT_SKILL_SETTINGS.reviewSkill,
+    },
+    gitstreamReviewSkill: {
+      type: "string",
+      label: "Skill to invoke when reviewing a Gitstream PR (empty = none)",
+      default: DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill,
+    },
+    triageSkill: {
+      type: "string",
+      label: "Skill to invoke when triaging an issue (empty = none)",
+      default: DEFAULT_SKILL_SETTINGS.triageSkill,
+    },
+  });
+  type Config = {
+    refreshSeconds: number;
+    maxAgeDays: number;
+    gitstreamRepo: string;
+    gitstreamWebUrl: string;
+    gitstreamLabel: string;
+    deltaHost: string;
+    deltaRepo: string;
+    deltaLabel: string;
+    areaRepo: string;
+    draftNotes: string;
+    gsPath: string;
+    ghPath: string;
+    dtPath: string;
+    aiModel: string;
+    aiBaseUrl: string;
+    aiKeyEnv: string;
+    reviewSection: string;
+    reviewSkill: string;
+    gitstreamReviewSkill: string;
+    triageSkill: string;
+  };
+  const readConfig = (values: Config): Config => ({
+    refreshSeconds: Number.isFinite(values.refreshSeconds) ? Math.max(30, values.refreshSeconds) : 90,
+    maxAgeDays: values.maxAgeDays === undefined ? DEFAULT_MAX_AGE_DAYS : maxAgeDays(values.maxAgeDays),
+    gitstreamRepo: values.gitstreamRepo ?? "",
+    gitstreamWebUrl: values.gitstreamWebUrl ?? "",
+    gitstreamLabel: values.gitstreamLabel ?? "",
+    deltaHost: values.deltaHost ?? "",
+    deltaRepo: values.deltaRepo ?? "",
+    deltaLabel: values.deltaLabel ?? "",
+    areaRepo: values.areaRepo ?? "",
+    draftNotes: (values.draftNotes ?? "").trim(),
+    gsPath: values.gsPath.trim() || "gs",
+    ghPath: values.ghPath.trim() || "gh",
+    dtPath: (values.dtPath ?? "").trim() || "dt",
+    aiModel: values.aiModel.trim() || DEFAULT_AI_MODEL,
+    aiBaseUrl: aiBaseUrl(values.aiBaseUrl),
+    aiKeyEnv: values.aiKeyEnv.trim() || DEFAULT_AI_KEY_ENV,
+    reviewSection: (values.reviewSection ?? "Reviews").trim(),
+    reviewSkill: (values.reviewSkill ?? DEFAULT_SKILL_SETTINGS.reviewSkill).trim(),
+    gitstreamReviewSkill: (values.gitstreamReviewSkill ?? DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill).trim(),
+    triageSkill: (values.triageSkill ?? DEFAULT_SKILL_SETTINGS.triageSkill).trim(),
+  });
+  /** The proxy key is sent to this URL, so only https is accepted; anything else falls back to the default. */
+  function aiBaseUrl(value: string): string {
+    const fallback = DEFAULT_AI_BASE_URL;
+    const trimmed = value.trim().replace(/\/+$/, "");
+    if (trimmed === "") return fallback;
+    try {
+      if (new URL(trimmed).protocol === "https:") return trimmed;
+    } catch {
+      // Not a URL.
+    }
+    bb.log.warn(`aiBaseUrl "${trimmed.slice(0, 80)}" is not an https URL; using ${fallback}`);
+    return fallback;
+  }
+  /** Applies the host settings; malformed values switch that host off and are logged. */
+  function applyHosts(values: Config): void {
+    const { hosts: next, problems } = readHosts(values);
+    for (const problem of problems) bb.log.warn(`${problem}; that host is off`);
+    setHosts(next);
+  }
+  let config = readConfig(await settings.get());
+  applyHosts(config);
+
+  // Radar threads get radar-review / radar-triage on top of the radar CLI skill. Selecting
+  // any skill filters this plugin's roots to the selection, so `radar` is always included.
+  bb.agents.configure((context) => ({ tools: [], skills: selectedSkills(context.pluginMetadata) }));
+
+  // ---- persisted configuration -------------------------------------------
+
+  async function loadLanes(): Promise<Lane[]> {
+    const stored = await bb.storage.kv.get<unknown>("lanes");
+    if (stored === undefined || stored === null) return DEFAULT_LANES.map((lane) => ({ ...lane }));
+    const parsed = lanesSchema.safeParse(stored);
+    if (parsed.success) return parsed.data;
+    bb.log.warn("stored lanes were invalid; falling back to defaults");
+    return DEFAULT_LANES.map((lane) => ({ ...lane }));
+  }
+  async function saveLanes(next: Lane[]) {
+    const parsed = lanesSchema.safeParse(next);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new UserError(`Invalid lanes (${issue?.path.join(".")}: ${issue?.message})`);
+    }
+    lanes = parsed.data;
+    await bb.storage.kv.set("lanes", lanes);
+  }
+
+  type SeenMap = Record<string, string[]>;
+  let seen: SeenMap = (await bb.storage.kv.get<SeenMap>("seen")) ?? {};
+  const persistSeen = () => bb.storage.kv.set("seen", seen);
+
+  let lanes = await loadLanes();
+
+  const storedFocus = focusStateSchema.safeParse(await bb.storage.kv.get<unknown>("focus"));
+  let focusState: FocusState = storedFocus.success ? storedFocus.data : { ...FOCUS_OFF };
+  let scope: ScopeFilter = effectiveScope(focusState);
+  let visible = scopePredicate(scope);
+
+  type Reviews = Record<string, { threadId: string; at: string }>;
+  let reviews: Reviews = (await bb.storage.kv.get<Reviews>("reviews")) ?? {};
+  /** Repo → project last chosen in the review composer; beats remote-URL matching. */
+  let reviewProjects: Record<string, string> =
+    (await bb.storage.kv.get<Record<string, string>>("reviewProjects")) ?? {};
+
+  // ---- live state ---------------------------------------------------------
+
+  const results: Record<string, LaneResult> = {};
+  let fetchedAt = "";
+  let refreshing = false;
+  let githubLogin = "";
+  /** The user's Gitstream principal (email) as `gs` resolved it. The REST API does not resolve @me. */
+  let gitstreamMe = "";
+  /** World label names, for steering the LLM to exact spellings. Rebuilt daily. */
+  type LabelIndex = { at: string; names: string[] };
+  // The index (~5k names, ~300KB) is over kv's 256KB value cap, so it lives in the plugin database.
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [
+    "CREATE TABLE label_index (name TEXT PRIMARY KEY) WITHOUT ROWID",
+    "CREATE TABLE label_index_meta (id INTEGER PRIMARY KEY CHECK (id = 1), indexed_at TEXT NOT NULL)",
+  ]);
+  function loadLabelIndex(): LabelIndex | null {
+    const meta = db.prepare("SELECT indexed_at FROM label_index_meta WHERE id = 1").get() as { indexed_at: string } | undefined;
+    if (meta === undefined) return null;
+    const rows = db.prepare("SELECT name FROM label_index ORDER BY name").all() as { name: string }[];
+    return { at: meta.indexed_at, names: rows.map((row) => row.name) };
+  }
+  const saveLabelIndex = db.transaction((index: LabelIndex) => {
+    db.prepare("DELETE FROM label_index").run();
+    const insert = db.prepare("INSERT OR IGNORE INTO label_index (name) VALUES (?)");
+    for (const name of index.names) insert.run(name);
+    db.prepare(
+      "INSERT INTO label_index_meta (id, indexed_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET indexed_at = excluded.indexed_at",
+    ).run(index.at);
+  });
+  let labelIndex: LabelIndex | null = loadLabelIndex();
+  await bb.storage.kv.delete("labelIndex");
+  let labelIndexing: Promise<void> | null = null;
+  let disposed = false;
+  let wakeSleep: (() => void) | undefined;
+  let inFlight: Promise<void> | null = null;
+  const controller = new AbortController();
+
+  function aiState() {
+    const key = process.env[config.aiKeyEnv];
+    return key
+      ? { available: true, model: config.aiModel, detail: "" }
+      : {
+          available: false,
+          model: config.aiModel,
+          detail: `$${config.aiKeyEnv} is not set in the bb server environment.`,
+        };
+  }
+
+  function snapshot(): RadarSnapshot {
+    return {
+      lanes,
+      results,
+      fetchedAt,
+      refreshing,
+      githubLogin,
+      gitstreamLogin: gitstreamMe,
+      reviews,
+      ai: aiState(),
+      scope,
+      focus: focusState,
+      maxAgeDays: config.maxAgeDays,
+      hosts: hosts(),
+      skills: { reviewSkill: config.reviewSkill, gitstreamReviewSkill: config.gitstreamReviewSkill, triageSkill: config.triageSkill },
+    };
+  }
+
+  let publishTimer: ReturnType<typeof setTimeout> | undefined;
+  function publish() {
+    // Coalesce bursts (one per lane) into one signal.
+    if (publishTimer !== undefined) return;
+    publishTimer = setTimeout(() => {
+      publishTimer = undefined;
+      if (!disposed) bb.realtime.publish(CHANGED, { fetchedAt });
+    }, 50);
+  }
+
+  async function tool(bin: string, args: string[], label: string): Promise<string> {
+    try {
+      const { stdout } = await run(bin, args, {
+        cwd: homedir(),
+        env: toolEnv,
+        maxBuffer: MAX_OUTPUT_BYTES,
+        timeout: TOOL_TIMEOUT_MS,
+        signal: controller.signal,
+        killSignal: "SIGKILL",
+      });
+      return stdout;
+    } catch (error) {
+      const failure = error as { code?: unknown; stderr?: unknown; killed?: unknown } | null;
+      const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
+      if (failure?.code === "ENOENT") throw new UserError(`${label}: "${bin}" is not on PATH. Set the path in Radar settings.`);
+      if (failure?.killed === true || failure?.code === "ETIMEDOUT") throw new UserError(`${label} timed out.`);
+      const kind = classifyToolError(stderr);
+      if (kind === "rate-limit") throw new UserError(`${label}: rate limit hit; it will retry next cycle.`);
+      if (kind === "auth") throw new UserError(`${label}: not authenticated (${stderr.trim().split("\n")[0]?.slice(0, 160)}).`);
+      const first = stderr.trim().split("\n").find((line) => line.trim() !== "") ?? "command failed";
+      throw new UserError(`${label}: ${first.slice(0, 200)}`);
+    }
+  }
+
+  function parseJson(stdout: string, label: string): unknown {
+    // gs prints a human summary on stderr, JSON on stdout.
+    try {
+      return JSON.parse(stdout);
+    } catch {
+      throw new UserError(`${label} returned invalid JSON.`);
+    }
+  }
+
+  async function resolveGitstreamMe(): Promise<string> {
+    if (gitstreamMe !== "") return gitstreamMe;
+    // `gs pr list` prints its resolved scope ("author=<email> (default)") on stderr.
+    try {
+      const { stderr } = await run(config.gsPath, ["pr", "list", "--limit", "1", "--json"], {
+        cwd: homedir(), env: toolEnv, timeout: TOOL_TIMEOUT_MS, signal: controller.signal, maxBuffer: MAX_OUTPUT_BYTES,
+      });
+      gitstreamMe = stderr.match(/author=([^\s(),]+@[^\s(),]+)/)?.[1] ?? "";
+    } catch {
+      gitstreamMe = "";
+    }
+    if (gitstreamMe !== "") return gitstreamMe;
+    // Fallback for this cycle only, so a transient gs failure is retried next time
+    // instead of pinning a guessed identity until restart.
+    const fallback = gitstreamFallbackEmail(
+      await tool("git", ["config", "--global", "user.email"], "git config").catch(() => ""),
+    );
+    if (fallback === "") throw new UserError("Could not resolve your Gitstream identity. Run gs auth login.");
+    return fallback;
+  }
+
+  function buildLabelIndex(): Promise<void> {
+    if (labelIndexing !== null) return labelIndexing;
+    labelIndexing = (async () => {
+      const names: string[] = [];
+      for (let page = 1; page <= 200 && !disposed; page++) {
+        const data = parseJson(
+          await tool(config.gsPath, ["api", "-X", "GET", `repos/${hosts().gitstream?.repo ?? ""}/labels`, "-f", "per_page=100", "-f", `page=${page}`], "gs labels"),
+          "gs labels",
+        );
+        if (!Array.isArray(data)) break;
+        for (const label of data) {
+          const name = (label as { name?: unknown } | null)?.name;
+          if (typeof name === "string") names.push(name);
+        }
+        if (data.length < 100) break;
+      }
+      if (names.length > 0) {
+        labelIndex = { at: new Date().toISOString(), names };
+        saveLabelIndex(labelIndex);
+        bb.log.info(`indexed ${names.length} World labels`);
+      }
+    })()
+      .catch((error) => bb.log.warn(`label index failed: ${String(error)}`))
+      .finally(() => {
+        labelIndexing = null;
+      });
+    return labelIndexing;
+  }
+
+  const STOP = new Set(["the", "and", "for", "with", "that", "from", "prs", "pr", "pull", "requests", "issues", "issue",
+    "open", "mine", "my", "me", "not", "any", "all", "anyone", "everyone", "world", "review", "reviews", "track", "show",
+    "this", "week", "today", "team", "touching", "touch", "about", "drafts", "draft", "updated", "into", "have", "been"]);
+
+  function candidateLabels(description: string): string[] {
+    const names = labelIndex?.names ?? [];
+    const tokens = [...new Set(description.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) ?? [])].filter((t) => !STOP.has(t));
+    if (tokens.length === 0 || names.length === 0) return [];
+    const scored = names
+      .map((name) => {
+        const lower = name.toLowerCase();
+        const hits = tokens.filter((token) => lower.includes(token)).length;
+        // Prefer short, structural labels (area paths, components, slices) over one-offs.
+        const bonus = /^(\/\/areas\/|component:|slice:)/i.test(name) ? 0.5 : 0;
+        return { name, score: hits === 0 ? 0 : hits + bonus - name.length / 400 };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored.slice(0, 40).map((entry) => entry.name);
+  }
+
+  async function fetchSource(lane: Lane, source: Source): Promise<Item[]> {
+    if (source === "gitstream") {
+      const me = await resolveGitstreamMe();
+      const data = parseJson(await tool(config.gsPath, gitstreamArgs(lane, me, Date.now(), config.maxAgeDays), SOURCE_LABEL.gitstream), SOURCE_LABEL.gitstream);
+      if (!Array.isArray(data)) throw new UserError(`${SOURCE_LABEL.gitstream} did not return a JSON array.`);
+      return data.map(fromGitstream).filter((item): item is Item => item !== null);
+    }
+    if (source === "delta") {
+      const data = parseJson(await tool(config.dtPath, deltaArgs(lane, Date.now(), config.maxAgeDays), SOURCE_LABEL.delta), SOURCE_LABEL.delta) as { items?: unknown };
+      if (!Array.isArray(data.items)) throw new UserError(`${SOURCE_LABEL.delta} search did not return items.`);
+      return data.items.map(fromDelta).filter((item): item is Item => item !== null);
+    }
+    const data = parseJson(
+      await tool(
+        config.ghPath,
+        [
+          "api", "graphql",
+          "-f", `query=${GITHUB_SEARCH_GRAPHQL}`,
+          "-f", `q=${githubSearchQuery(withWindow(lane.query ?? "", lane.filter, Date.now(), config.maxAgeDays))}`,
+          "-F", `n=${lane.limit ?? 30}`,
+        ],
+        "GitHub",
+      ),
+      "GitHub",
+    ) as { data?: { search?: { nodes?: unknown[] } }; errors?: { message?: string }[] };
+    if (data.errors?.length) throw new UserError(`GitHub: ${data.errors[0]?.message ?? "query error"}`);
+    return (data.data?.search?.nodes ?? []).map(fromGithubNode).filter((item): item is Item => item !== null);
+  }
+
+  /** Every source in parallel; a failing host is reported without hiding the others' items. */
+  async function fetchLane(lane: Lane): Promise<{ items: Item[]; fetched: number; error: string }> {
+    // Sources that are not configured are skipped, so default and shared lanes work anywhere.
+    const enabled = enabledSources();
+    const sources = lane.sources.filter((source) => enabled.includes(source));
+    if (sources.length === 0) {
+      throw new UserError(`${lane.sources.map((source) => SOURCE_LABEL[source]).join(" and ")} ${lane.sources.length === 1 ? "is" : "are"} not set up. Add ${lane.sources.length === 1 ? "it" : "them"} in Settings → Plugins → Radar.`);
+    }
+    const settled = await Promise.allSettled(sources.map((source) => fetchSource(lane, source)));
+    const raw: Item[] = [];
+    const errors: string[] = [];
+    settled.forEach((outcome, index) => {
+      if (outcome.status === "fulfilled") raw.push(...outcome.value);
+      else {
+        const error = outcome.reason;
+        if (!(error instanceof UserError)) bb.log.warn(`lane ${lane.id} ${sources[index]} failed: ${String(error)}`);
+        errors.push(error instanceof UserError ? error.message : `${SOURCE_LABEL[sources[index]!]}: could not be read.`);
+      }
+    });
+    if (errors.length === settled.length) throw new UserError(errors.join(" · "));
+    // `limit` is the lane's size: each host fetches up to it, the merged list is cut to it.
+    const sorted = applyFilter(raw, lane.filter, Date.now(), config.maxAgeDays)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, lane.limit ?? 30);
+    return { items: sorted, fetched: raw.length, error: errors.join(" · ") };
+  }
+
+  function withNew(laneId: string, items: Item[], complete: boolean): RadarItem[] {
+    const marked = markNew(seen[laneId], items, complete);
+    if (marked.seed !== null) {
+      seen[laneId] = marked.seed;
+      void persistSeen();
+    }
+    return marked.items;
+  }
+
+  /** False once the lane was deleted or its query edited after `lane` was read. */
+  function stillCurrent(lane: Lane): boolean {
+    const current = lanes.find((candidate) => candidate.id === lane.id);
+    return current !== undefined && laneQueryKey(current) === laneQueryKey(lane);
+  }
+
+  async function refreshLane(lane: Lane) {
+    const previous = results[lane.id];
+    results[lane.id] = {
+      laneId: lane.id,
+      items: previous?.items ?? [],
+      fetched: previous?.fetched ?? 0,
+      error: previous?.error ?? "",
+      fetchedAt: previous?.fetchedAt ?? "",
+      loading: true,
+    };
+    publish();
+    try {
+      const { items, fetched, error } = await fetchLane(lane);
+      // An edit during the fetch starts its own refresh; this older result must not win.
+      if (disposed || !stillCurrent(lane)) return;
+      results[lane.id] = {
+        laneId: lane.id,
+        items: withNew(lane.id, items, error === ""),
+        fetched,
+        error,
+        fetchedAt: new Date().toISOString(),
+        loading: false,
+      };
+    } catch (error) {
+      if (disposed || !stillCurrent(lane)) return;
+      const message = error instanceof UserError ? error.message : "Lane could not be read.";
+      if (!(error instanceof UserError)) bb.log.warn(`lane ${lane.id} failed: ${String(error)}`);
+      results[lane.id] = { ...results[lane.id]!, error: message, loading: false };
+    }
+    publish();
+  }
+
+  async function pool<T>(values: T[], worker: (value: T) => Promise<void>) {
+    let index = 0;
+    const runners = Array.from({ length: Math.min(LANE_CONCURRENCY, values.length) }, async () => {
+      while (index < values.length && !disposed) {
+        const value = values[index++]!;
+        await worker(value);
+      }
+    });
+    await Promise.all(runners);
+  }
+
+  function refreshAll(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (inFlight !== null) return inFlight;
+    refreshing = true;
+    publish();
+    inFlight = (async () => {
+      try {
+        if (githubLogin === "") {
+          githubLogin = (await tool(config.ghPath, ["api", "user", "--jq", ".login"], "gh api user").catch(() => "")).trim();
+        }
+        await pool([...lanes], refreshLane);
+        fetchedAt = new Date().toISOString();
+        // Drop results and seen sets for lanes that no longer exist.
+        const ids = new Set(lanes.map((lane) => lane.id));
+        for (const id of Object.keys(results)) if (!ids.has(id)) delete results[id];
+        let prunedSeen = false;
+        for (const id of Object.keys(seen)) {
+          if (!ids.has(id)) {
+            delete seen[id];
+            prunedSeen = true;
+          }
+        }
+        if (prunedSeen) await persistSeen();
+      } finally {
+        refreshing = false;
+        inFlight = null;
+        publish();
+      }
+    })();
+    return inFlight;
+  }
+
+  // ---- AI drafting --------------------------------------------------------
+
+  /** One chat completion through the configured OpenAI-compatible proxy. */
+  async function chat(system: string, user: string, maxTokens: number): Promise<string> {
+    const key = process.env[config.aiKeyEnv];
+    if (!key) throw new UserError(aiState().detail);
+    const timeout = AbortSignal.timeout(AI_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${config.aiBaseUrl}/v1/chat/completions`, {
+        method: "POST",
+        signal: AbortSignal.any([timeout, controller.signal]),
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: config.aiModel,
+          temperature: 0,
+          max_tokens: maxTokens,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+        }),
+      });
+    } catch {
+      throw new UserError(timeout.aborted ? "The AI request timed out." : "The AI proxy could not be reached.");
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      const reason = (() => {
+        try {
+          const parsed = JSON.parse(detail) as { reason?: unknown; error?: { message?: unknown } | unknown };
+          if (typeof parsed.reason === "string") return parsed.reason;
+          const nested = (parsed.error as { message?: unknown } | undefined)?.message;
+          return typeof nested === "string" ? nested : "";
+        } catch {
+          return "";
+        }
+      })();
+      throw new UserError(
+        `The AI proxy returned HTTP ${response.status} for model ${config.aiModel}${reason ? `: ${reason.slice(0, 200)}` : "."}`,
+      );
+    }
+    const body = (await response.json().catch(() => null)) as
+      | { choices?: { message?: { content?: unknown } }[] }
+      | null;
+    const content = body?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") throw new UserError("The AI proxy returned an empty answer.");
+    return content;
+  }
+
+  async function draftLane(description: string): Promise<DraftResult> {
+    if (!process.env[config.aiKeyEnv]) throw new UserError(aiState().detail);
+    const me = hosts().gitstream === null ? "" : await resolveGitstreamMe().catch(() => "");
+    const prompt = draftPrompt(description, {
+      githubLogin,
+      email: me,
+      existing: lanes,
+      candidateLabels: candidateLabels(description),
+      notes: config.draftNotes,
+    });
+    const content = await chat(prompt.system, prompt.user, 800);
+    let drafted: Omit<Lane, "id">;
+    try {
+      drafted = parseDraft(content);
+    } catch (error) {
+      throw new UserError((error as Error).message);
+    }
+    const lane: Lane = {
+      ...drafted,
+      id: slugify(drafted.title, new Set(lanes.map((existing) => existing.id))),
+      description,
+    };
+    // Run it once so the user sees what they would get before adding it.
+    let preview: LaneResult;
+    try {
+      const { items, fetched } = await fetchLane(lane);
+      preview = {
+        laneId: lane.id,
+        items: items.map((item) => ({ ...item, isNew: false })),
+        fetched,
+        error: "",
+        fetchedAt: new Date().toISOString(),
+        loading: false,
+      };
+    } catch (error) {
+      preview = {
+        laneId: lane.id,
+        items: [],
+        fetched: 0,
+        error: error instanceof UserError ? error.message : "Preview failed.",
+        fetchedAt: "",
+        loading: false,
+      };
+    }
+    return { lane, preview };
+  }
+
+  // ---- mutations ----------------------------------------------------------
+
+  async function upsertLane(input: unknown): Promise<RadarSnapshot> {
+    const candidate = input as Partial<Lane> | null;
+    if (candidate === null || typeof candidate !== "object") throw new UserError("Missing lane.");
+    const id =
+      typeof candidate.id === "string" && candidate.id !== ""
+        ? candidate.id
+        : slugify(String(candidate.title ?? "lane"), new Set(lanes.map((lane) => lane.id)));
+    const existing = lanes.find((lane) => lane.id === id);
+    // A category the caller set by hand is pinned; otherwise it follows the query.
+    const { categoryPinned: _pinned, ...rest } = candidate;
+    const parsed = laneSchema.safeParse({ ...rest, id, ...requestedCategory(candidate, existing) });
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new UserError(`${issue?.path.join(".") || "lane"}: ${issue?.message}`);
+    }
+    const lane = parsed.data;
+    const index = lanes.findIndex((existing) => existing.id === lane.id);
+    if (index < 0 && lanes.length >= MAX_LANES) throw new UserError(`Radar holds at most ${MAX_LANES} lanes.`);
+    const previous = index >= 0 ? lanes[index] : undefined;
+    const next = [...lanes];
+    if (index >= 0) next[index] = lane;
+    else next.push(lane);
+    await saveLanes(next);
+    // A changed query starts fresh; a collapse toggle must not refetch.
+    const queryChanged = previous === undefined || laneQueryKey(previous) !== laneQueryKey(lane);
+    if (queryChanged) {
+      if (previous !== undefined) {
+        delete seen[lane.id];
+        await persistSeen();
+      }
+      void refreshLane(lane);
+    }
+    publish();
+    return snapshot();
+  }
+
+  async function deleteLane(laneId: string): Promise<RadarSnapshot> {
+    await saveLanes(lanes.filter((lane) => lane.id !== laneId));
+    delete results[laneId];
+    delete seen[laneId];
+    await persistSeen();
+    publish();
+    return snapshot();
+  }
+
+  async function reorder(ids: string[]): Promise<RadarSnapshot> {
+    const byId = new Map(lanes.map((lane) => [lane.id, lane]));
+    const ordered = ids.map((id) => byId.get(id)).filter((lane): lane is Lane => lane !== undefined);
+    const rest = lanes.filter((lane) => !ids.includes(lane.id));
+    await saveLanes([...ordered, ...rest]);
+    publish();
+    return snapshot();
+  }
+
+  /** Marks a lane's (or every lane's) items seen; `view` limits it to what that view shows. */
+  async function markSeen(laneId?: string, view: View = "all"): Promise<RadarSnapshot> {
+    for (const lane of lanes) {
+      if (laneId !== undefined && lane.id !== laneId) continue;
+      if (laneId === undefined && !laneInView(lane, view)) continue;
+      const result = results[lane.id];
+      if (result === undefined) continue;
+      // Hidden items stay new so they surface when the focus filter changes.
+      const hit = (item: RadarItem) => itemInView(item, view) && visible(item);
+      // Non-new items are already seen, so this keeps the other view's new items new.
+      seen[lane.id] = result.items.filter((item) => !item.isNew || hit(item)).map((item) => item.key);
+      result.items = result.items.map((item) => (hit(item) ? { ...item, isNew: false } : item));
+    }
+    await persistSeen();
+    publish();
+    return snapshot();
+  }
+
+  function findItem(key: string): RadarItem | undefined {
+    for (const result of Object.values(results)) {
+      const item = result.items.find((candidate) => candidate.key === key);
+      if (item !== undefined) return item;
+    }
+    return undefined;
+  }
+
+  /** Unique new items across lanes (an item can sit in several lanes), focus filter applied. */
+  function newCount(): number {
+    const keys = new Set<string>();
+    for (const result of Object.values(results)) {
+      for (const item of result.items) if (item.isNew && visible(item)) keys.add(item.key);
+    }
+    return keys.size;
+  }
+
+  function allItems(): RadarItem[] {
+    return Object.values(results).flatMap((result) => result.items);
+  }
+
+  function catalog(): ScopeEntry[] {
+    return scopeCatalog(allItems(), scope);
+  }
+
+  async function saveFocus(next: FocusState): Promise<RadarSnapshot> {
+    const parsed = focusStateSchema.safeParse(next);
+    if (!parsed.success) throw new UserError("Too many repos or areas in the focus.");
+    focusState = parsed.data;
+    scope = effectiveScope(focusState);
+    visible = scopePredicate(scope);
+    await bb.storage.kv.set("focus", focusState);
+    publish();
+    return snapshot();
+  }
+
+  /** "i don't want to see any billing stuff" → hide acme/billing, Focus on. */
+  async function describeFocus(description: string): Promise<RadarSnapshot> {
+    const entries = scopeCatalog(allItems(), EMPTY_SCOPE);
+    const known = [...new Set([...catalogKeys(entries), ...focusState.focus, ...focusState.hidden])];
+    let choice: { focus: string[]; hidden: string[]; summary: string };
+    if (!aiState().available) {
+      try {
+        choice = heuristicFocus(description, known);
+      } catch (error) {
+        throw new UserError(`${(error as Error).message} (${aiState().detail} Name a repo or area, e.g. “no billing”.)`);
+      }
+    } else {
+      const prompt = focusPrompt(description, entries);
+      try {
+        choice = parseFocusReply(await chat(prompt.system, prompt.user, 400), known);
+      } catch (error) {
+        // An AI outage should not block a simple "no billing".
+        try {
+          choice = heuristicFocus(description, known);
+        } catch {
+          throw error instanceof UserError ? error : new UserError((error as Error).message);
+        }
+      }
+    }
+    return saveFocus({ enabled: true, description, ...choice });
+  }
+
+  async function setFocusEnabled(enabled: boolean): Promise<RadarSnapshot> {
+    if (enabled && !isActive(focusState)) throw new UserError("No focus yet. Describe what to focus on.");
+    return saveFocus({ ...focusState, enabled });
+  }
+
+  /** Typed names → scope keys, matched against repos/areas in current results. */
+  function resolveScopes(inputs: string[]): string[] {
+    const known = catalogKeys(catalog());
+    return inputs.map((input) => {
+      try {
+        return resolveScope(input, known);
+      } catch (error) {
+        throw new UserError((error as Error).message);
+      }
+    });
+  }
+
+  async function editScope(op: ScopeOp, keys: string[]): Promise<RadarSnapshot> {
+    if (op !== "clear" && keys.length === 0) throw new UserError("Name at least one repo or area.");
+    // "clear" is Focus off; the last focus is kept so it can be resumed.
+    if (op === "clear") return setFocusEnabled(false);
+    const knownAreas = [...new Set(allItems().flatMap(itemAreas))];
+    // Picking scopes while Focus is off starts a fresh, hand-picked focus.
+    const base = focusState.enabled ? focusState : FOCUS_OFF;
+    const next = applyScopeOp(base, op, keys, knownAreas);
+    const active = isActive(next);
+    return saveFocus({
+      ...next,
+      enabled: active,
+      description: active ? base.description : "",
+      summary: describeScope(next),
+    });
+  }
+
+  async function defaultProjectFor(repo: string): Promise<string | null> {
+    const remembered = reviewProjects[repo];
+    const projects = await bb.sdk.projects.list({ includePersonal: false });
+    const list = Array.isArray(projects) ? projects : ((projects as { projects?: unknown[] }).projects ?? []);
+    const rows = list as { id: string; gitRemoteUrl: string | null }[];
+    if (remembered !== undefined && rows.some((project) => project.id === remembered)) return remembered;
+    const match = rows.find((project) => project.gitRemoteUrl !== null && remoteRepo(project.gitRemoteUrl) === repo.toLowerCase());
+    return match?.id ?? null;
+  }
+
+  async function reviewContext(key: string): Promise<ReviewContext> {
+    const item = findItem(key);
+    if (item === undefined) throw new UserError("That item is no longer in any lane; refresh and try again.");
+    return {
+      title: reviewTitle(item),
+      prompt: reviewPrompt(item),
+      defaultProjectId: await defaultProjectFor(item.repo),
+    };
+  }
+
+  async function startReview(key: string, request: Record<string, unknown>): Promise<{ threadId: string }> {
+    const item = findItem(key);
+    if (item === undefined) throw new UserError("That item is no longer in any lane; refresh and try again.");
+    const projectId = typeof request.projectId === "string" ? request.projectId : null;
+    const [context, sectionId, skill] = await Promise.all([reviewContext(key), reviewSectionId(), availableHostSkill(item, projectId)]);
+    const withSkill = skill !== null ? withSkillMention(request as { input?: unknown; prompt?: unknown }, skill) : request;
+    const thread = (await bb.sdk.threads.spawn({
+      ...(withSkill as unknown as Parameters<typeof bb.sdk.threads.spawn>[0]),
+      ...(sectionId !== null ? { sectionId } : {}),
+      title: context.title,
+      pluginMetadata: { itemKey: key, url: item.url, action: actionFor(item.kind), source: item.source },
+    })) as { id?: string; thread?: { id?: string } };
+    const threadId = thread.id ?? thread.thread?.id;
+    if (threadId === undefined) throw new Error("bb did not return the new thread id");
+    reviews = { ...reviews, [key]: { threadId, at: new Date().toISOString() } };
+    if (typeof request.projectId === "string") reviewProjects = { ...reviewProjects, [item.repo]: request.projectId };
+    await Promise.all([bb.storage.kv.set("reviews", reviews), bb.storage.kv.set("reviewProjects", reviewProjects)]);
+    publish();
+    return { threadId };
+  }
+
+  /**
+   * The configured host skill for this item, if the target project can see it. An unknown
+   * skill would just render as literal "/name" text, so it is dropped (and logged) instead.
+   */
+  async function availableHostSkill(item: Item, projectId: string | null): Promise<string | null> {
+    const name = hostSkillFor(item, config);
+    if (name === null) return null;
+    if (projectId === null) return name;
+    try {
+      const { skills } = await bb.sdk.skills.list({ projectId, environmentId: null });
+      if (skills.some((skill) => skill.name === name)) return name;
+      bb.log.warn(`review skill "${name}" is not installed for project ${projectId}; starting without it`);
+      return null;
+    } catch (error) {
+      bb.log.warn(`could not list skills for ${projectId}: ${error instanceof Error ? error.message : String(error)}`);
+      return name;
+    }
+  }
+
+  /**
+   * The id of the configured review section (default "Reviews"), creating it when missing.
+   * A failure here never blocks a review: the thread just lands unsectioned.
+   */
+  async function reviewSectionId(): Promise<string | null> {
+    const name = config.reviewSection;
+    if (name === "") return null;
+    try {
+      const existing = findSection(await bb.sdk.threadSections.list(), name);
+      if (existing !== null) return existing;
+      return (await bb.sdk.threadSections.create({ name })).id;
+    } catch (error) {
+      bb.log.warn(`review section "${name}" unavailable: ${String(error)}`);
+      return null;
+    }
+  }
+
+  /** One-time move of review threads started before sections were applied. */
+  async function backfillReviewSection(): Promise<void> {
+    if ((await bb.storage.kv.get<boolean>("reviewSectionBackfilled")) === true) return;
+    const sectionId = await reviewSectionId();
+    if (sectionId === null) return;
+    const threads = await Promise.all(
+      Object.values(reviews).map(async ({ threadId }) => {
+        try {
+          const thread = (await bb.sdk.threads.get({ threadId })) as { sectionId?: string | null };
+          return { id: threadId, sectionId: thread.sectionId ?? null };
+        } catch {
+          return { id: threadId, sectionId: "unknown" };
+        }
+      }),
+    );
+    await Promise.all(threadsToSection(threads).map((threadId) => bb.sdk.threads.update({ threadId, sectionId })));
+    await bb.storage.kv.set("reviewSectionBackfilled", true);
+  }
+
+  /** Drop links to threads that were archived or deleted; the user is done with them. */
+  async function pruneReviews(): Promise<void> {
+    const entries = Object.entries(reviews);
+    if (entries.length === 0) return;
+    const keep: Reviews = {};
+    await Promise.all(
+      entries.map(async ([key, review]) => {
+        try {
+          const thread = (await bb.sdk.threads.get({ threadId: review.threadId })) as {
+            archivedAt?: number | null;
+            deletedAt?: number | null;
+          };
+          if (thread.archivedAt == null && thread.deletedAt == null) keep[key] = review;
+        } catch (error) {
+          // Unknown thread → gone. Anything else (transient) keeps the link.
+          if (!/not.?found|404/i.test(String(error))) keep[key] = review;
+        }
+      }),
+    );
+    if (Object.keys(keep).length === entries.length) return;
+    reviews = keep;
+    await bb.storage.kv.set("reviews", reviews);
+    publish();
+  }
+
+  // ---- rebase ---------------------------------------------------------------
+
+  /** Like `tool`, but a non-zero exit returns stdout+stderr for classification instead of throwing. */
+  async function capture(bin: string, args: string[], label: string): Promise<{ ok: boolean; stdout: string; output: string }> {
+    try {
+      const { stdout } = await run(bin, args, {
+        cwd: homedir(),
+        env: toolEnv,
+        maxBuffer: MAX_OUTPUT_BYTES,
+        // A server-side rebase replays commits; give it more room than a read.
+        timeout: TOOL_TIMEOUT_MS * 3,
+        signal: controller.signal,
+        killSignal: "SIGKILL",
+      });
+      return { ok: true, stdout, output: stdout };
+    } catch (error) {
+      const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown } | null;
+      if (failure?.code === "ENOENT") throw new UserError(`${label}: "${bin}" is not on PATH. Set the path in Radar settings.`);
+      if (failure?.killed === true || failure?.code === "ETIMEDOUT") {
+        throw new UserError(`${label} timed out; the rebase may still have landed. Refresh to check.`);
+      }
+      const stdout = typeof failure?.stdout === "string" ? failure.stdout : "";
+      const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
+      return { ok: false, stdout, output: `${stderr}\n${stdout}` };
+    }
+  }
+
+  async function rebaseGithub(target: RebaseTarget): Promise<RebaseResult> {
+    const read = await capture(config.ghPath, githubPrArgs(target.repo, target.number), "GitHub");
+    const parsed = (() => {
+      try {
+        return JSON.parse(read.stdout) as unknown;
+      } catch {
+        return null;
+      }
+    })();
+    if (!read.ok && parsed === null) {
+      const failure = classifyRebaseFailure("github", read.output);
+      throw new UserError(failure.upToDate ? "GitHub could not read that pull request." : failure.message);
+    }
+    const verified = verifyGithubPr(parsed);
+    if (!verified.ok) throw new UserError(verified.reason);
+    const { id, headOid, baseOid } = verified.value;
+    // Skip the rewrite entirely when the base is already in the head.
+    const behind = await capture(config.ghPath, githubCompareArgs(target.repo, baseOid, headOid), "GitHub compare");
+    if (behind.ok && behind.stdout.trim() === "0") return { status: "up-to-date", message: "Already up to date.", headSha: headOid };
+    const result = await capture(config.ghPath, githubRebaseArgs(id, headOid), "GitHub rebase");
+    const body = (() => {
+      try {
+        return JSON.parse(result.stdout) as {
+          data?: { updatePullRequestBranch?: { pullRequest?: { headRefOid?: unknown } } | null };
+          errors?: { message?: unknown }[];
+        };
+      } catch {
+        return null;
+      }
+    })();
+    const errors = (body?.errors ?? []).map((error) => (typeof error.message === "string" ? error.message : "")).join("\n");
+    if (!result.ok || errors !== "") {
+      const failure = classifyRebaseFailure("github", `${errors}\n${result.output}`);
+      if (failure.upToDate) return { status: "up-to-date", message: "Already up to date.", headSha: headOid };
+      throw new UserError(failure.message);
+    }
+    const next = body?.data?.updatePullRequestBranch?.pullRequest?.headRefOid;
+    return { status: "rebased", message: "Rebased onto the latest base.", headSha: typeof next === "string" ? next : headOid };
+  }
+
+  async function rebaseGitstream(target: RebaseTarget): Promise<RebaseResult> {
+    const me = await resolveGitstreamMe();
+    const pr = parseJson(await tool(config.gsPath, gitstreamPrArgs(target.repo, target.number), SOURCE_LABEL.gitstream), SOURCE_LABEL.gitstream);
+    const verified = verifyGitstreamPr(pr, me);
+    if (!verified.ok) throw new UserError(verified.reason);
+    const { headSha } = verified.value;
+    const result = await capture(config.gsPath, gitstreamRebaseArgs(target.repo, target.number, headSha), `${SOURCE_LABEL.gitstream} rebase`);
+    if (!result.ok) {
+      const failure = classifyRebaseFailure("gitstream", result.output);
+      if (failure.upToDate) return { status: "up-to-date", message: "Already up to date.", headSha };
+      throw new UserError(failure.message);
+    }
+    return gitstreamRebaseResult(parseJson(result.stdout, `${SOURCE_LABEL.gitstream} rebase`), headSha);
+  }
+
+  const rebasing = new Set<string>();
+
+  async function rebase(target: RebaseTarget): Promise<RebaseResult> {
+    if (!REBASE_SOURCES.has(target.source)) {
+      throw new UserError(`${SOURCE_LABEL[target.source]} has no server-side rebase (Delta's update-branch merges instead), so Radar doesn't offer it.`);
+    }
+    const key = `${target.source}:${target.repo}#${target.number}`;
+    if (rebasing.has(key)) throw new UserError("A rebase of this pull request is already running.");
+    rebasing.add(key);
+    try {
+      const result = target.source === "github" ? await rebaseGithub(target) : await rebaseGitstream(target);
+      bb.log.info(`rebase ${key}: ${result.status} ${result.headSha.slice(0, 12)}`);
+      if (result.status === "rebased") {
+        // Refresh every lane showing this PR so its row reflects the new head.
+        const showing = lanes.filter((lane) => results[lane.id]?.items.some((item) => item.key === key));
+        void Promise.all(showing.map(refreshLane));
+      }
+      return result;
+    } finally {
+      rebasing.delete(key);
+    }
+  }
+
+  /** CLI target → source: explicit flag, URL host, else the matching item in lanes. */
+  function resolveRebaseTarget(input: string, sourceFlag: string | undefined): RebaseTarget {
+    const parsed = parseRebaseTarget(input);
+    if (parsed === null) throw new UserError("Usage: bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]");
+    if (sourceFlag !== undefined && sourceFlag !== "github" && sourceFlag !== "gitstream" && sourceFlag !== "delta") {
+      throw new UserError("--source must be github, gitstream or delta.");
+    }
+    const flagged = sourceFlag as RebaseTarget["source"] | undefined;
+    if (parsed.source !== null && flagged !== undefined && parsed.source !== flagged) throw new UserError("--source does not match the URL.");
+    let source = parsed.source ?? flagged;
+    if (source === undefined) {
+      const sources = [...new Set(allItems().filter((item) => item.kind === "pr" && item.repo.toLowerCase() === parsed.repo.toLowerCase() && item.number === parsed.number).map((item) => item.source))];
+      if (sources.length > 1) throw new UserError(`${parsed.repo}#${parsed.number} is on ${sources.join(" and ")}; pass --source.`);
+      const { gitstream, delta } = hosts();
+      const elsewhere = [gitstream, delta].filter((host) => host !== null && host.repo.toLowerCase() === parsed.repo.toLowerCase());
+      source = sources[0] ?? (elsewhere.length > 0 ? undefined : "github");
+      if (source === undefined) throw new UserError(`${parsed.repo} PRs live on ${elsewhere.map((host) => host!.label).join(" or ")}; pass a URL or --source.`);
+    }
+    return { source, repo: parsed.repo, number: parsed.number };
+  }
+
+  // Read by the rail-badge content script; local auth keeps it to bb app origins.
+  bb.http.route("GET", "/badge", (c) => c.json({ new: newCount(), fetchedAt }));
+
+  bb.rpc.register(rpcContract, {
+    radar_snapshot: () => snapshot(),
+    radar_refresh: async (input) => {
+      const lane = input?.laneId === undefined ? undefined : lanes.find((candidate) => candidate.id === input.laneId);
+      if (lane !== undefined) await refreshLane(lane);
+      else await refreshAll();
+      return snapshot();
+    },
+    radar_lane_upsert: ({ lane }) => upsertLane(lane),
+    radar_lane_delete: ({ laneId }) => deleteLane(laneId),
+    radar_lanes_reorder: ({ ids }) => reorder(ids),
+    radar_lanes_reset: async () => {
+      await saveLanes(DEFAULT_LANES.map((lane) => ({ ...lane })));
+      seen = {};
+      await persistSeen();
+      void refreshAll();
+      return snapshot();
+    },
+    radar_mark_seen: ({ laneId, view, kind }) => markSeen(laneId, view ?? (kind === "pr" ? "prs" : kind === "issue" ? "issues" : "all")),
+    radar_draft: ({ description }) => draftLane(description),
+    radar_scope: ({ op, keys }) => editScope(op, keys),
+    radar_focus_describe: ({ description }) => describeFocus(description),
+    radar_focus_set: ({ enabled }) => setFocusEnabled(enabled),
+    radar_review_context: ({ key }) => reviewContext(key),
+    radar_review_start: ({ key, request }) => startReview(key, request),
+    radar_rebase: ({ source, repo, number }) => rebase({ source, repo, number }),
+  });
+
+  settings.onChange((values) => {
+    if (disposed) return;
+    const hadGitstream = hosts().gitstream?.repo;
+    config = readConfig(values);
+    applyHosts(config);
+    if (hosts().gitstream !== null && hosts().gitstream?.repo !== hadGitstream) void buildLabelIndex();
+    publish();
+    wakeSleep?.();
+  });
+
+  bb.background.service("poll", {
+    async start(signal) {
+      const stale = hosts().gitstream !== null && (labelIndex === null || Date.now() - Date.parse(labelIndex.at) > 24 * 3_600_000);
+      if (stale) void buildLabelIndex();
+      await refreshAll();
+      void pruneReviews()
+        .then(backfillReviewSection)
+        .catch((error) => bb.log.warn(`review prune/backfill failed: ${String(error)}`));
+      while (!signal.aborted && !disposed) {
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", finish);
+            if (wakeSleep === finish) wakeSleep = undefined;
+            resolve();
+          };
+          const timer = setTimeout(finish, config.refreshSeconds * 1000);
+          wakeSleep = finish;
+          signal.addEventListener("abort", finish, { once: true });
+        });
+        if (signal.aborted || disposed) return;
+        await refreshAll();
+        void pruneReviews().catch((error) => bb.log.warn(`review prune failed: ${String(error)}`));
+      }
+    },
+  });
+
+  // ---- CLI ------------------------------------------------------------------
+
+  const usage = [
+    "Usage:",
+    "  bb radar status [--json]                  lane counts, new counts, errors",
+    "  bb radar list [--lane <id>] [--view reviews|prs|issues|all] [--new] [--all] [--json]",
+    "                                            --view: what that panel view shows; --all ignores the focus filter",
+    "  bb radar lanes [--json]                   configured lanes, their view (category) and queries",
+    "  bb radar add <description…> [--dry-run]   draft a lane with the LLM and add it",
+    "  bb radar remove <lane-id>",
+    "  bb radar seen [<lane-id>]                 mark items as seen",
+    "  bb radar refresh",
+    "  bb radar defaults                         add missing default lanes",
+    "  bb radar put '<lane json>'                create or replace a lane (category inferred unless given)",
+    "  bb radar scopes [--json]                  repos (and area-repo areas) in results, with the focus filter",
+    "  bb radar focus <description…>             e.g. \"no billing stuff\": AI picks repos/areas, Focus on",
+    "  bb radar focus <repo|area>…               show only these (exact names)",
+    "  bb radar focus --add <repo|area>…         add to the focus",
+    "  bb radar focus --off | --on               turn Focus off (back to normal) / resume the last one",
+    "  bb radar hide <repo|area>…                hide from every lane, view and the badge",
+    "  bb radar show <repo|area>…                undo hide (adds to the focus while one is set)",
+    "  bb radar rebase <url|owner/repo#n> --yes  server-side rebase of your own open PR (GitHub, Gitstream)",
+    "",
+    "Repos are owner/name (or a unique tail, e.g. billing); areas of the area repo (a setting)",
+    "are //<path> label keys (or a unique tail, e.g. mobile); no-area is that repo without an area label.",
+  ].join("\n");
+
+  function describeLane(lane: Lane): string {
+    const scope = lane.sources
+      .map((source) => (source === "gitstream" ? `${SOURCE_LABEL.gitstream.toLowerCase()}: ${JSON.stringify(lane.gitstream ?? {})}` : `${source}: ${source === "delta" ? deltaQuery(lane.query ?? "") : lane.query}`))
+      .join("\n" + "".padEnd(25));
+    const filter = lane.filter === undefined ? "" : `  filter=${JSON.stringify(lane.filter)}`;
+    const category = `[${lane.category}${lane.categoryPinned === true ? ", pinned" : ""}]`;
+    return `${lane.id.padEnd(24)} ${lane.title}  ${category}\n${"".padEnd(25)}${scope}${filter}`;
+  }
+
+  bb.cli.register({
+    name: "radar",
+    summary: "Live PR/issue queues that need you (GitHub, plus optional Gitstream and Delta)",
+    commands: [
+      { name: "status", summary: "Per-lane counts", usage: "bb radar status [--json]" },
+      { name: "list", summary: "List items", usage: "bb radar list [--lane <id>] [--view reviews|prs|issues|all] [--new] [--all] [--json]" },
+      { name: "lanes", summary: "List configured lanes with their view (category)", usage: "bb radar lanes [--json]" },
+      { name: "add", summary: "Draft a lane from a description and add it", usage: "bb radar add <description…> [--dry-run]" },
+      { name: "remove", summary: "Remove a lane", usage: "bb radar remove <lane-id>" },
+      { name: "seen", summary: "Mark items seen", usage: "bb radar seen [<lane-id>]" },
+      { name: "refresh", summary: "Refetch every lane now", usage: "bb radar refresh" },
+      { name: "put", summary: "Create or replace a lane from JSON", usage: "bb radar put '<lane json>'" },
+      { name: "defaults", summary: "Add any missing default lanes (keeps yours)", usage: "bb radar defaults" },
+      { name: "scopes", summary: "Repos and areas in results, with the focus filter", usage: "bb radar scopes [--json]" },
+      { name: "focus", summary: "Focus mode: describe it, or name repos/areas; --off / --on", usage: "bb radar focus <description…> | <repo|area>… | --add <…> | --off | --on" },
+      { name: "hide", summary: "Hide repos/areas everywhere", usage: "bb radar hide <repo|area>…" },
+      { name: "show", summary: "Unhide repos/areas", usage: "bb radar show <repo|area>…" },
+      {
+        name: "rebase",
+        summary: "Server-side rebase of your own open PR onto its base (rewrites the branch; needs --yes)",
+        usage: "bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]",
+      },
+    ],
+    async run(argv) {
+      const json = argv.includes("--json");
+      const args = argv.filter((arg) => arg !== "--json");
+      const [command, ...rest] = args;
+      try {
+        switch (command) {
+          case undefined:
+          case "help":
+          case "--help":
+            return { exitCode: 0, stdout: usage };
+          case "refresh":
+            await refreshAll();
+            return { exitCode: 0, stdout: `Refreshed ${lanes.length} lanes.` };
+          case "status": {
+            if (fetchedAt === "") await refreshAll();
+            const hiddenKeys = new Set(allItems().filter((item) => !visible(item)).map((item) => item.key));
+            if (json) {
+              return {
+                exitCode: 0,
+                stdout: JSON.stringify({ ...snapshot(), scopeSummary: { active: isActive(scope), hiddenItems: hiddenKeys.size, newCount: newCount() } }),
+              };
+            }
+            const lines = lanes.map((lane) => {
+              const result = results[lane.id];
+              const shown = result?.items.filter(visible) ?? [];
+              const hidden = (result?.items.length ?? 0) - shown.length;
+              const fresh = shown.filter((item) => item.isNew).length;
+              const notes = [fresh > 0 ? `${fresh} new` : "", hidden > 0 ? `${hidden} hidden` : ""].filter(Boolean).join(", ");
+              const tail = result?.error ? `  ERROR: ${result.error}` : notes ? `  (${notes})` : "";
+              return `${String(shown.length).padStart(3)}  ${lane.title} [${lane.id}]${tail}`;
+            });
+            const filterLine = isActive(scope)
+              ? `focus: ON ${focusState.description ? `“${focusState.description}” → ` : ""}${describeScope(scope)} (${hiddenKeys.size} item${hiddenKeys.size === 1 ? "" : "s"} hidden; bb radar focus --off to turn off)`
+              : isActive(focusState)
+                ? `focus: off (last: ${focusState.summary || describeScope(focusState)}; bb radar focus --on to resume)`
+                : "focus: off";
+            return { exitCode: 0, stdout: [`fetched ${fetchedAt || "(never)"}`, filterLine, ...lines].join("\n") };
+          }
+          case "list": {
+            if (fetchedAt === "") await refreshAll();
+            const laneIndex = rest.indexOf("--lane");
+            const laneId = laneIndex >= 0 ? rest[laneIndex + 1] : undefined;
+            const viewIndex = rest.indexOf("--view");
+            const viewArg = viewIndex >= 0 ? rest[viewIndex + 1] : undefined;
+            if (viewArg !== undefined && !(CATEGORIES as readonly string[]).includes(viewArg)) {
+              return { exitCode: 1, stderr: `--view must be one of ${CATEGORIES.join(", ")}.` };
+            }
+            const view = (viewArg ?? "all") as View;
+            const onlyNew = rest.includes("--new");
+            const everything = rest.includes("--all");
+            const rows = lanes
+              .filter((lane) => (laneId === undefined || lane.id === laneId) && laneInView(lane, view))
+              .flatMap((lane) =>
+                (results[lane.id]?.items ?? [])
+                  .filter((item) => itemInView(item, view) && (!onlyNew || item.isNew) && (everything || visible(item)))
+                  .map((item) => ({ lane: lane.id, ...item })),
+              );
+            if (json) return { exitCode: 0, stdout: JSON.stringify(rows) };
+            if (rows.length === 0) return { exitCode: 0, stdout: "Nothing here." };
+            const shown = rows.slice(0, CLI_ROW_LIMIT).map(
+              (row) =>
+                `${row.isNew ? "*" : " "} ${row.lane.padEnd(18).slice(0, 18)} ${`${row.repo}#${row.number}`.padEnd(30)} ${row.title.slice(0, 80)}  ${row.url}`,
+            );
+            if (rows.length > CLI_ROW_LIMIT) shown.push(`… ${rows.length - CLI_ROW_LIMIT} more (use --json)`);
+            return { exitCode: 0, stdout: shown.join("\n") };
+          }
+          case "defaults": {
+            const have = new Set(lanes.map((lane) => lane.id));
+            const missing = DEFAULT_LANES.filter((lane) => !have.has(lane.id));
+            if (missing.length === 0) return { exitCode: 0, stdout: "All default lanes are present." };
+            await saveLanes([...lanes, ...missing.map((lane) => ({ ...lane }))]);
+            publish();
+            void refreshAll();
+            return { exitCode: 0, stdout: `Added ${missing.map((lane) => lane.id).join(", ")}.` };
+          }
+          case "lanes":
+            return {
+              exitCode: 0,
+              stdout: json ? JSON.stringify(lanes) : lanes.map(describeLane).join("\n"),
+            };
+          case "add": {
+            const dryRun = rest.includes("--dry-run");
+            const description = rest.filter((arg) => arg !== "--dry-run").join(" ").trim();
+            if (description.length < 3) return { exitCode: 1, stderr: "Describe what to track." };
+            const draft = await draftLane(description);
+            if (!dryRun) await upsertLane(draft.lane);
+            const preview = draft.preview.error
+              ? `preview error: ${draft.preview.error}`
+              : `${draft.preview.items.length} item(s) match now`;
+            return {
+              exitCode: 0,
+              stdout: json
+                ? JSON.stringify(draft)
+                : `${dryRun ? "Drafted (not added)" : "Added"}:\n${describeLane(draft.lane)}\n${preview}`,
+            };
+          }
+          case "put": {
+            // Agent/scripting path: upsert one lane from JSON (same schema as `bb radar lanes --json`).
+            let lane: unknown;
+            try {
+              lane = JSON.parse(rest.join(" "));
+            } catch {
+              return { exitCode: 1, stderr: "Usage: bb radar put '<lane json>'" };
+            }
+            try {
+              await upsertLane(lane);
+            } catch (error) {
+              return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
+            }
+            const id = (lane as { id?: unknown }).id;
+            return { exitCode: 0, stdout: `Saved ${typeof id === "string" ? id : "lane"}.` };
+          }
+          case "remove": {
+            const id = rest[0];
+            if (id === undefined || !lanes.some((lane) => lane.id === id)) {
+              return { exitCode: 1, stderr: `No lane "${id ?? ""}". Run bb radar lanes.` };
+            }
+            await deleteLane(id);
+            return { exitCode: 0, stdout: `Removed ${id}.` };
+          }
+          case "seen":
+            await markSeen(rest[0]);
+            return { exitCode: 0, stdout: "Marked seen." };
+          case "scopes": {
+            if (fetchedAt === "") await refreshAll();
+            const entries = catalog();
+            if (json) return { exitCode: 0, stdout: JSON.stringify({ filter: scope, focus: focusState, scopes: entries }) };
+            const row = (entry: ScopeEntry, indent: string) => {
+              const mark = entry.state === "hidden" ? "-" : entry.state === "unfocused" ? "·" : entry.state === "focused" ? "*" : " ";
+              const counts = `${entry.total}${entry.fresh > 0 ? ` (${entry.fresh} new)` : ""}${entry.hiddenItems > 0 ? ` [${entry.hiddenItems} hidden]` : ""}`;
+              return `${mark} ${indent}${entry.key.padEnd(40 - indent.length)} ${counts}`;
+            };
+            const lines = entries.flatMap((entry) => [row(entry, ""), ...(entry.children ?? []).map((child) => row(child, "  "))]);
+            return {
+              exitCode: 0,
+              stdout: [`filter: ${describeScope(scope)}   (* focused, · outside focus, - hidden)`, ...lines].join("\n"),
+            };
+          }
+          case "focus":
+          case "hide":
+          case "show": {
+            if (fetchedAt === "") await refreshAll();
+            const flags = new Set(["--clear", "--off", "--on", "--add"]);
+            const names = rest.filter((arg) => !flags.has(arg));
+            if (command === "focus" && (rest.includes("--off") || rest.includes("--clear"))) await setFocusEnabled(false);
+            else if (command === "focus" && rest.includes("--on")) await setFocusEnabled(true);
+            else if (names.length === 0) {
+              return { exitCode: 1, stderr: `Usage: bb radar ${command} ${command === "focus" ? "<description…> | <repo|area>… | --on | --off" : "<repo|area>…"}` };
+            } else if (command === "focus" && !rest.includes("--add")) {
+              // Exact repo/area names focus on them; anything else is a description.
+              let keys: string[] | null;
+              try {
+                keys = resolveScopes(names);
+              } catch {
+                keys = null;
+              }
+              if (keys !== null) await editScope("focus", keys);
+              else await describeFocus(names.join(" "));
+            } else {
+              await editScope(command === "focus" ? "add-focus" : (command as ScopeOp), resolveScopes(names));
+            }
+            const hidden = new Set(allItems().filter((item) => !visible(item)).map((item) => item.key)).size;
+            return {
+              exitCode: 0,
+              stdout: json
+                ? JSON.stringify(focusState)
+                : isActive(scope)
+                  ? `Focus on: ${describeScope(scope)} (${hidden} hidden)`
+                  : "Focus off: showing everything.",
+            };
+          }
+          case "rebase": {
+            const sourceIndex = rest.indexOf("--source");
+            const sourceFlag = sourceIndex >= 0 ? rest[sourceIndex + 1] : undefined;
+            const positional = rest.filter((arg, index) => !arg.startsWith("--") && (sourceIndex < 0 || index !== sourceIndex + 1));
+            if (positional.length !== 1) {
+              return { exitCode: 1, stderr: "Usage: bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]" };
+            }
+            if (fetchedAt === "") await refreshAll();
+            const target = resolveRebaseTarget(positional[0]!, sourceFlag);
+            const name = `${SOURCE_LABEL[target.source]} ${target.repo}#${target.number}`;
+            if (!rest.includes("--yes")) {
+              return {
+                exitCode: 1,
+                stderr: `This rewrites the remote branch of ${name}. Re-run with --yes to rebase it onto its base.`,
+              };
+            }
+            const result = await rebase(target);
+            return {
+              exitCode: 0,
+              stdout: json ? JSON.stringify({ ...target, ...result }) : `${name}: ${result.message} (head ${result.headSha.slice(0, 12)})`,
+            };
+          }
+          default:
+            return { exitCode: 1, stderr: usage };
+        }
+      } catch (error) {
+        return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  });
+
+  bb.onDispose(async () => {
+    disposed = true;
+    controller.abort();
+    wakeSleep?.();
+    if (publishTimer !== undefined) clearTimeout(publishTimer);
+    await inFlight?.catch(() => undefined);
+  });
+}

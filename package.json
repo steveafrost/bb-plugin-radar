@@ -1,0 +1,43 @@
+{
+  "name": "bb-plugin-radar",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "description": "Live queues of the PRs and issues that need you on GitHub (plus optional Gitstream and Delta), with one-click review threads.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/steveafrost/bb-plugin-radar.git"
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
+  },
+  "bb": {
+    "name": "Radar",
+    "description": "A live panel of the pull requests and issues that need you, on GitHub, plus optional Gitstream and Delta repos. Describe what to track and an LLM turns it into a lane; start a review or triage thread from any row.",
+    "branding": {
+      "icon": "./assets/icon.svg"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.4"
+  },
+  "license": "MIT"
+}
