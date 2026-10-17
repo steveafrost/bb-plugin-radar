@@ -237,31 +237,6 @@ function ItemRow({ item }: { item: RadarItem }) {
   );
 }
 
-function gitstreamSummary(lane: Lane): string {
-  const parts = Object.entries(lane.gitstream ?? {}).map(([key, value]) => (value === true ? key : `${key}:${value}`));
-  return parts.join(" ") || "author:@me";
-}
-
-/** Source chips (configured sources only), then the shared search query, then Gitstream's filters. */
-function LaneScope({ lane }: { lane: Lane }) {
-  const enabled = enabledSources();
-  const sources = lane.sources.filter((source) => enabled.includes(source));
-  const searched = sources.some((source) => source !== "gitstream");
-  const gitstreamOn = sources.includes("gitstream");
-  return (
-    <p className="radar-lane__query radar-mono" title={lane.description}>
-      {sources.map((source) => (
-        <span key={source} className="radar-chip radar-chip--muted radar-chip--source">
-          {SOURCE_LABEL[source]}
-        </span>
-      ))}{" "}
-      {searched ? lane.query : null}
-      {gitstreamOn ? <>{searched ? ` · ${SOURCE_LABEL.gitstream} ` : ""}{gitstreamSummary(lane)}</> : null}
-      {lane.filter === undefined || Object.keys(lane.filter).length === 0 ? null : <> · filter {JSON.stringify(lane.filter)}</>}
-    </p>
-  );
-}
-
 /** Title-bar tab glyphs; VIEWS sets the order. Old board/prs and board/issues routes keep working. */
 const VIEW_GLYPH: Record<View, GlyphName> = { reviews: "review", prs: "pr", issues: "issue", all: "stack" };
 const VIEW_HELP: Record<View, string> = {
@@ -625,7 +600,6 @@ function LaneCard({
       </header>
       {collapsed ? null : (
         <>
-          <LaneScope lane={lane} />
           {result?.error ? <p className="radar-error">{result.error}</p> : null}
           {result !== undefined && items.length === 0 && !result.loading && !result.error ? (
             <p className="radar-empty">
@@ -1067,7 +1041,6 @@ function DraftPreview({
           </button>
         </span>
       </header>
-      <LaneScope lane={lane} />
       {preview.error ? <p className="radar-error">{preview.error}</p> : null}
       {preview.items.length === 0 && !preview.error ? <p className="radar-empty">No items match right now.</p> : null}
       <ul className="radar-items">

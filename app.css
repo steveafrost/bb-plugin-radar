@@ -251,15 +251,6 @@
 .radar-lane__tools:focus-within {
   opacity: 1;
 }
-.radar-lane__query {
-  margin: 0;
-  padding: 0 12px 8px 32px;
-  color: var(--r-faint);
-  font-size: var(--text-xs, 0.75rem);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .radar-count {
   min-width: 20px;
   padding: 0 6px;
@@ -1136,9 +1127,6 @@
 .radar-lane:not(.radar-lane--editor) > .radar-lane__head {
   padding: 0 2px;
   min-height: 28px;
-}
-.radar-lane:not(.radar-lane--editor) > .radar-lane__query {
-  padding: 0 2px 2px 26px;
 }
 .radar-lane:not(.radar-lane--editor) > .radar-empty {
   padding: 2px 2px 4px 26px;
