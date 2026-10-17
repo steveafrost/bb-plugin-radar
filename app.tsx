@@ -1205,11 +1205,14 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
-            {totals.fresh > 0 ? (
-              <button type="button" className="radar-btn" onClick={() => void mutate(rpc.call("radar_mark_seen", { view }))}>
-                Mark all seen
-              </button>
-            ) : null}
+            <button
+              type="button"
+              className="radar-icon-btn"
+              title="Mark all seen — every lane, every view"
+              onClick={() => void mutate(rpc.call("radar_mark_seen", { view: "all" }))}
+            >
+              <Glyph name="seen" className="radar-icon" />
+            </button>
             <button
               type="button"
               className="radar-btn"
