@@ -116,6 +116,7 @@ const useTrackBoxOpen = () => useSyncExternalStore(trackBox.subscribe, trackBox.
 const ReviewActions = createContext<{
   threadFor: (key: string) => string | undefined;
   review: (item: RadarItem) => void;
+  acknowledge: (item: RadarItem) => void;
   open: (threadId: string) => void;
   viewer: Viewer;
   rebase: (item: RadarItem) => Promise<RebaseResult>;
@@ -218,6 +219,7 @@ function ItemRow({ item }: { item: RadarItem }) {
       </div>
       {actions !== null ? (
         <span className="radar-item__actions" data-active={rebaseActive || undefined}>
+          {item.canAcknowledge ? <button type="button" className="radar-act radar-act--acknowledge" title="Clear this mention and mark its GitHub notification read" onClick={() => actions.acknowledge(item)}>Acknowledge</button> : null}
           {showRebase ? <RebaseAction item={item} rebase={actions.rebase} onActive={setRebaseActive} /> : null}
           {threadId !== undefined ? (
             <ActionIcon icon="external" label="Open thread" tip="Open the bb thread started for this" onClick={() => actions.open(threadId)} />
@@ -239,12 +241,6 @@ function ItemRow({ item }: { item: RadarItem }) {
 
 /** Title-bar tab glyphs; VIEWS sets the order. Old board/prs and board/issues routes keep working. */
 const VIEW_GLYPH: Record<View, GlyphName> = { reviews: "review", prs: "pr", issues: "issue", all: "stack" };
-const VIEW_HELP: Record<View, string> = {
-  reviews: "Review queues",
-  prs: "Pull request lanes",
-  issues: "Issue lanes",
-  all: "Every lane",
-};
 
 const scopeOf = (snapshot: RadarSnapshot | null): ScopeFilter => snapshot?.scope ?? EMPTY_SCOPE;
 
@@ -280,61 +276,6 @@ function viewTotals(snapshot: RadarSnapshot | null): Record<View, { items: numbe
   return Object.fromEntries(VIEWS.map((view) => [view, total(view)])) as Record<View, { items: number; fresh: number; hidden: number }>;
 }
 
-function ViewToggle({ subPath }: PluginNavPanelProps) {
-  const { rpc, snapshot, mutate } = useRadar();
-  const navigate = useBbNavigate();
-  const current = viewFrom(subPath);
-  const totals = viewTotals(snapshot);
-  const scope = scopeOf(snapshot);
-  const entries = useMemo(() => scopeCatalog(viewItems(snapshot, current), scope), [snapshot, current, scope]);
-  const tracking = useTrackBoxOpen();
-  return (
-    <div className="radar radar-views">
-      <div className="radar-views__tabs" role="tablist" aria-label="Radar view">
-        {VIEWS.map((view) => {
-          const { items, fresh } = totals[view];
-          const tip = `${CATEGORY_LABEL[view]}: ${items}${fresh > 0 ? `, ${fresh} new` : ""} · ${VIEW_HELP[view]}`;
-          return (
-            <button
-              key={view}
-              type="button"
-              role="tab"
-              aria-selected={current === view}
-              aria-label={tip}
-              title={tip}
-              className="radar-views__tab"
-              onClick={() => navigate.toPluginPanel("board", { subPath: view, replace: true })}
-            >
-              <Glyph name={VIEW_GLYPH[view]} className="radar-views__icon" optical />
-              {fresh > 0 ? <span className="radar-views__dot" aria-hidden="true" /> : null}
-            </button>
-          );
-        })}
-      </div>
-      <span className="radar-views__sep" aria-hidden="true" />
-      <button
-        type="button"
-        className="radar-views__tab"
-        aria-pressed={tracking}
-        aria-label="Track something new"
-        title="Track something new: describe it and Radar drafts a lane"
-        onClick={() => trackBox.set(!tracking)}
-      >
-        <Glyph name="sparkles" className="radar-views__icon" optical />
-      </button>
-      <FocusControl
-        entries={entries}
-        state={snapshot?.focus}
-        hidden={totals[current].hidden}
-        aiAvailable={snapshot?.ai.available ?? false}
-        onOp={(op, keys) => void mutate(rpc.call("radar_scope", { op, keys }))}
-        onSet={(enabled) => void mutate(rpc.call("radar_focus_set", { enabled }))}
-        onDescribe={async (description) => (await mutate(rpc.call("radar_focus_describe", { description }))) !== null}
-      />
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Focus filter: hide repos (and area-repo areas) across every lane and view.
 
@@ -349,7 +290,7 @@ function ScopeRow({
 }) {
   const off = entry.state === "hidden" || entry.state === "unfocused";
   const label = child ? entry.label.replace(/^[^/]+\//, "") : entry.label;
-  const [owner, name] = !child && label.includes("/") ? [label.slice(0, label.indexOf("/") + 1), label.slice(label.indexOf("/") + 1)] : ["", label];
+  const name = label;
   return (
     <li className="radar-scope__row" data-off={off || undefined} data-child={child || undefined} data-state={entry.state}>
       <button
@@ -361,10 +302,7 @@ function ScopeRow({
         onClick={() => onOp(off ? "show" : "hide", [entry.key])}
       >
         <Glyph name={off ? "eyeOff" : "eye"} className="radar-scope__eye" />
-        <span className="radar-scope__name">
-          {owner ? <span className="radar-scope__owner">{owner}</span> : null}
-          {name}
-        </span>
+        <span className="radar-scope__name" title={entry.label}>{name}</span>
       </button>
       <button
         type="button"
@@ -383,6 +321,8 @@ function ScopeRow({
 }
 
 function FocusControl({
+  view,
+  onView,
   entries,
   state,
   hidden,
@@ -391,6 +331,8 @@ function FocusControl({
   onDescribe,
   onSet,
 }: {
+  view: View;
+  onView: (view: View) => void;
   entries: ScopeEntry[];
   state: FocusState | undefined;
   hidden: number;
@@ -399,16 +341,27 @@ function FocusControl({
   onDescribe: (description: string) => Promise<boolean>;
   onSet: (enabled: boolean) => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const on = state?.enabled === true && isActive(state);
   const resumable = state !== undefined && !state.enabled && isActive(state);
   useEffect(() => {
-    if (!open) return;
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && setOpen(false);
+    if (!menuOpen) return;
+    const close = () => { setMenuOpen(false); setOpen(false); };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (open) {
+        setOpen(false);
+        requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".radar-filter__zen")?.focus());
+      } else {
+        close();
+        document.querySelector<HTMLButtonElement>(".radar-filter__trigger")?.focus();
+      }
+    };
     const onDown = (event: MouseEvent) => {
-      if (!(event.target as Element | null)?.closest?.(".radar-scope")) setOpen(false);
+      if (!(event.target as Element | null)?.closest?.(".radar-scope")) close();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
@@ -416,7 +369,7 @@ function FocusControl({
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("mousedown", onDown);
     };
-  }, [open]);
+  }, [menuOpen, open]);
   const submit = () => {
     if (text.trim().length < 2 || busy) return;
     setBusy(true);
@@ -432,23 +385,49 @@ function FocusControl({
     <div className="radar-scope">
       <button
         type="button"
-        className="radar-views__tab radar-focus"
-        data-on={on || undefined}
-        aria-expanded={open}
+        className="radar-btn radar-focus radar-filter__trigger"
+        data-on={on || view !== "all" || undefined}
+        aria-expanded={menuOpen}
         aria-haspopup="dialog"
-        aria-label={on ? `Focus: ${state?.summary || describeScope(state!)}${hidden > 0 ? `, ${hidden} hidden` : ""}` : "Focus"}
-        title={
-          on
-            ? `Focus: ${state?.summary || describeScope(state!)}${hidden > 0 ? ` (${hidden} hidden)` : ""}. Click to change.`
-            : "Focus: describe what helps you focus; Radar hides the rest"
-        }
-        onClick={() => setOpen((value) => !value)}
+        aria-label={`Filter: ${CATEGORY_LABEL[view]}${on ? ", Zen active" : ""}`}
+        onClick={() => { setMenuOpen((value) => !value); setOpen(false); }}
       >
-        <Glyph name="zen" className="radar-views__icon" optical />
-        {on ? <span className="radar-views__dot" aria-hidden="true" /> : null}
+        <span>Filter</span>
+        <svg className="radar-filter__chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+        {on || view !== "all" ? <span className="radar-views__dot" aria-hidden="true" /> : null}
       </button>
+      {menuOpen ? (
+        <div className={`radar-scope__pop radar-filter__pop${open ? " radar-filter__pop--zen" : ""}`} role="dialog" aria-label="Filter">
+          {!open ? <div className="radar-filter__main">
+          <div className="radar-scope__section radar-filter__views">
+            {(["all", "prs", "issues", "reviews"] as View[]).map((value) => (
+              <button key={value} type="button" className="radar-scope__item" aria-pressed={view === value}
+                onClick={() => { onView(value); setMenuOpen(false); setOpen(false); }}>
+                <span className="radar-scope__name">{CATEGORY_LABEL[value]}</span>
+                <span className="radar-filter__check" aria-hidden="true">{view === value ? "✓" : ""}</span>
+              </button>
+            ))}
+          </div>
+          <div className="radar-scope__section">
+            <button type="button" className="radar-scope__item radar-filter__zen" aria-expanded={open}
+              onClick={() => setOpen((value) => !value)}>
+              <span className="radar-scope__name">Zen</span>
+              {on ? <span className="radar-views__dot" aria-label="Active" /> : null}
+              <span aria-hidden="true">›</span>
+            </button>
+          </div>
+          </div> : null}
       {open ? (
-        <div className="radar-scope__pop" role="dialog" aria-label="Focus">
+        <div className="radar-filter__submenu" role="group" aria-label="Zen">
+          <button type="button" className="radar-scope__item radar-filter__back"
+            onClick={() => {
+              setOpen(false);
+              requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".radar-filter__zen")?.focus());
+            }}>
+            <span aria-hidden="true">‹</span>
+            <span>Back</span>
+            <span className="radar-filter__back-title">Zen</span>
+          </button>
           <form
             className="radar-scope__ask"
             onSubmit={(event) => {
@@ -497,6 +476,8 @@ function FocusControl({
             </ul>
           </div>
           {!aiAvailable ? <p className="radar-scope__foot">AI unavailable: descriptions match repo and area names only.</p> : null}
+        </div>
+      ) : null}
         </div>
       ) : null}
     </div>
@@ -566,8 +547,6 @@ function LaneCard({
         <button type="button" className="radar-lane__toggle" onClick={onToggle}>
           <Glyph name={collapsed ? "chevronRight" : "chevronDown"} className="radar-icon" />
           <span className="radar-lane__title">{lane.title}</span>
-          <span className="radar-count">{result === undefined ? "…" : items.length}</span>
-          {fresh > 0 ? <span className="radar-count radar-count--new">{fresh} new</span> : null}
           {hidden > 0 ? (
             <span className="radar-lane__hidden" title="Hidden by the repo / area focus filter">
               {hidden} hidden
@@ -1022,7 +1001,6 @@ function DraftPreview({
         <span className="radar-lane__toggle">
           <Glyph name="sparkles" className="radar-icon" />
           <span className="radar-lane__title">{lane.title}</span>
-          <span className="radar-count">{preview.items.length}</span>
           <span className="radar-chip radar-chip--muted">preview</span>
           <span className="radar-chip radar-chip--muted radar-chip--view" title={lane.category === "all" ? "Shows in All" : `Shows in ${CATEGORY_LABEL[lane.category]} and All`}>
             <Glyph name={VIEW_GLYPH[lane.category]} className="radar-icon" />
@@ -1111,6 +1089,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const reviewActions = useMemo(
     () => ({
       threadFor: (key: string) => snapshot?.reviews[key]?.threadId,
+      acknowledge: (item: RadarItem) => { void mutate(rpc.call("radar_acknowledge", { key: item.key })); },
       open: (threadId: string) => navigate.toThread(threadId),
       review: (item: RadarItem) => {
         void call(rpc.call("radar_review_context", { key: item.key }) as Promise<ReviewContext>).then((context) => {
@@ -1123,19 +1102,22 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       rebase: (item: RadarItem) =>
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
     }),
-    [snapshot, navigate, call, rpc],
+    [snapshot, navigate, call, rpc, mutate],
   );
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [editing, setEditing] = useState<Draft | null>(null);
   const [search, setSearch] = useState("");
-  const [onlyNew, setOnlyNew] = useState(false);
   const query = search.trim().toLowerCase();
   const tracking = useTrackBoxOpen();
 
   const lanes = snapshot?.lanes ?? [];
-  const totals = useMemo(() => viewTotals(snapshot)[view], [snapshot, view]);
   const scope = scopeOf(snapshot);
   const inScope = useMemo(() => scopePredicate(scope), [scope]);
+  const entries = useMemo(() => scopeCatalog(viewItems(snapshot, view), scope), [snapshot, view, scope]);
+  const totals = useMemo(() => viewTotals(snapshot)[view], [snapshot, view]);
+  const refreshLabel = snapshot?.refreshing ? "Refreshing…" : snapshot?.fetchedAt
+    ? `Refresh — updated ${relative(snapshot.fetchedAt) === "now" ? "just now" : `${relative(snapshot.fetchedAt)} ago`}`
+    : "Refresh";
 
   const saveLane = async (lane: Partial<Lane>) => {
     const before = new Set(lanes.map((existing) => existing.id));
@@ -1168,58 +1150,66 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
         lane,
         hidden: mine.length - shown.length,
         otherKind: result.items.length - mine.length,
-        result: { ...result, items: shown.filter((item) => !onlyNew || item.isNew) },
+        result: { ...result, items: shown },
       };
-    })
-    .filter(({ result }) => !onlyNew || (result?.items.length ?? 0) > 0);
+    });
 
   return (
     <div className="radar">
       <div className="radar__inner">
-        <div className="radar-bar">
-          <div className="radar-bar__facts">
-            <span>
-              <b>{totals.items}</b> items
-            </span>
-            <button
-              type="button"
-              className="radar-pill"
-              aria-pressed={onlyNew}
-              onClick={() => setOnlyNew((value) => !value)}
-              title="Show only items you have not seen"
-            >
-              <b>{totals.fresh}</b> new
-            </button>
-            <span className="radar-faint">
-              {snapshot?.refreshing ? "refreshing…" : snapshot?.fetchedAt
-                  ? relative(snapshot.fetchedAt) === "now"
-                    ? "updated just now"
-                    : `updated ${relative(snapshot.fetchedAt)} ago`
-                  : "loading…"}
-            </span>
-          </div>
-          <div className="radar-row">
+        <div className="radar-bar" role="group" aria-label="Radar tools">
             <input
               className="radar-input radar-search"
-              placeholder="Filter…"
+              placeholder="Search..."
+              aria-label="Search items"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
+          <div className="radar-bar__actions">
+            <FocusControl
+              view={view}
+              onView={(value) => navigate.toPluginPanel("board", { subPath: value, replace: true })}
+              entries={entries}
+              state={snapshot?.focus}
+              hidden={totals.hidden}
+              aiAvailable={snapshot?.ai.available ?? false}
+              onOp={(op, keys) => void mutate(rpc.call("radar_scope", { op, keys }))}
+              onSet={(enabled) => void mutate(rpc.call("radar_focus_set", { enabled }))}
+              onDescribe={async (description) => (await mutate(rpc.call("radar_focus_describe", { description }))) !== null}
+            />
+            <span className="radar-toolbar-sep" aria-hidden="true" />
+            <button
+              type="button"
+              className="radar-icon-btn radar-add-panel"
+              aria-label="Add a panel"
+              aria-pressed={tracking}
+              title="Add a panel: describe what to track or add manually"
+              onClick={() => trackBox.set(!tracking)}
+            >
+              <svg className="radar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 8v8M8 12h8" />
+              </svg>
+            </button>
+            <span className="radar-toolbar-sep" aria-hidden="true" />
             <button
               type="button"
               className="radar-icon-btn"
               title="Mark all seen — every lane, every view"
+              aria-label="Mark all seen — every lane, every view"
               onClick={() => void mutate(rpc.call("radar_mark_seen", { view: "all" }))}
             >
               <Glyph name="seen" className="radar-icon" />
             </button>
             <button
               type="button"
-              className="radar-btn"
-              disabled={snapshot?.refreshing}
+              className="radar-icon-btn"
+              title={refreshLabel}
+              aria-label={refreshLabel}
+              disabled={!snapshot || snapshot.refreshing}
               onClick={() => void mutate(rpc.call("radar_refresh", null))}
             >
-              <Glyph name="refresh" className="radar-icon" /> Refresh
+              <Glyph name="refresh" className={`radar-icon${snapshot?.refreshing ? " radar-icon--spinning" : ""}`} />
             </button>
           </div>
         </div>
@@ -1321,7 +1311,6 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
             </button>
           </p>
         ) : null}
-        {onlyNew && visibleLanes.length === 0 ? <p className="radar-empty">You're caught up.</p> : null}
       </div>
     </div>
   );
@@ -1329,12 +1318,12 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
 
 export default definePluginApp((app) => {
   app.slots.navPanel({
+    headerContent: () => <span className="radar-header-anchor" aria-hidden="true" />,
     id: "board",
     title: "Radar",
     icon: "Radar",
     path: "board",
     component: RadarPage,
-    headerContent: ViewToggle,
   });
   app.contentScripts.register({ id: "rail-badge", mount: mountRailBadge });
 });

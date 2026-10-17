@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { MentionTracker, mentionStoreSchema, createMentionStore } from "./mentions";
 
 const DEFAULT_AI_BASE_URL = "https://api.openai.com";
 const DEFAULT_AI_KEY_ENV = "OPENAI_API_KEY";
@@ -147,6 +148,7 @@ const itemSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   isNew: z.boolean(),
+  canAcknowledge: z.boolean().optional(),
 });
 
 const laneResultSchema = z.object({
@@ -195,6 +197,7 @@ export const rpcContract = defineRpcContract({
   radar_lane_delete: { input: z.object({ laneId: z.string() }), output: z.any() },
   radar_lanes_reorder: { input: z.object({ ids: z.array(z.string()) }), output: z.any() },
   radar_lanes_reset: { input: z.null(), output: z.any() },
+  radar_acknowledge: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
   radar_mark_seen: {
     /** `view` limits it to what that view shows; `kind` is the pre-category form (pr = prs, issue = issues). */
     input: z.object({ laneId: z.string().optional(), view: z.enum(CATEGORIES).optional(), kind: z.enum(["pr", "issue"]).optional() }),
@@ -397,6 +400,43 @@ export default async function plugin(bb: BbPluginApi) {
   type SeenMap = Record<string, string[]>;
   let seen: SeenMap = (await bb.storage.kv.get<SeenMap>("seen")) ?? {};
   const persistSeen = () => bb.storage.kv.set("seen", seen);
+  const storedMentions = mentionStoreSchema.safeParse(await bb.storage.kv.get<unknown>("mentions"));
+  const mentions = new MentionTracker(storedMentions.success ? storedMentions.data : createMentionStore(), async (path, method = "GET") => {
+    const output = await tool(config.ghPath, ["api", "--method", method, path], "GitHub notifications");
+    return output.trim() ? parseJson(output, "GitHub notifications") : null;
+  }, "github.com", async () => { await bb.storage.kv.set("mentions", mentions.state); });
+  const persistMentions = () => bb.storage.kv.set("mentions", mentions.state);
+  const trackedSchema = z.record(z.string(), z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]) }));
+  const storedTracked = trackedSchema.safeParse(await bb.storage.kv.get<unknown>("mentionCandidates"));
+  const trackedMentions = storedTracked.success ? storedTracked.data : {};
+  const isMentionLane = (lane: Lane) => lane.sources.includes("github") && /(?:^|\s)mentions:@me(?:\s|$)/i.test(lane.query ?? "");
+  let mentionSync: Promise<void> = Promise.resolve();
+  function syncMentions(): Promise<void> {
+    mentionSync = mentionSync.catch(() => {}).then(async () => {
+      if (!githubLogin) return;
+      const candidates = new Map(Object.entries(trackedMentions));
+      for (const lane of lanes.filter(isMentionLane)) {
+        for (const item of results[lane.id]?.items ?? []) if (item.source === "github") candidates.set(item.key, item);
+      }
+      if (!candidates.size) return;
+      for (const [key, item] of candidates) trackedMentions[key] = { key, repo: item.repo, number: item.number, kind: item.kind };
+      await bb.storage.kv.set("mentionCandidates", trackedMentions);
+      const generations = new Map([...candidates.keys()].map(key => [key, mentions.metadata(key).generation]));
+      await mentions.reconcile([...candidates.values()], githubLogin);
+      for (const lane of lanes.filter(isMentionLane)) {
+        for (const item of results[lane.id]?.items ?? []) {
+          if (item.source === "github" && (generations.get(item.key) ?? 0) > 0 && mentions.metadata(item.key).generation > (generations.get(item.key) ?? 0)) {
+            seen[lane.id] = (seen[lane.id] ?? []).filter(key => key !== item.key);
+            item.isNew = true;
+          }
+        }
+      }
+      await persistSeen();
+      await persistMentions();
+      publish();
+    });
+    return mentionSync;
+  }
 
   let lanes = await loadLanes();
 
@@ -463,7 +503,15 @@ export default async function plugin(bb: BbPluginApi) {
   function snapshot(): RadarSnapshot {
     return {
       lanes,
-      results,
+      results: Object.fromEntries(Object.entries(results).map(([id, result]) => {
+        const lane = lanes.find(l => l.id === id);
+        if (!lane || !isMentionLane(lane)) return [id, result];
+        return [id, { ...result,
+          error: [result.error, mentions.error ? `Mention sync: ${mentions.error}` : ""].filter(Boolean).join(" · "),
+          items: result.items.filter(item => item.source !== "github" || mentions.metadata(item.key).generation === 0 || mentions.metadata(item.key).canAck)
+            .map(item => ({ ...item, canAcknowledge: item.source === "github" && mentions.metadata(item.key).canAck })),
+        }];
+      })),
       fetchedAt,
       refreshing,
       githubLogin,
@@ -717,6 +765,7 @@ export default async function plugin(bb: BbPluginApi) {
           githubLogin = (await tool(config.ghPath, ["api", "user", "--jq", ".login"], "gh api user").catch(() => "")).trim();
         }
         await pool([...lanes], refreshLane);
+        await syncMentions();
         fetchedAt = new Date().toISOString();
         // Drop results and seen sets for lanes that no longer exist.
         const ids = new Set(lanes.map((lane) => lane.id));
@@ -867,7 +916,7 @@ export default async function plugin(bb: BbPluginApi) {
         delete seen[lane.id];
         await persistSeen();
       }
-      void refreshLane(lane);
+      void refreshLane(lane).then(() => isMentionLane(lane) ? syncMentions() : undefined).catch(error => bb.log.warn(`lane refresh failed: ${String(error)}`));
     }
     publish();
     return snapshot();
@@ -920,7 +969,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Unique new items across lanes (an item can sit in several lanes), focus filter applied. */
   function newCount(): number {
     const keys = new Set<string>();
-    for (const result of Object.values(results)) {
+    for (const result of Object.values(snapshot().results)) {
       for (const item of result.items) if (item.isNew && visible(item)) keys.add(item.key);
     }
     return keys.size;
@@ -1260,7 +1309,7 @@ export default async function plugin(bb: BbPluginApi) {
     radar_snapshot: () => snapshot(),
     radar_refresh: async (input) => {
       const lane = input?.laneId === undefined ? undefined : lanes.find((candidate) => candidate.id === input.laneId);
-      if (lane !== undefined) await refreshLane(lane);
+      if (lane !== undefined) { await refreshLane(lane); if (isMentionLane(lane)) await syncMentions(); }
       else await refreshAll();
       return snapshot();
     },
@@ -1272,6 +1321,15 @@ export default async function plugin(bb: BbPluginApi) {
       seen = {};
       await persistSeen();
       void refreshAll();
+      return snapshot();
+    },
+    radar_acknowledge: async ({ key }) => {
+      const eligible = lanes.filter(isMentionLane).some(lane => results[lane.id]?.items.some(item => item.key === key && item.source === "github"));
+      if (!eligible || !mentions.acknowledge(key)) throw new UserError("This mention is no longer available to acknowledge. Refresh and try again.");
+      await persistMentions();
+      publish();
+      // Do not make local clearing wait for GitHub. Failed writes remain queued for refresh.
+      void syncMentions().catch(error => bb.log.warn(`mention sync failed: ${String(error)}`));
       return snapshot();
     },
     radar_mark_seen: ({ laneId, view, kind }) => markSeen(laneId, view ?? (kind === "pr" ? "prs" : kind === "issue" ? "issues" : "all")),
