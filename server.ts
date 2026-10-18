@@ -20,9 +20,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MentionTracker, mentionStoreSchema, createMentionStore } from "./mentions";
 
-const DEFAULT_AI_BASE_URL = "https://api.openai.com";
-const DEFAULT_AI_KEY_ENV = "OPENAI_API_KEY";
-const DEFAULT_AI_MODEL = "gpt-4.1-mini";
+import { aiAvailable, aiOverrideSchema, AI_UNSUPPORTED, complete, type AiOverride } from "./ai";
 import {
   applyFilter,
   findSection,
@@ -192,6 +190,8 @@ export type { FocusState, Lane, RebaseResult, ScopeEntry, ScopeFilter };
 
 export const rpcContract = defineRpcContract({
   radar_snapshot: { input: z.null(), output: z.any() },
+  radar_ai_get: { input: z.null(), output: aiOverrideSchema },
+  radar_ai_set: { input: aiOverrideSchema, output: aiOverrideSchema },
   radar_refresh: { input: z.object({ laneId: z.string().optional() }).nullable(), output: z.any() },
   radar_lane_upsert: { input: z.object({ lane: z.any() }), output: z.any() },
   radar_lane_delete: { input: z.object({ laneId: z.string() }), output: z.any() },
@@ -242,68 +242,56 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     refreshSeconds: {
       type: "number",
-      label: "Refresh interval in seconds (min 30)",
+      label: "Refresh & retention · Refresh interval in seconds (min 30)",
       default: 90,
       experimental_schema: z.number().finite().min(30),
     },
     maxAgeDays: {
       type: "number",
-      label: "Max age in days: hide anything not updated for longer, in every lane (0 = no limit)",
+      label: "Refresh & retention · Maximum age in days (0 = no limit)",
+      description: "Hide items not updated within this many days in every lane.",
       default: DEFAULT_MAX_AGE_DAYS,
       experimental_schema: z.number().finite().int().min(0).max(3650),
     },
-    ghPath: { type: "string", label: "GitHub CLI executable", default: "gh" },
-    gitstreamRepo: { type: "string", label: "Gitstream repo, owner/name (empty = Gitstream off)", default: "" },
-    gitstreamWebUrl: { type: "string", label: "Gitstream web URL PRs open at, https origin (e.g. https://gitstream.example.com)", default: "" },
-    gitstreamLabel: { type: "string", label: "Name shown for Gitstream", default: "Gitstream" },
-    gsPath: { type: "string", label: "Gitstream CLI executable", default: "gs" },
-    deltaHost: { type: "string", label: "Delta host name (e.g. delta.example.com)", default: "" },
-    deltaRepo: { type: "string", label: "Delta repo, owner/name (empty = Delta off)", default: "" },
-    deltaLabel: { type: "string", label: "Name shown for Delta", default: "Delta" },
-    dtPath: { type: "string", label: "Delta CLI executable", default: "dt" },
+    ghPath: { type: "string", label: "Sources · GitHub CLI executable", default: "gh" },
+    gitstreamRepo: { type: "string", label: "Sources · Gitstream repo, owner/name (empty = off)", default: "" },
+    gitstreamWebUrl: { type: "string", label: "Sources · Gitstream web URL (https origin)", default: "" },
+    gitstreamLabel: { type: "string", label: "Sources · Name shown for Gitstream", default: "Gitstream" },
+    gsPath: { type: "string", label: "Sources · Gitstream CLI executable", default: "gs" },
+    deltaHost: { type: "string", label: "Sources · Delta host name (e.g. delta.example.com)", default: "" },
+    deltaRepo: { type: "string", label: "Sources · Delta repo, owner/name (empty = off)", default: "" },
+    deltaLabel: { type: "string", label: "Sources · Name shown for Delta", default: "Delta" },
+    dtPath: { type: "string", label: "Sources · Delta CLI executable", default: "dt" },
     areaRepo: {
       type: "string",
-      label: "Monorepo whose //path labels become Focus areas, owner/name (empty = none)",
+      label: "AI & focus · Area monorepo, owner/name (empty = none)",
+      description: "Its //path labels become Focus areas.",
       default: "",
-    },
-    aiModel: {
-      type: "string",
-      label: "Model for drafting lanes and focus",
-      default: DEFAULT_AI_MODEL,
-    },
-    aiBaseUrl: {
-      type: "string",
-      label: "OpenAI-compatible https base URL for drafting (receives the key below; /v1/chat/completions is appended)",
-      default: DEFAULT_AI_BASE_URL,
-    },
-    aiKeyEnv: {
-      type: "string",
-      label: "Environment variable holding the AI key",
-      default: DEFAULT_AI_KEY_ENV,
     },
     draftNotes: {
       type: "string",
-      label: "Notes for the lane drafter: your repos, teams and labels, in plain words (optional)",
+      label: "AI & focus · Lane drafting notes (optional)",
+      description: "Describe your repos, teams and labels in plain words.",
       default: "",
     },
     reviewSection: {
       type: "string",
-      label: "Thread section for review threads (created if missing; empty = none)",
+      label: "Review workflows · Thread section (created if missing; empty = none)",
       default: "Reviews",
     },
     reviewSkill: {
       type: "string",
-      label: "Skill to invoke when reviewing a GitHub or Delta PR (empty = none)",
+      label: "Review workflows · GitHub / Delta review skill (empty = none)",
       default: DEFAULT_SKILL_SETTINGS.reviewSkill,
     },
     gitstreamReviewSkill: {
       type: "string",
-      label: "Skill to invoke when reviewing a Gitstream PR (empty = none)",
+      label: "Review workflows · Gitstream review skill (empty = none)",
       default: DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill,
     },
     triageSkill: {
       type: "string",
-      label: "Skill to invoke when triaging an issue (empty = none)",
+      label: "Review workflows · Issue triage skill (empty = none)",
       default: DEFAULT_SKILL_SETTINGS.triageSkill,
     },
   });
@@ -321,9 +309,6 @@ export default async function plugin(bb: BbPluginApi) {
     gsPath: string;
     ghPath: string;
     dtPath: string;
-    aiModel: string;
-    aiBaseUrl: string;
-    aiKeyEnv: string;
     reviewSection: string;
     reviewSkill: string;
     gitstreamReviewSkill: string;
@@ -343,27 +328,13 @@ export default async function plugin(bb: BbPluginApi) {
     gsPath: values.gsPath.trim() || "gs",
     ghPath: values.ghPath.trim() || "gh",
     dtPath: (values.dtPath ?? "").trim() || "dt",
-    aiModel: values.aiModel.trim() || DEFAULT_AI_MODEL,
-    aiBaseUrl: aiBaseUrl(values.aiBaseUrl),
-    aiKeyEnv: values.aiKeyEnv.trim() || DEFAULT_AI_KEY_ENV,
     reviewSection: (values.reviewSection ?? "Reviews").trim(),
     reviewSkill: (values.reviewSkill ?? DEFAULT_SKILL_SETTINGS.reviewSkill).trim(),
     gitstreamReviewSkill: (values.gitstreamReviewSkill ?? DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill).trim(),
     triageSkill: (values.triageSkill ?? DEFAULT_SKILL_SETTINGS.triageSkill).trim(),
   });
-  /** The proxy key is sent to this URL, so only https is accepted; anything else falls back to the default. */
-  function aiBaseUrl(value: string): string {
-    const fallback = DEFAULT_AI_BASE_URL;
-    const trimmed = value.trim().replace(/\/+$/, "");
-    if (trimmed === "") return fallback;
-    try {
-      if (new URL(trimmed).protocol === "https:") return trimmed;
-    } catch {
-      // Not a URL.
-    }
-    bb.log.warn(`aiBaseUrl "${trimmed.slice(0, 80)}" is not an https URL; using ${fallback}`);
-    return fallback;
-  }
+  const savedAi = aiOverrideSchema.safeParse(await bb.storage.kv.get<unknown>("aiOverride"));
+  let aiOverride: AiOverride = savedAi.success ? savedAi.data : null;
   /** Applies the host settings; malformed values switch that host off and are logged. */
   function applyHosts(values: Config): void {
     const { hosts: next, problems } = readHosts(values);
@@ -490,14 +461,13 @@ export default async function plugin(bb: BbPluginApi) {
   const controller = new AbortController();
 
   function aiState() {
-    const key = process.env[config.aiKeyEnv];
-    return key
-      ? { available: true, model: config.aiModel, detail: "" }
-      : {
-          available: false,
-          model: config.aiModel,
-          detail: `$${config.aiKeyEnv} is not set in the bb server environment.`,
-        };
+    return {
+      available: aiAvailable(bb),
+      model: aiOverride?.model ?? "BB default",
+      detail: aiAvailable(bb)
+        ? "BB completion API available; the selected provider/model must support text completion."
+        : AI_UNSUPPORTED,
+    };
   }
 
   function snapshot(): RadarSnapshot {
@@ -789,56 +759,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- AI drafting --------------------------------------------------------
 
-  /** One chat completion through the configured OpenAI-compatible proxy. */
   async function chat(system: string, user: string, maxTokens: number): Promise<string> {
-    const key = process.env[config.aiKeyEnv];
-    if (!key) throw new UserError(aiState().detail);
-    const timeout = AbortSignal.timeout(AI_TIMEOUT_MS);
-    let response: Response;
     try {
-      response = await fetch(`${config.aiBaseUrl}/v1/chat/completions`, {
-        method: "POST",
-        signal: AbortSignal.any([timeout, controller.signal]),
-        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: config.aiModel,
-          temperature: 0,
-          max_tokens: maxTokens,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ],
-        }),
-      });
-    } catch {
-      throw new UserError(timeout.aborted ? "The AI request timed out." : "The AI proxy could not be reached.");
+      return await complete(bb, aiOverride, system, user, maxTokens, AI_TIMEOUT_MS, controller.signal);
+    } catch (error) {
+      throw new UserError(error instanceof Error ? error.message : "BB AI completion failed.");
     }
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      const reason = (() => {
-        try {
-          const parsed = JSON.parse(detail) as { reason?: unknown; error?: { message?: unknown } | unknown };
-          if (typeof parsed.reason === "string") return parsed.reason;
-          const nested = (parsed.error as { message?: unknown } | undefined)?.message;
-          return typeof nested === "string" ? nested : "";
-        } catch {
-          return "";
-        }
-      })();
-      throw new UserError(
-        `The AI proxy returned HTTP ${response.status} for model ${config.aiModel}${reason ? `: ${reason.slice(0, 200)}` : "."}`,
-      );
-    }
-    const body = (await response.json().catch(() => null)) as
-      | { choices?: { message?: { content?: unknown } }[] }
-      | null;
-    const content = body?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") throw new UserError("The AI proxy returned an empty answer.");
-    return content;
   }
 
   async function draftLane(description: string): Promise<DraftResult> {
-    if (!process.env[config.aiKeyEnv]) throw new UserError(aiState().detail);
+    if (!aiState().available) throw new UserError(aiState().detail);
     const me = hosts().gitstream === null ? "" : await resolveGitstreamMe().catch(() => "");
     const prompt = draftPrompt(description, {
       githubLogin,
@@ -1307,6 +1237,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     radar_snapshot: () => snapshot(),
+    radar_ai_get: () => aiOverride,
+    radar_ai_set: async (next) => {
+      await bb.storage.kv.set("aiOverride", next);
+      aiOverride = next;
+      publish();
+      return aiOverride;
+    },
     radar_refresh: async (input) => {
       const lane = input?.laneId === undefined ? undefined : lanes.find((candidate) => candidate.id === input.laneId);
       if (lane !== undefined) { await refreshLane(lane); if (isMentionLane(lane)) await syncMentions(); }

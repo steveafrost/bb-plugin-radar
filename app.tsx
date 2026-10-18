@@ -3,6 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, u
 import {
   definePluginApp,
   experimental_NewThreadComposer as NewThreadComposer,
+  experimental_ProviderModelPicker as ProviderModelPicker,
   UrlLink,
   useBbNavigate,
   useRealtime,
@@ -11,6 +12,8 @@ import {
 import type { DraftResult, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract } from "./server";
 import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { mountRailBadge } from "./badge";
+import type { AiOverride } from "./ai";
+import type { ExperimentalProviderModelPickerValue } from "@get-bb/plugin-sdk/app";
 import { CATEGORY_LABEL, enabledSources, itemInView, laneInView, SOURCE_LABEL, SOURCES, viewFrom, VIEWS, type Category, type Source, type View } from "./lanes";
 
 const sourceHint = (source: Source): string => {
@@ -1316,7 +1319,57 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   );
 }
 
+function AiSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [selection, setSelection] = useState<AiOverride>(null);
+  const [status, setStatus] = useState("Loading…");
+  const [editing, setEditing] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    void Promise.all([rpc.call("radar_ai_get", null), rpc.call("radar_snapshot", null)]).then(([value, snapshot]) => {
+      if (!active) return;
+      setSelection(value);
+      setStatus((snapshot as RadarSnapshot).ai.detail);
+      setReady(true);
+    }).catch((cause) => { if (active) setError(errorText(cause)); });
+    return () => { active = false; };
+  }, [rpc]);
+  async function save(next: AiOverride) {
+    setSaving(true);
+    try {
+      setSelection(await rpc.call("radar_ai_set", next));
+      setError("");
+      setEditing(false);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+  const [draft, setDraft] = useState<ExperimentalProviderModelPickerValue>({ providerId: "", model: "", reasoningLevel: "medium" });
+  return <section>
+    <p>Draft lanes and interpret focus using BB’s configured providers. No separate endpoint or API key.</p>
+    <p>{selection ? `${selection.providerId} / ${selection.model}` : "Use BB default"}</p>
+    <p>{status}</p>
+    <button className="radar-btn" disabled={!ready || saving} onClick={() => {
+      setDraft({ providerId: selection?.providerId ?? "", model: selection?.model ?? "", reasoningLevel: "medium" });
+      setEditing(true);
+    }}>Choose override</button>
+    {selection ? <button className="radar-btn" disabled={saving} onClick={() => void save(null)}>Use BB default</button> : null}
+    {editing ? <div>
+      <ProviderModelPicker value={draft} onChange={setDraft} disabled={saving} />
+      <button className="radar-btn" disabled={saving || !draft.providerId || !draft.model} onClick={() => void save({ providerId: draft.providerId, model: draft.model })}>Save override</button>
+      <button className="radar-btn" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+    </div> : null}
+    {error ? <p role="alert">{error}</p> : null}
+  </section>;
+}
+
 export default definePluginApp((app) => {
+  app.slots.settingsSection({ id: "ai-focus", title: "AI & focus", component: AiSettings });
   app.slots.navPanel({
     headerContent: () => <span className="radar-header-anchor" aria-hidden="true" />,
     id: "board",

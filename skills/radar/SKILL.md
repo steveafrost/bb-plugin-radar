@@ -36,7 +36,7 @@ bb radar rebase <PR url|owner/repo#n> --yes  # server-side rebase of YOUR open P
 
 Scope keys: repos are `owner/name`; areas of the `areaRepo` setting (a monorepo) are `//<path>` keys from its `//...` labels, cut to three segments; `//no-area` is that repo with no area label. Focus = show only those; hidden = drop those (a PR touching several areas stays while any of its areas is shown). It applies to every lane, every view, the rail badge and `status`/`list`; hidden items are never counted new or marked seen. `bb radar status` prints the focus line and per-lane hidden counts.
 
-`add` sends the description to the configured OpenAI-compatible endpoint, validates the drafted lane,
+`add` sends the description through BB’s configured-provider text completion API, validates the drafted lane,
 runs it once, and prints how many items match. Use `--dry-run` to preview first.
 
 ## Lane shape
@@ -55,11 +55,14 @@ runs it once, and prints how many items match. Use `--dry-run` to preview first.
 
 ## Settings
 
+Under **AI & focus** in Radar’s plugin settings, **Use BB default** leaves the provider/model override unset (`null`). Choose an override with BB’s native picker and explicitly save it, or reset to the default. The override is stored durably by typed `radar_ai_get` / `radar_ai_set` RPC, not a CLI config setting. Radar never reads AI credentials or calls a separate endpoint. Legacy `aiBaseUrl`, `aiKeyEnv`, and `aiModel` values are ignored.
+
+A BB development build exposing `experimental_ai.complete` is required for AI execution. API availability does not guarantee the chosen model supports text completion; provider failures are surfaced without credential fallback. On older hosts drafting is unavailable with an explicit explanation. Focus retains repo/area name matching and all manual controls, including when AI execution fails. Settings labels distinguish **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**; this SDK has no grouped setting descriptors.
+
 `bb plugin config radar set <key> <value>`: `refreshSeconds` (min 30, default 90),
 `maxAgeDays` (default 60, 0 = no limit), `ghPath`;
 Gitstream `gitstreamRepo` (owner/name; empty = off), `gitstreamWebUrl` (https origin PR links open at), `gitstreamLabel`, `gsPath`;
 Delta `deltaHost`, `deltaRepo` (empty = off), `deltaLabel`, `dtPath`;
 `areaRepo` (monorepo whose `//path` labels are Focus areas);
-`aiModel` (default `gpt-4.1-mini`), `aiBaseUrl` (default `https://api.openai.com`), `draftNotes` (plain-words context for the lane drafter),
-`aiKeyEnv` (default `OPENAI_API_KEY`, read from the bb server environment),
+`draftNotes` (plain-words context for the lane drafter),
 `reviewSection` (thread section for review threads, default `Reviews`; empty = none), `gitstreamReviewSkill`, `reviewSkill` and `triageSkill` (skill invoked when a review/triage thread starts; empty = none).

@@ -10,5 +10,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["server.ts", "lanes.ts", "app.tsx", "glyphs.tsx", "badge.ts", "test"]
+  "include": ["server.ts", "lanes.ts", "app.tsx", "glyphs.tsx", "badge.ts", "ai.ts", "types/**/*.d.ts", "test"]
 }

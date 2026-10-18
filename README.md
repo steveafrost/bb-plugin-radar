@@ -15,7 +15,7 @@ shows whatever is current.
   Sources that are not set up are skipped, so the default lanes work with GitHub alone.
   Optional client-side filters refine the merged list.
 - **Track something**: describe what you want in plain English; an
-  OpenAI-compatible model drafts a lane, Radar runs it once and shows the live
+  BB-configured model drafts a lane, Radar runs it once and shows the live
   preview, and you add, tweak, or discard it. Gitstream label names come from a
   daily label index, so the model uses exact spellings, and the `draftNotes`
   setting tells it about your repos, teams and labels.
@@ -82,6 +82,10 @@ Persisted state is configuration only: the lane list, the Focus filter, seen-ite
 item → review-thread links live in plugin kv. The cached Gitstream label list can be too big for
 kv's 256KB value cap, so it lives in the plugin database (`label_index` table).
 
+AI execution requires a BB development build exposing `experimental_ai.complete`. On older hosts Radar reports that the API is unsupported, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced; there is no credential fallback. Focus also falls back to name matching after a provider error.
+
+Settings use an **AI & focus** section for model selection and label prefixes for **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**. The current SDK has neither grouped nor provider/model setting descriptors. Its picker currently requires a concrete value, so Radar wraps it in an optional, explicitly saved override editor rather than passing `null` to the host component.
+
 ## Develop
 
 ```sh
@@ -89,6 +93,8 @@ npm test            # vitest (lanes.ts policy)
 npx tsc --noEmit
 bb plugin build . && bb plugin reload radar
 ```
+
+The installed SDK is 0.6.37. `types/bb-ai-preview.d.ts` narrowly augments it with the new completion interfaces generated from the local BB SDK source; remove this shim when the published SDK includes the contract. No SDK lockfile bump is needed. Runtime support is feature-detected; a successful plugin build does not add host support.
 
 ## Setup
 
@@ -100,7 +106,7 @@ Radar needs `gh` signed in on the bb host. Everything else is in
 | `gitstreamRepo`, `gitstreamWebUrl`, `gitstreamLabel`, `gsPath` | Turn on a Gitstream repo (`owner/name`), the https origin its PRs open at, the name shown for it, and the `gs` binary. Empty repo = off. |
 | `deltaHost`, `deltaRepo`, `deltaLabel`, `dtPath` | Same for a Delta repo, read with `dt --host <deltaHost> -R <deltaRepo>`. |
 | `areaRepo` | A monorepo whose `//path` labels become Focus areas. |
-| `aiBaseUrl`, `aiKeyEnv`, `aiModel` | OpenAI-compatible endpoint for drafting lanes and focus (default `https://api.openai.com`, key from `$OPENAI_API_KEY` in the bb server environment, `gpt-4.1-mini`). The key is only sent to this https URL. Without a key, focus falls back to name matching and drafting is off. |
+| AI provider/model | In **AI & focus**, use BB’s default (no override, stored as `null`) or choose a provider/model with BB’s native picker and save the override. Stored via typed RPC and durable plugin storage, not CLI config. No separate endpoint or key. Legacy `aiBaseUrl`, `aiKeyEnv`, and `aiModel` values are ignored. |
 | `draftNotes` | Plain-words context for the drafter: which repos live where, team names, label conventions. |
 | `maxAgeDays`, `refreshSeconds` | Hide items not updated in N days (default 60, 0 = no limit); poll interval (min 30s). |
 | `reviewSection`, `reviewSkill`, `gitstreamReviewSkill`, `triageSkill` | Thread section for Radar threads, and an installed skill to invoke per kind. |
