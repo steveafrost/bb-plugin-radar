@@ -114,7 +114,8 @@ Radar needs `gh` signed in on the bb host. Everything else is in
 | `deltaCheckout` | Absolute path to a local checkout whose `origin` is the Delta repo; turns on Rebase for your Delta PRs. Empty = off. |
 | `gitstreamHistory`, `gitstreamRepo`, `gitstreamWebUrl`, `gitstreamLabel`, `gsPath` | Read-only Gitstream history: off unless `gitstreamHistory` is true and the repo and https web origin are set. Shown as "<label> history". |
 | `areaRepo` | A monorepo whose `//path` labels become Focus areas. |
-| AI provider/model | In **AI & focus**, use BB’s default (no override, stored as `null`) or choose a provider/model with BB’s native picker and save the override. Stored via typed RPC and durable plugin storage, not CLI config. No separate endpoint or key. Legacy `aiBaseUrl`, `aiKeyEnv`, and `aiModel` values are ignored. |
+| AI provider/model | In **AI & focus**, use BB’s default (no override, stored as `null`) or choose a provider/model with BB’s native picker and save the override. Stored via typed RPC and durable plugin storage, not CLI config. |
+| AI fallback | `aiBaseUrl` (https, OpenAI-compatible; `/v1/chat/completions` is appended), `aiKeyEnv` and `aiModel`. Used only when the BB host has no `experimental_ai` completion (release builds up to at least 0.46.1). Empty by default; BB’s own providers always win when available. |
 | `draftNotes` | Plain-words context for the drafter: which repos live where, team names, label conventions. |
 | `maxAgeDays`, `refreshSeconds` | Hide items not updated in N days (default 60, 0 = no limit); poll interval (min 30s). |
 | `reviewSection`, `reviewSkill`, `gitstreamReviewSkill`, `triageSkill` | Thread section for Radar threads, and an installed skill to invoke per kind. |

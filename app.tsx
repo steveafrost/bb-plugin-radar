@@ -1356,7 +1356,7 @@ function AiSettings() {
   }
   const [draft, setDraft] = useState<ExperimentalProviderModelPickerValue>({ providerId: "", model: "", reasoningLevel: "medium" });
   return <section>
-    <p>Draft lanes and interpret focus using BB’s configured providers. No separate endpoint or API key.</p>
+    <p>Draft lanes and interpret focus using BB’s configured providers. On BB builds without that, Radar uses the AI fallback settings (endpoint, key variable, model).</p>
     <p>{selection ? `${selection.providerId} / ${selection.model}` : "Use BB default"}</p>
     <p>{status}</p>
     <button className="radar-btn" disabled={!ready || saving} onClick={() => {

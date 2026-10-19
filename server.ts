@@ -21,7 +21,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MentionTracker, mentionStoreSchema, createMentionStore } from "./mentions";
 
-import { aiAvailable, aiOverrideSchema, AI_UNSUPPORTED, complete, type AiOverride } from "./ai";
+import { aiBackend, aiDetail, aiOverrideSchema, complete, fallbackBaseUrl, type AiFallback, type AiOverride } from "./ai";
 import {
   applyFilter,
   findSection,
@@ -294,6 +294,22 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Its //path labels become Focus areas.",
       default: "",
     },
+    aiBaseUrl: {
+      type: "string",
+      label: "AI & focus · Fallback endpoint, OpenAI-compatible https URL (empty = none)",
+      description: "Used only when this BB host has no configured-provider completion (experimental_ai). Receives the key below; /v1/chat/completions is appended.",
+      default: "",
+    },
+    aiKeyEnv: {
+      type: "string",
+      label: "AI & focus · Fallback key environment variable",
+      default: "",
+    },
+    aiModel: {
+      type: "string",
+      label: "AI & focus · Fallback model",
+      default: "",
+    },
     draftNotes: {
       type: "string",
       label: "AI & focus · Lane drafting notes (optional)",
@@ -334,6 +350,9 @@ export default async function plugin(bb: BbPluginApi) {
     deltaLabel: string;
     areaRepo: string;
     draftNotes: string;
+    aiBaseUrl: string;
+    aiKeyEnv: string;
+    aiModel: string;
     gsPath: string;
     ghPath: string;
     dtPath: string;
@@ -355,6 +374,9 @@ export default async function plugin(bb: BbPluginApi) {
     deltaLabel: values.deltaLabel ?? "",
     areaRepo: values.areaRepo ?? "",
     draftNotes: (values.draftNotes ?? "").trim(),
+    aiBaseUrl: fallbackBaseUrl(values.aiBaseUrl ?? ""),
+    aiKeyEnv: (values.aiKeyEnv ?? "").trim(),
+    aiModel: (values.aiModel ?? "").trim(),
     gsPath: values.gsPath.trim() || "gs",
     ghPath: values.ghPath.trim() || "gh",
     dtPath: (values.dtPath ?? "").trim() || "dt",
@@ -500,13 +522,16 @@ export default async function plugin(bb: BbPluginApi) {
   let inFlight: Promise<void> | null = null;
   const controller = new AbortController();
 
+  function aiFallback(): AiFallback {
+    return { baseUrl: config.aiBaseUrl, keyEnv: config.aiKeyEnv, model: config.aiModel };
+  }
+
   function aiState() {
+    const backend = aiBackend(bb, aiFallback());
     return {
-      available: aiAvailable(bb),
-      model: aiOverride?.model ?? "BB default",
-      detail: aiAvailable(bb)
-        ? "BB completion API available; the selected provider/model must support text completion."
-        : AI_UNSUPPORTED,
+      available: backend !== null,
+      model: backend === "fallback" ? config.aiModel : (aiOverride?.model ?? "BB default"),
+      detail: aiDetail(bb, aiFallback()),
     };
   }
 
@@ -833,7 +858,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function chat(system: string, user: string, maxTokens: number): Promise<string> {
     try {
-      return await complete(bb, aiOverride, system, user, maxTokens, AI_TIMEOUT_MS, controller.signal);
+      return await complete(bb, aiOverride, system, user, maxTokens, AI_TIMEOUT_MS, controller.signal, aiFallback());
     } catch (error) {
       throw new UserError(error instanceof Error ? error.message : "BB AI completion failed.");
     }
