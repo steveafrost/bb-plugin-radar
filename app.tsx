@@ -1,5 +1,5 @@
 // bb-plugin-radar — panel frontend. Compiled by `bb plugin build`.
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   definePluginApp,
   experimental_NewThreadComposer as NewThreadComposer,
@@ -34,6 +34,7 @@ import { canRebase, rebaseHelp, type Viewer } from "./rebase";
 import { DEFAULT_SKILL_SETTINGS, threadSkills, type SkillSettings } from "./review-skills";
 import { summarizeLane } from "./lane-summary";
 import { draftCategory, draftInferredCategory, fromDraft, gitstreamScoped, pickCategory, toDraft, type Draft, type ListKey } from "./lane-draft";
+import { applyPending, type PendingOp } from "./optimistic";
 import "./app.css";
 
 const LANE_PREVIEW = 8;
@@ -75,10 +76,18 @@ function useRadar() {
     [],
   );
   // Hosts are module state shared with the lane helpers, so set them before the render that reads them.
+  // Ops sent but not yet answered. Each server snapshot is shown with them re-applied,
+  // so the board changes on click and a refetch racing the RPC can't bring items back.
+  const pending = useRef(new Set<PendingOp>());
+  const latest = useRef<RadarSnapshot | null>(null);
+  const show = useCallback(() => {
+    if (latest.current !== null) setSnapshot(applyPending(latest.current, pending.current));
+  }, []);
   const apply = useCallback((next: RadarSnapshot) => {
     if (next.hosts !== undefined) setHosts(next.hosts);
-    setSnapshot(next);
-  }, []);
+    latest.current = next;
+    show();
+  }, [show]);
   const refetch = useCallback(() => {
     void call(rpc.call("radar_snapshot", null) as Promise<RadarSnapshot>).then((next) => {
       if (next !== null) apply(next);
@@ -94,7 +103,21 @@ function useRadar() {
     },
     [call, apply],
   );
-  return { rpc, snapshot, error, setError, mutate, call };
+  /** Shows `op` at once, then settles on the server's answer (or reverts if the call fails). */
+  const optimistic = useCallback(
+    async (op: PendingOp, promise: Promise<unknown>) => {
+      pending.current.add(op);
+      show();
+      try {
+        return await mutate(promise);
+      } finally {
+        pending.current.delete(op);
+        show();
+      }
+    },
+    [mutate, show],
+  );
+  return { rpc, snapshot, error, setError, mutate, call, optimistic };
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,13 +1112,13 @@ function ReviewSheet({
 
 function RadarPage({ subPath }: PluginNavPanelProps) {
   const view = viewFrom(subPath);
-  const { rpc, snapshot, error, setError, mutate, call } = useRadar();
+  const { rpc, snapshot, error, setError, mutate, call, optimistic } = useRadar();
   const navigate = useBbNavigate();
   const [reviewing, setReviewing] = useState<{ item: RadarItem; context: ReviewContext } | null>(null);
   const reviewActions = useMemo(
     () => ({
       threadFor: (key: string) => snapshot?.reviews[key]?.threadId,
-      acknowledge: (item: RadarItem) => { void mutate(rpc.call("radar_acknowledge", { key: item.key })); },
+      acknowledge: (item: RadarItem) => { void optimistic({ kind: "acknowledge", key: item.key }, rpc.call("radar_acknowledge", { key: item.key })); },
       open: (threadId: string) => navigate.toThread(threadId),
       review: (item: RadarItem) => {
         void call(rpc.call("radar_review_context", { key: item.key }) as Promise<ReviewContext>).then((context) => {
@@ -1109,7 +1132,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       rebase: (item: RadarItem) =>
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
     }),
-    [snapshot, navigate, call, rpc, mutate],
+    [snapshot, navigate, call, rpc, mutate, optimistic],
   );
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [editing, setEditing] = useState<Draft | null>(null);
@@ -1204,7 +1227,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               className="radar-icon-btn"
               title="Mark all seen — every lane, every view"
               aria-label="Mark all seen — every lane, every view"
-              onClick={() => void mutate(rpc.call("radar_mark_seen", { view: "all" }))}
+              onClick={() => void optimistic({ kind: "seen", view: "all" }, rpc.call("radar_mark_seen", { view: "all" }))}
             >
               <Glyph name="seen" className="radar-icon" />
             </button>
@@ -1287,7 +1310,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               if (window.confirm(`Remove the “${lane.title}” lane?`)) void mutate(rpc.call("radar_lane_delete", { laneId: lane.id }));
             }}
             onMove={(delta) => move(lanes.indexOf(lane), delta)}
-            onSeen={() => void mutate(rpc.call("radar_mark_seen", { laneId: lane.id, view }))}
+            onSeen={() => void optimistic({ kind: "seen", laneId: lane.id, view }, rpc.call("radar_mark_seen", { laneId: lane.id, view }))}
             onRefresh={() => void mutate(rpc.call("radar_refresh", { laneId: lane.id }))}
           />
         ))}
