@@ -554,11 +554,6 @@ function LaneCard({
         <button type="button" className="radar-lane__toggle" onClick={onToggle}>
           <Glyph name={collapsed ? "chevronRight" : "chevronDown"} className="radar-icon" />
           <span className="radar-lane__title">{lane.title}</span>
-          {hidden > 0 ? (
-            <span className="radar-lane__hidden" title="Hidden by the repo / area focus filter">
-              {hidden} hidden
-            </span>
-          ) : null}
           {result?.loading ? <Glyph name="spinner" className="radar-icon radar-spin" /> : null}
         </button>
         <span className="radar-lane__tools">

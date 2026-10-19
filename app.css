@@ -1238,11 +1238,6 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   color: var(--r-accent);
   font-weight: 500;
 }
-.radar-lane__hidden {
-  color: var(--r-faint);
-  font-size: var(--text-xs, 0.75rem);
-  white-space: nowrap;
-}
 
 /* Inside the editor, fields use the host's input border (--border vanishes on the lane surface). */
 .radar-ed .radar-input,
