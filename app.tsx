@@ -582,7 +582,11 @@ function LaneCard({
       {collapsed ? null : (
         <>
           {result?.error ? <p className="radar-error">{result.error}</p> : null}
-          {result !== undefined && items.length === 0 && !result.loading && !result.error ? (
+          {/* Keep the body's height while the first fetch runs; later refreshes keep the last result on screen. */}
+          {(result === undefined || (result.loading && result.fetchedAt === "")) && items.length === 0 ? (
+            <p className="radar-empty">Loading…</p>
+          ) : null}
+          {result !== undefined && items.length === 0 && (!result.loading || result.fetchedAt !== "") && !result.error ? (
             <p className="radar-empty">
               {query === ""
                 ? hidden > 0

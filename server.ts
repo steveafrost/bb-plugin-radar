@@ -171,6 +171,11 @@ const laneResultSchema = z.object({
   loading: z.boolean(),
 });
 
+const resultsCacheSchema = z.object({
+  fetchedAt: z.string(),
+  lanes: z.record(z.string(), z.object({ queryKey: z.string(), result: laneResultSchema })),
+});
+
 const snapshotSchema = z.object({
   lanes: z.array(z.any()),
   results: z.record(z.string(), laneResultSchema),
@@ -486,6 +491,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   const results: Record<string, LaneResult> = {};
   let fetchedAt = "";
+  // Last refresh's results, so a restart or reload shows what we knew instead of blank lanes.
+  const storedResults = resultsCacheSchema.safeParse(await bb.storage.kv.get<unknown>("resultsCache"));
+  if (storedResults.success) {
+    for (const lane of lanes) {
+      const cached = storedResults.data.lanes[lane.id];
+      if (cached !== undefined && cached.queryKey === laneQueryKey(lane)) results[lane.id] = { ...cached.result, loading: false };
+    }
+    fetchedAt = storedResults.data.fetchedAt;
+  }
+  const persistResults = () =>
+    bb.storage.kv.set("resultsCache", {
+      fetchedAt,
+      lanes: Object.fromEntries(
+        lanes.flatMap((lane) => {
+          const result = results[lane.id];
+          return result === undefined || result.fetchedAt === "" ? [] : [[lane.id, { queryKey: laneQueryKey(lane), result: { ...result, loading: false } }]];
+        }),
+      ),
+    });
   let refreshing = false;
   let githubLogin = "";
   /** The user's Gitstream principal (email) as `gs` resolved it. The REST API does not resolve @me. */
@@ -845,6 +869,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
         }
         if (prunedSeen) await persistSeen();
+        await persistResults().catch((error: unknown) => bb.log.warn(`results cache write failed: ${String(error)}`));
       } finally {
         refreshing = false;
         inFlight = null;
