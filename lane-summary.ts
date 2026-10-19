@@ -1,7 +1,7 @@
 /**
  * One-line, human description of what a lane matches, e.g.
  * "Open PRs requesting your review · 3 sources". Heuristic: reads the common
- * GitHub qualifiers and Gitstream principals; anything else is left out.
+ * GitHub qualifiers and Gitstream-history principals; anything else is left out.
  */
 import { enabledSources, SOURCE_LABEL, type Lane } from "./lanes";
 

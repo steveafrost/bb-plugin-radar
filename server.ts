@@ -2,9 +2,10 @@
  * bb-plugin-radar — backend entry.
  *
  * A live, storage-free view of the PR/issue queues that need you. Each "lane"
- * is a saved query over one or more hosts: GitHub (`gh api graphql` search) and,
- * when configured in settings, a Gitstream repo (`gs api repos/<repo>/pulls`) and a
- * Delta repo (`dt api search/issues`). The server polls every lane on an interval, keeps
+ * is a saved query over one or more hosts: a Delta repo (`dt api search/issues`, the
+ * primary host for repos that left GitHub, e.g. shop/world), GitHub (`gh api graphql`
+ * search) and, only when turned on as read-only history, a Gitstream repo
+ * (`gs api repos/<repo>/pulls`; Gitstream no longer accepts PR writes). The server polls every lane on an interval, keeps
  * only the latest result in memory, and pushes a realtime signal so the panel
  * re-reads it. The only persisted state is configuration: the lane list and
  * which items you have already seen (so new arrivals can be badged).
@@ -48,7 +49,7 @@ import {
   type Item,
   type Lane,
   classifyToolError,
-  gitstreamFallbackEmail,
+  principalFallbackEmail,
   laneQueryKey,
   markNew,
   remoteRepo,
@@ -90,14 +91,25 @@ import {
   githubCompareArgs,
   githubPrArgs,
   githubRebaseArgs,
-  gitstreamPrArgs,
-  gitstreamRebaseArgs,
-  gitstreamRebaseResult,
+  deltaMeArgs,
+  deltaPrArgs,
+  deltaPrincipal,
+  gitDeleteRefArgs,
+  gitFetchArgs,
+  gitIsAncestorArgs,
+  gitMergesArgs,
+  gitOriginArgs,
+  gitPushArgs,
+  gitReplayArgs,
+  gitRevParseArgs,
+  originMatches,
+  radarRefs,
+  replayedHead,
   parseRebaseTarget,
   REBASE_SOURCES,
   REPO_PATTERN,
   verifyGithubPr,
-  verifyGitstreamPr,
+  verifyDeltaPr,
   type RebaseResult,
   type RebaseTarget,
 } from "./rebase";
@@ -165,8 +177,10 @@ const snapshotSchema = z.object({
   fetchedAt: z.string(),
   refreshing: z.boolean(),
   githubLogin: z.string(),
-  /** Your Gitstream principal (email), as Gitstream items carry it in `author`. */
-  gitstreamLogin: z.string(),
+  /** Your Delta principal (email); "" until known. */
+  deltaLogin: z.string(),
+  /** Whether Rebase is offered on Delta (a rebase checkout is configured). */
+  deltaRebase: z.boolean(),
   /** Item key → bb thread started from Radar for it. */
   reviews: z.record(z.string(), z.object({ threadId: z.string(), at: z.string() })),
   ai: z.object({ available: z.boolean(), model: z.string(), detail: z.string() }),
@@ -177,7 +191,7 @@ const snapshotSchema = z.object({
   /** Host skills Radar threads invoke, so rows can name them before a thread starts. */
   /** The "Max age" setting in days (0 = no limit), for the lane editor's hint. */
   maxAgeDays: z.number(),
-  /** Configured Gitstream / Delta hosts and area repo; the panel mirrors them. */
+  /** Configured Delta / Gitstream-history hosts and area repo; the panel mirrors them. */
   hosts: hostsSchema,
   skills: z.object({ reviewSkill: z.string(), gitstreamReviewSkill: z.string(), triageSkill: z.string() }),
 });
@@ -254,14 +268,26 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: z.number().finite().int().min(0).max(3650),
     },
     ghPath: { type: "string", label: "Sources · GitHub CLI executable", default: "gh" },
-    gitstreamRepo: { type: "string", label: "Sources · Gitstream repo, owner/name (empty = off)", default: "" },
-    gitstreamWebUrl: { type: "string", label: "Sources · Gitstream web URL (https origin)", default: "" },
-    gitstreamLabel: { type: "string", label: "Sources · Name shown for Gitstream", default: "Gitstream" },
-    gsPath: { type: "string", label: "Sources · Gitstream CLI executable", default: "gs" },
     deltaHost: { type: "string", label: "Sources · Delta host name (e.g. delta.example.com)", default: "" },
     deltaRepo: { type: "string", label: "Sources · Delta repo, owner/name (empty = off)", default: "" },
     deltaLabel: { type: "string", label: "Sources · Name shown for Delta", default: "Delta" },
     dtPath: { type: "string", label: "Sources · Delta CLI executable", default: "dt" },
+    deltaCheckout: {
+      type: "string",
+      label: "Sources · Delta checkout for Rebase (absolute path; origin must be Delta; empty = no Rebase on Delta)",
+      description: "Radar fetches into private refs/radar/* refs and uses git replay, so the checkout's worktree, branches and origin/* are untouched. Only the rebased PR branch is force-pushed, with a lease.",
+      default: "",
+    },
+    gitstreamHistory: {
+      type: "boolean",
+      label: "Sources · Show Gitstream PRs as read-only history",
+      description: "Off by default; Gitstream no longer accepts PR writes. When on, lanes that include Gitstream also list old Gitstream PRs; Radar never writes to Gitstream.",
+      default: false,
+    },
+    gitstreamRepo: { type: "string", label: "Sources · Gitstream history repo, owner/name", default: "" },
+    gitstreamWebUrl: { type: "string", label: "Sources · Gitstream history web URL (https origin)", default: "" },
+    gitstreamLabel: { type: "string", label: "Sources · Name shown for Gitstream history (\"history\" is appended)", default: "Gitstream" },
+    gsPath: { type: "string", label: "Sources · Gitstream CLI executable (history only)", default: "gs" },
     areaRepo: {
       type: "string",
       label: "AI & focus · Area monorepo, owner/name (empty = none)",
@@ -286,7 +312,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     gitstreamReviewSkill: {
       type: "string",
-      label: "Review workflows · Gitstream review skill (empty = none)",
+      label: "Review workflows · Gitstream history review skill (empty = none)",
       default: DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill,
     },
     triageSkill: {
@@ -298,6 +324,8 @@ export default async function plugin(bb: BbPluginApi) {
   type Config = {
     refreshSeconds: number;
     maxAgeDays: number;
+    gitstreamHistory: boolean;
+    deltaCheckout: string;
     gitstreamRepo: string;
     gitstreamWebUrl: string;
     gitstreamLabel: string;
@@ -317,6 +345,8 @@ export default async function plugin(bb: BbPluginApi) {
   const readConfig = (values: Config): Config => ({
     refreshSeconds: Number.isFinite(values.refreshSeconds) ? Math.max(30, values.refreshSeconds) : 90,
     maxAgeDays: values.maxAgeDays === undefined ? DEFAULT_MAX_AGE_DAYS : maxAgeDays(values.maxAgeDays),
+    gitstreamHistory: values.gitstreamHistory === true,
+    deltaCheckout: checkoutPath(values.deltaCheckout ?? ""),
     gitstreamRepo: values.gitstreamRepo ?? "",
     gitstreamWebUrl: values.gitstreamWebUrl ?? "",
     gitstreamLabel: values.gitstreamLabel ?? "",
@@ -335,6 +365,14 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const savedAi = aiOverrideSchema.safeParse(await bb.storage.kv.get<unknown>("aiOverride"));
   let aiOverride: AiOverride = savedAi.success ? savedAi.data : null;
+  /** An absolute path, `~/` expanded; anything else turns Delta rebase off. */
+  function checkoutPath(value: string): string {
+    const trimmed = value.trim().replace(/^~(?=\/|$)/, homedir());
+    if (trimmed === "") return "";
+    if (trimmed.startsWith("/") && !trimmed.includes("\0")) return trimmed;
+    bb.log.warn(`deltaCheckout "${trimmed.slice(0, 80)}" is not an absolute path; Rebase on Delta is off`);
+    return "";
+  }
   /** Applies the host settings; malformed values switch that host off and are logged. */
   function applyHosts(values: Config): void {
     const { hosts: next, problems } = readHosts(values);
@@ -430,7 +468,9 @@ export default async function plugin(bb: BbPluginApi) {
   let githubLogin = "";
   /** The user's Gitstream principal (email) as `gs` resolved it. The REST API does not resolve @me. */
   let gitstreamMe = "";
-  /** World label names, for steering the LLM to exact spellings. Rebuilt daily. */
+  /** The user's Delta principal (email) from `/api/v1/me`. */
+  let deltaMe = "";
+  /** Label names (Delta, else Gitstream history), for steering the LLM to exact spellings. Rebuilt weekly from Delta, daily from Gitstream. */
   type LabelIndex = { at: string; names: string[] };
   // The index (~5k names, ~300KB) is over kv's 256KB value cap, so it lives in the plugin database.
   const db = bb.storage.database();
@@ -485,7 +525,8 @@ export default async function plugin(bb: BbPluginApi) {
       fetchedAt,
       refreshing,
       githubLogin,
-      gitstreamLogin: gitstreamMe,
+      deltaLogin: deltaMe,
+      deltaRebase: hosts().delta !== null && config.deltaCheckout !== "",
       reviews,
       ai: aiState(),
       scope,
@@ -539,6 +580,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function resolveDeltaMe(): Promise<string> {
+    if (deltaMe !== "") return deltaMe;
+    const delta = hosts().delta;
+    if (delta === null) throw new UserError("Delta is not configured.");
+    const me = deltaPrincipal(parseJson(await tool(config.dtPath, deltaMeArgs(delta.host, delta.repo), `${SOURCE_LABEL.delta} identity`), `${SOURCE_LABEL.delta} identity`));
+    if (me === "") throw new UserError(`Could not resolve your ${SOURCE_LABEL.delta} identity. Run dt auth login --host ${delta.host}.`);
+    deltaMe = me;
+    publish();
+    return deltaMe;
+  }
+
   async function resolveGitstreamMe(): Promise<string> {
     if (gitstreamMe !== "") return gitstreamMe;
     // `gs pr list` prints its resolved scope ("author=<email> (default)") on stderr.
@@ -553,33 +605,51 @@ export default async function plugin(bb: BbPluginApi) {
     if (gitstreamMe !== "") return gitstreamMe;
     // Fallback for this cycle only, so a transient gs failure is retried next time
     // instead of pinning a guessed identity until restart.
-    const fallback = gitstreamFallbackEmail(
+    const fallback = principalFallbackEmail(
       await tool("git", ["config", "--global", "user.email"], "git config").catch(() => ""),
     );
     if (fallback === "") throw new UserError("Could not resolve your Gitstream identity. Run gs auth login.");
     return fallback;
   }
 
+  /** Where label names for drafting come from: Delta, else Gitstream history ("" = none). */
+  function labelRepo(): string {
+    const { delta, gitstream } = hosts();
+    return delta !== null ? `delta:${delta.host}/${delta.repo}` : gitstream !== null ? `gitstream:${gitstream.repo}` : "";
+  }
+
   function buildLabelIndex(): Promise<void> {
     if (labelIndexing !== null) return labelIndexing;
     labelIndexing = (async () => {
       const names: string[] = [];
-      for (let page = 1; page <= 200 && !disposed; page++) {
-        const data = parseJson(
-          await tool(config.gsPath, ["api", "-X", "GET", `repos/${hosts().gitstream?.repo ?? ""}/labels`, "-f", "per_page=100", "-f", `page=${page}`], "gs labels"),
-          "gs labels",
-        );
+      // Delta is the live host (and asked to be read gently): ~60 sequential pages, at most
+      // weekly (see the poll service). Gitstream history is only a fallback when Delta is off.
+      const { delta, gitstream } = hosts();
+      const pages = delta !== null ? 100 : 200;
+      let complete = false;
+      for (let page = 1; page <= pages && !disposed; page++) {
+        const data =
+          delta !== null
+            ? parseJson(await tool(config.dtPath, ["--host", delta.host, "-R", delta.repo, "api", `repos/${delta.repo}/labels?per_page=100&page=${page}`], "dt labels"), "dt labels")
+            : gitstream !== null
+              ? parseJson(await tool(config.gsPath, ["api", "-X", "GET", `repos/${gitstream.repo}/labels`, "-f", "per_page=100", "-f", `page=${page}`], "gs labels"), "gs labels")
+              : null;
         if (!Array.isArray(data)) break;
         for (const label of data) {
           const name = (label as { name?: unknown } | null)?.name;
           if (typeof name === "string") names.push(name);
         }
-        if (data.length < 100) break;
+        if (data.length < 100) {
+          complete = true;
+          break;
+        }
       }
+      // A capped read keeps names indexed before, so the index never shrinks to the first pages.
+      if (!complete && labelIndex !== null) names.push(...labelIndex.names);
       if (names.length > 0) {
-        labelIndex = { at: new Date().toISOString(), names };
+        labelIndex = { at: new Date().toISOString(), names: [...new Set(names)] };
         saveLabelIndex(labelIndex);
-        bb.log.info(`indexed ${names.length} World labels`);
+        bb.log.info(`indexed ${labelIndex.names.length} labels from ${labelRepo()}${complete ? "" : ` (first ${pages} pages, merged with the previous index)`}`);
       }
     })()
       .catch((error) => bb.log.warn(`label index failed: ${String(error)}`))
@@ -734,6 +804,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (githubLogin === "") {
           githubLogin = (await tool(config.ghPath, ["api", "user", "--jq", ".login"], "gh api user").catch(() => "")).trim();
         }
+        // The panel needs your Delta identity to offer Rebase; one cached read per session.
+        if (deltaMe === "" && hosts().delta !== null && config.deltaCheckout !== "") await resolveDeltaMe().catch(() => "");
         await pool([...lanes], refreshLane);
         await syncMentions();
         fetchedAt = new Date().toISOString();
@@ -769,7 +841,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function draftLane(description: string): Promise<DraftResult> {
     if (!aiState().available) throw new UserError(aiState().detail);
-    const me = hosts().gitstream === null ? "" : await resolveGitstreamMe().catch(() => "");
+    const me =
+      hosts().delta !== null
+        ? await resolveDeltaMe().catch(() => "")
+        : hosts().gitstream !== null
+          ? await resolveGitstreamMe().catch(() => "")
+          : "";
     const prompt = draftPrompt(description, {
       githubLogin,
       email: me,
@@ -1109,14 +1186,20 @@ export default async function plugin(bb: BbPluginApi) {
   // ---- rebase ---------------------------------------------------------------
 
   /** Like `tool`, but a non-zero exit returns stdout+stderr for classification instead of throwing. */
-  async function capture(bin: string, args: string[], label: string): Promise<{ ok: boolean; stdout: string; output: string }> {
+  async function capture(
+    bin: string,
+    args: string[],
+    label: string,
+    options: { cwd?: string; timeoutMs?: number } = {},
+  ): Promise<{ ok: boolean; stdout: string; output: string }> {
     try {
       const { stdout } = await run(bin, args, {
-        cwd: homedir(),
-        env: toolEnv,
+        cwd: options.cwd ?? homedir(),
+        // Never prompt for credentials or an editor from the server process.
+        env: { ...toolEnv, GIT_TERMINAL_PROMPT: "0", GIT_EDITOR: "true" },
         maxBuffer: MAX_OUTPUT_BYTES,
-        // A server-side rebase replays commits; give it more room than a read.
-        timeout: TOOL_TIMEOUT_MS * 3,
+        // A rebase replays commits; give it more room than a read.
+        timeout: options.timeoutMs ?? TOOL_TIMEOUT_MS * 3,
         signal: controller.signal,
         killSignal: "SIGKILL",
       });
@@ -1173,32 +1256,75 @@ export default async function plugin(bb: BbPluginApi) {
     return { status: "rebased", message: "Rebased onto the latest base.", headSha: typeof next === "string" ? next : headOid };
   }
 
-  async function rebaseGitstream(target: RebaseTarget): Promise<RebaseResult> {
-    const me = await resolveGitstreamMe();
-    const pr = parseJson(await tool(config.gsPath, gitstreamPrArgs(target.repo, target.number), SOURCE_LABEL.gitstream), SOURCE_LABEL.gitstream);
-    const verified = verifyGitstreamPr(pr, me);
-    if (!verified.ok) throw new UserError(verified.reason);
-    const { headSha } = verified.value;
-    const result = await capture(config.gsPath, gitstreamRebaseArgs(target.repo, target.number, headSha), `${SOURCE_LABEL.gitstream} rebase`);
-    if (!result.ok) {
-      const failure = classifyRebaseFailure("gitstream", result.output);
-      if (failure.upToDate) return { status: "up-to-date", message: "Already up to date.", headSha };
-      throw new UserError(failure.message);
+  /**
+   * Delta has no server-side rebase, so this is plain git against `origin` in the configured
+   * checkout, touching only private refs/radar/* refs (never the worktree, HEAD or origin/*):
+   * verify on Delta, fetch base+head, refuse merge commits, `git replay`, then push leased
+   * to the head Delta reported. One fetch and one push per click keeps Delta load light.
+   */
+  const gitFailure = (output: string, fallback: string) => {
+    const failure = classifyRebaseFailure("delta", output);
+    return failure.upToDate ? fallback : failure.message;
+  };
+
+  async function rebaseDelta(target: RebaseTarget): Promise<RebaseResult> {
+    const delta = hosts().delta;
+    if (delta === null) throw new UserError("Delta is not configured.");
+    const cwd = config.deltaCheckout;
+    if (cwd === "") throw new UserError(`Set "Local checkout of the Delta repo used for Rebase" in Radar settings to rebase ${SOURCE_LABEL.delta} PRs.`);
+    if (target.repo.toLowerCase() !== delta.repo.toLowerCase()) throw new UserError(`Radar only rebases ${delta.repo} PRs on ${SOURCE_LABEL.delta}.`);
+    const git = (args: string[], label: string, timeoutMs?: number) => capture("git", args, label, { cwd, timeoutMs });
+    const origin = await git(gitOriginArgs(), "git remote");
+    if (!origin.ok || !originMatches(origin.stdout, delta.host, delta.repo)) {
+      throw new UserError(`The rebase checkout's origin is not https://${delta.host}/${delta.repo}. Fix the checkout path in Radar settings.`);
     }
-    return gitstreamRebaseResult(parseJson(result.stdout, `${SOURCE_LABEL.gitstream} rebase`), headSha);
+    const me = await resolveDeltaMe();
+    const pr = parseJson(await tool(config.dtPath, deltaPrArgs(delta.host, target.repo, target.number), SOURCE_LABEL.delta), SOURCE_LABEL.delta);
+    const verified = verifyDeltaPr(pr, me, target.repo);
+    if (!verified.ok) throw new UserError(verified.reason);
+    const { headSha, headRef, baseRef } = verified.value;
+    const refs = radarRefs(target.number);
+    try {
+      const fetched = await git(gitFetchArgs(target.number, baseRef, headRef), "git fetch", TOOL_TIMEOUT_MS * 6);
+      if (!fetched.ok) throw new UserError(gitFailure(fetched.output, "git fetch failed."));
+      const oid = async (ref: string) => {
+        const result = await git(gitRevParseArgs(ref), "git rev-parse");
+        const value = result.stdout.trim().toLowerCase();
+        if (!result.ok || !/^[0-9a-f]{40}$/.test(value)) throw new UserError("git could not read the fetched branches.");
+        return value;
+      };
+      const [base, head] = [await oid(refs.base), await oid(refs.head)];
+      if (head !== headSha) throw new UserError("The branch changed since Delta last reported it. Refresh and try again.");
+      if ((await git(gitIsAncestorArgs(base, head), "git merge-base")).ok) return { status: "up-to-date", message: "Already up to date.", headSha: head };
+      const merges = await git(gitMergesArgs(base, head), "git rev-list");
+      if (!merges.ok || merges.stdout.trim() !== "0") throw new UserError("Can't rebase cleanly (conflicts or merge commits). Rebase locally instead.");
+      const replay = await git(gitReplayArgs(target.number, base, head), "git replay", TOOL_TIMEOUT_MS * 4);
+      if (!replay.ok) {
+        if (/unknown option|usage: .*git replay|is not a git command/i.test(replay.output)) throw new UserError("Rebase on Delta needs git 2.52 or newer (git replay --ref-action).");
+        throw new UserError("Can't rebase cleanly (conflicts or merge commits). Rebase locally instead.");
+      }
+      const next = replayedHead(replay.stdout, target.number, head);
+      if (next === null) throw new UserError("git replay did not produce a rebased head.");
+      // Delta writes can take minutes; a timeout may still land, so say so instead of retrying.
+      const pushed = await git(gitPushArgs(headRef, next, head), "git push", 5 * 60_000);
+      if (!pushed.ok) throw new UserError(gitFailure(pushed.output, "git push failed."));
+      return { status: "rebased", message: "Rebased onto the latest base.", headSha: next };
+    } finally {
+      for (const ref of [refs.base, refs.head]) await git(gitDeleteRefArgs(ref), "git update-ref").catch(() => undefined);
+    }
   }
 
   const rebasing = new Set<string>();
 
   async function rebase(target: RebaseTarget): Promise<RebaseResult> {
     if (!REBASE_SOURCES.has(target.source)) {
-      throw new UserError(`${SOURCE_LABEL[target.source]} has no server-side rebase (Delta's update-branch merges instead), so Radar doesn't offer it.`);
+      throw new UserError(`${SOURCE_LABEL[target.source]} is read-only (Gitstream no longer accepts PR writes), so Radar can't rebase it. Rebase the matching ${SOURCE_LABEL.delta} PR instead.`);
     }
     const key = `${target.source}:${target.repo}#${target.number}`;
     if (rebasing.has(key)) throw new UserError("A rebase of this pull request is already running.");
     rebasing.add(key);
     try {
-      const result = target.source === "github" ? await rebaseGithub(target) : await rebaseGitstream(target);
+      const result = target.source === "github" ? await rebaseGithub(target) : await rebaseDelta(target);
       bb.log.info(`rebase ${key}: ${result.status} ${result.headSha.slice(0, 12)}`);
       if (result.status === "rebased") {
         // Refresh every lane showing this PR so its row reflects the new head.
@@ -1214,9 +1340,9 @@ export default async function plugin(bb: BbPluginApi) {
   /** CLI target → source: explicit flag, URL host, else the matching item in lanes. */
   function resolveRebaseTarget(input: string, sourceFlag: string | undefined): RebaseTarget {
     const parsed = parseRebaseTarget(input);
-    if (parsed === null) throw new UserError("Usage: bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]");
+    if (parsed === null) throw new UserError("Usage: bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes]");
     if (sourceFlag !== undefined && sourceFlag !== "github" && sourceFlag !== "gitstream" && sourceFlag !== "delta") {
-      throw new UserError("--source must be github, gitstream or delta.");
+      throw new UserError("--source must be github or delta (gitstream is read-only history).");
     }
     const flagged = sourceFlag as RebaseTarget["source"] | undefined;
     if (parsed.source !== null && flagged !== undefined && parsed.source !== flagged) throw new UserError("--source does not match the URL.");
@@ -1225,7 +1351,7 @@ export default async function plugin(bb: BbPluginApi) {
       const sources = [...new Set(allItems().filter((item) => item.kind === "pr" && item.repo.toLowerCase() === parsed.repo.toLowerCase() && item.number === parsed.number).map((item) => item.source))];
       if (sources.length > 1) throw new UserError(`${parsed.repo}#${parsed.number} is on ${sources.join(" and ")}; pass --source.`);
       const { gitstream, delta } = hosts();
-      const elsewhere = [gitstream, delta].filter((host) => host !== null && host.repo.toLowerCase() === parsed.repo.toLowerCase());
+      const elsewhere = [delta, gitstream].filter((host) => host !== null && host.repo.toLowerCase() === parsed.repo.toLowerCase());
       source = sources[0] ?? (elsewhere.length > 0 ? undefined : "github");
       if (source === undefined) throw new UserError(`${parsed.repo} PRs live on ${elsewhere.map((host) => host!.label).join(" or ")}; pass a URL or --source.`);
     }
@@ -1281,17 +1407,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   settings.onChange((values) => {
     if (disposed) return;
-    const hadGitstream = hosts().gitstream?.repo;
+    const hadLabels = labelRepo();
+    const hadDelta = JSON.stringify(hosts().delta);
     config = readConfig(values);
     applyHosts(config);
-    if (hosts().gitstream !== null && hosts().gitstream?.repo !== hadGitstream) void buildLabelIndex();
+    if (JSON.stringify(hosts().delta) !== hadDelta) deltaMe = "";
+    if (labelRepo() !== "" && labelRepo() !== hadLabels) void buildLabelIndex();
     publish();
     wakeSleep?.();
   });
 
   bb.background.service("poll", {
     async start(signal) {
-      const stale = hosts().gitstream !== null && (labelIndex === null || Date.now() - Date.parse(labelIndex.at) > 24 * 3_600_000);
+      const maxAge = hosts().delta !== null ? 7 * 24 * 3_600_000 : 24 * 3_600_000;
+      const stale = labelRepo() !== "" && (labelIndex === null || Date.now() - Date.parse(labelIndex.at) > maxAge);
       if (stale) void buildLabelIndex();
       await refreshAll();
       void pruneReviews()
@@ -1337,7 +1466,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb radar focus --off | --on               turn Focus off (back to normal) / resume the last one",
     "  bb radar hide <repo|area>…                hide from every lane, view and the badge",
     "  bb radar show <repo|area>…                undo hide (adds to the focus while one is set)",
-    "  bb radar rebase <url|owner/repo#n> --yes  server-side rebase of your own open PR (GitHub, Gitstream)",
+    "  bb radar rebase <url|owner/repo#n> --yes  rebase your own open PR (GitHub server-side; Delta via git)",
     "",
     "Repos are owner/name (or a unique tail, e.g. billing); areas of the area repo (a setting)",
     "are //<path> label keys (or a unique tail, e.g. mobile); no-area is that repo without an area label.",
@@ -1354,7 +1483,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register({
     name: "radar",
-    summary: "Live PR/issue queues that need you (GitHub, plus optional Gitstream and Delta)",
+    summary: "Live PR/issue queues that need you (Delta and GitHub, plus optional read-only Gitstream history)",
     commands: [
       { name: "status", summary: "Per-lane counts", usage: "bb radar status [--json]" },
       { name: "list", summary: "List items", usage: "bb radar list [--lane <id>] [--view reviews|prs|issues|all] [--new] [--all] [--json]" },
@@ -1371,8 +1500,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "show", summary: "Unhide repos/areas", usage: "bb radar show <repo|area>…" },
       {
         name: "rebase",
-        summary: "Server-side rebase of your own open PR onto its base (rewrites the branch; needs --yes)",
-        usage: "bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]",
+        summary: "Rebase your own open PR onto its base (GitHub server-side, Delta via git replay + leased push; needs --yes)",
+        usage: "bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes]",
       },
     ],
     async run(argv) {
@@ -1551,7 +1680,7 @@ export default async function plugin(bb: BbPluginApi) {
             const sourceFlag = sourceIndex >= 0 ? rest[sourceIndex + 1] : undefined;
             const positional = rest.filter((arg, index) => !arg.startsWith("--") && (sourceIndex < 0 || index !== sourceIndex + 1));
             if (positional.length !== 1) {
-              return { exitCode: 1, stderr: "Usage: bb radar rebase <PR url | owner/repo#number> [--source github|gitstream] [--yes]" };
+              return { exitCode: 1, stderr: "Usage: bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes]" };
             }
             if (fetchedAt === "") await refreshAll();
             const target = resolveRebaseTarget(positional[0]!, sourceFlag);

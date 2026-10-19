@@ -1,11 +1,11 @@
-Radar is a live panel of the pull requests and issues that need you, on **GitHub** and, if you set them up, a **Gitstream** repo and a **Delta** repo. Nothing is stored remotely: lanes are queried live from your own `gh` (and `gs`, `dt`) CLIs every 90 seconds, and only your configuration lives in bb.
+Radar is a live panel of the pull requests and issues that need you, on **GitHub** and a **Delta** repo, plus optional read-only **Gitstream history**. Nothing is stored remotely: lanes are queried live from your own `gh` and `dt` (and, for history, `gs`) CLIs every 90 seconds, and only your configuration lives in bb.
 
 ## Lanes
 
 A lane is a saved query that can hit several hosts at once. The defaults cover reviews requested from you, mentions, assigned items and your own open PRs. Results merge by last update, with unseen items marked and an unseen count on Radar's rail icon.
 
 - **Describe what to track** in plain words ("PRs from my team that touch billing, not drafts") and an OpenAI-compatible model drafts a lane for you.
-- **Edit a lane** in a form with per-host sections, a live summary, chip inputs and Gitstream's server-side filters (review requested, author, labels, and more).
+- **Edit a lane** in a form with per-host sections, a live summary, chip inputs, and server-side filters for Gitstream history lanes.
 - **All**, **Issues**, **Pull requests** and **Reviews** views, switched from the panel title bar. Each lane has a category, inferred from its query or picked in the editor, that decides its view; All shows every lane.
 
 ## Focus
@@ -16,7 +16,7 @@ Hide repos across every lane ("no billing", "only the mobile app"). Type it in w
 
 Every row can start a bb thread through bb's own new-thread composer, with the project picked from the repo. Threads land in a **Reviews** thread section and the row links to them until archived.
 
-Your own open GitHub and Gitstream PRs also get **Rebase**: an inline confirm, then a server-side rebase onto the latest base (GitHub's rebase update, Gitstream's clean-only rebase). Radar re-checks on the host that you wrote the PR before touching it. Delta has no server-side rebase, so it is not offered there.
+Your own open GitHub and Delta PRs also get **Rebase**: an inline confirm, then a rebase onto the latest base. GitHub uses its server-side rebase update. Delta has no server-side rebase, so once you point Radar at a local checkout it uses plain git against `origin`: a clean-only `git replay` in private refs (your worktree is untouched) and a lease-guarded push. Radar re-checks on the host that you wrote the PR before touching it. Gitstream history is read-only and never written to.
 
 Radar threads get skills attached:
 
@@ -29,5 +29,5 @@ Radar threads get skills attached:
 
 ## Requirements
 
-- `gh` signed in to GitHub. For Gitstream or Delta, `gs` or `dt` signed in, plus the repo and host in settings; lanes skip sources that are not set up.
+- `gh` signed in to GitHub. For Delta, `dt` signed in plus the host and repo in settings (and a checkout path for Rebase); for Gitstream history, `gs` plus the history toggle. Lanes skip sources that are not set up.
 - An OpenAI-compatible API key in the bb server environment (`OPENAI_API_KEY` by default; base URL, key variable and model are settings) for drafting lanes and focus.

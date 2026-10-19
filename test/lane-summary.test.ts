@@ -6,8 +6,8 @@ const lane = (id: string) => DEFAULT_LANES.find((entry) => entry.id === id)!;
 
 describe("summarizeLane", () => {
   it("describes the default lanes", () => {
-    expect(summarizeLane(lane("reviews"))).toBe("Open PRs requesting your review · 3 sources");
-    expect(summarizeLane(lane("mine"))).toBe("Open PRs by you · 3 sources");
+    expect(summarizeLane(lane("reviews"))).toBe("Open PRs requesting your review · 2 sources");
+    expect(summarizeLane(lane("mine"))).toBe("Open PRs by you · 2 sources");
     expect(summarizeLane(lane("github-mentions"))).toBe("Open PRs and issues mentioning you · GitHub only · updated in 14d");
     expect(summarizeLane(lane("github-assigned"))).toBe("Open issues assigned to you · GitHub only");
   });

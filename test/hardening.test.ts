@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyToolError,
   gitstreamArgs,
-  gitstreamFallbackEmail,
+  principalFallbackEmail,
   laneQueryKey,
   laneSchema,
   markNew,
@@ -63,9 +63,9 @@ describe("gitstream principals", () => {
   });
 
   it("only falls back to a git email that is an address", () => {
-    expect(gitstreamFallbackEmail(" first.last@example.com\n")).toBe("first.last@example.com");
-    expect(gitstreamFallbackEmail("not an email")).toBe("");
-    expect(gitstreamFallbackEmail("")).toBe("");
+    expect(principalFallbackEmail(" first.last@example.com\n")).toBe("first.last@example.com");
+    expect(principalFallbackEmail("not an email")).toBe("");
+    expect(principalFallbackEmail("")).toBe("");
   });
 });
 

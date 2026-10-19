@@ -18,7 +18,11 @@ import { CATEGORY_LABEL, enabledSources, itemInView, laneInView, SOURCE_LABEL, S
 
 const sourceHint = (source: Source): string => {
   const { gitstream, delta } = hosts();
-  if (source === "gitstream") return gitstream === null ? "Not set up: add a Gitstream repo in Settings → Plugins → Radar" : `${gitstream.repo} · gs`;
+  if (source === "gitstream") {
+    return gitstream === null
+      ? "Read-only history, off: turn on Gitstream history in Settings → Plugins → Radar"
+      : `${gitstream.repo} · gs · read-only history (no PR writes)`;
+  }
   if (source === "delta") return delta === null ? "Not set up: add a Delta host and repo in Settings → Plugins → Radar" : `${delta.repo} · dt`;
   return "github.com";
 };
@@ -1099,7 +1103,8 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
           if (context !== null) setReviewing({ item, context });
         });
       },
-      viewer: { github: snapshot?.githubLogin ?? "", gitstream: snapshot?.gitstreamLogin ?? "" },
+      // Delta rows offer Rebase only once a rebase checkout is configured.
+      viewer: { github: snapshot?.githubLogin ?? "", delta: snapshot?.deltaRebase === true ? (snapshot?.deltaLogin ?? "") : "" },
       skills: snapshot?.skills ?? DEFAULT_SKILL_SETTINGS,
       // Errors stay on the row, not the page banner.
       rebase: (item: RadarItem) =>

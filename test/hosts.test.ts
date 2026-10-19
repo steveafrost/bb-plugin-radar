@@ -13,19 +13,28 @@ describe("readHosts", () => {
   });
   it("turns hosts on from settings and keeps custom names", () => {
     const { hosts: next, problems } = readHosts({
-      gitstreamRepo: "acme/mono", gitstreamWebUrl: "https://gs.acme.dev/", gitstreamLabel: "Review UI",
+      gitstreamHistory: true, gitstreamRepo: "acme/mono", gitstreamWebUrl: "https://gs.acme.dev/", gitstreamLabel: "Review UI",
       deltaHost: "Delta.Acme.dev", deltaRepo: "acme/mono", areaRepo: "acme/mono",
     });
     expect(problems).toEqual([]);
     expect(next).toEqual({
-      gitstream: { repo: "acme/mono", web: "https://gs.acme.dev", label: "Review UI" },
+      gitstream: { repo: "acme/mono", web: "https://gs.acme.dev", label: "Review UI history" },
       delta: { host: "delta.acme.dev", repo: "acme/mono", label: "Delta" },
       areaRepo: "acme/mono",
     });
   });
+  it("keeps Gitstream (read-only history) off unless the history toggle is on", () => {
+    const configured = { gitstreamRepo: "acme/mono", gitstreamWebUrl: "https://gs.acme.dev", gitstreamLabel: "Meteorite", deltaHost: "delta.acme.dev", deltaRepo: "acme/mono" };
+    expect(readHosts(configured).hosts.gitstream).toBeNull();
+    expect(readHosts(configured).hosts.delta).not.toBeNull();
+    expect(readHosts(configured).problems).toEqual([]);
+    expect(readHosts({ ...configured, gitstreamHistory: false }).hosts.gitstream).toBeNull();
+    expect(readHosts({ ...configured, gitstreamHistory: true }).hosts.gitstream?.label).toBe("Meteorite history");
+    expect(readHosts({ ...configured, gitstreamHistory: true, gitstreamLabel: "Old history" }).hosts.gitstream?.label).toBe("Old history");
+  });
   it("switches a host off, with a reason, when a value is malformed", () => {
     const { hosts: next, problems } = readHosts({
-      gitstreamRepo: "acme/mono", gitstreamWebUrl: "http://gs.acme.dev",
+      gitstreamHistory: true, gitstreamRepo: "acme/mono", gitstreamWebUrl: "http://gs.acme.dev",
       deltaHost: "delta.acme.dev/x", deltaRepo: "acme/mono",
       areaRepo: "../etc",
     });
@@ -34,7 +43,7 @@ describe("readHosts", () => {
   });
   it("rejects a web URL with a path, query or credentials-looking parts", () => {
     for (const web of ["https://gs.acme.dev/x", "https://gs.acme.dev/?a=1", "javascript:alert(1)"]) {
-      expect(readHosts({ gitstreamRepo: "a/b", gitstreamWebUrl: web }).hosts.gitstream).toBeNull();
+      expect(readHosts({ gitstreamHistory: true, gitstreamRepo: "a/b", gitstreamWebUrl: web }).hosts.gitstream).toBeNull();
     }
   });
 });
@@ -43,7 +52,7 @@ describe("GitHub-only (no hosts configured)", () => {
   it("only offers GitHub, and labels fall back to generic names", () => {
     setHosts(NO_HOSTS);
     expect(enabledSources()).toEqual(["github"]);
-    expect(SOURCE_LABEL.gitstream).toBe("Gitstream");
+    expect(SOURCE_LABEL.gitstream).toBe("Gitstream history");
     setHosts({ ...TEST_HOSTS, gitstream: { ...TEST_HOSTS.gitstream, label: "Review UI" } });
     expect(SOURCE_LABEL.gitstream).toBe("Review UI");
   });
@@ -54,10 +63,14 @@ describe("GitHub-only (no hosts configured)", () => {
     expect(system).not.toMatch(/"gitstream"\?:|delta \(/);
     expect(system).toContain("Billing lives in acme/billing.");
   });
-  it("names the configured hosts in the draft prompt", () => {
-    const { system } = draftPrompt("x", { githubLogin: "me", email: "a@b.co", existing: [], candidateLabels: [] });
+  it("names the configured hosts in the draft prompt, Delta as primary and Gitstream as read-only history", () => {
+    const { system } = draftPrompt("x", { githubLogin: "me", email: "a@b.co", existing: [], candidateLabels: ["//areas/clients/mobile"] });
     expect(system).toContain("acme/monorepo");
     expect(system).toContain("delta.example.com");
+    expect(system).toMatch(/primary, live host/);
+    expect(system).toMatch(/READ-ONLY HISTORY/);
+    expect(system).toContain('should use every live source: ["delta","github"]');
+    expect(system).toContain("//areas/clients/mobile");
   });
   it("only parses rebase URLs of configured hosts", () => {
     expect(parseRebaseTarget("https://gitstream.example.com/repos/acme/monorepo/pulls/7")).toEqual({ source: "gitstream", repo: "acme/monorepo", number: 7 });

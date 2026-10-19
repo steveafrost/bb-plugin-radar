@@ -1,23 +1,26 @@
 # Radar (bb plugin)
 
-A live bb panel of the pull requests and issues that need you, on GitHub and,
-optionally, a Gitstream repo and a Delta repo. No backing site or database: every
+A live bb panel of the pull requests and issues that need you, on GitHub and a
+Delta repo (the primary host for repos that moved off GitHub/Gitstream), plus
+optional read-only Gitstream history. No backing site or database: every
 lane is a saved query that the bb server re-runs on an interval, and the panel
 shows whatever is current.
 
 - **Lanes**: each lane reads one or more hosts and merges the results:
+  - Delta: the GitHub-syntax query via `dt api search/issues` (`author:@me` and
+    `review-requested:@me` resolve server-side; `archived:` is stripped; Delta
+    rejects `mentions:` and `involves:`). Radar never uses `dt pr list --author`.
   - GitHub: search query via `gh api graphql`.
-  - Gitstream (optional): `gs api repos/<repo>/pulls` with server-side principals,
-    exact labels, text search, draft/approval filters.
-  - Delta (optional): the same GitHub-syntax query via `dt api search/issues`
-    (`archived:` is stripped; Delta rejects `mentions:` and `involves:`).
+  - Gitstream history (off by default): `gs api repos/<repo>/pulls` reads only.
+    Gitstream no longer accepts PR writes, so it is labelled "<name> history",
+    the default lanes leave it out, and Radar never writes to it.
   A host that fails shows its error on the lane without hiding the others' items.
   Sources that are not set up are skipped, so the default lanes work with GitHub alone.
   Optional client-side filters refine the merged list.
-- **Track something**: describe what you want in plain English; an
+- **Track something**: describe what you want in plain English; a
   BB-configured model drafts a lane, Radar runs it once and shows the live
-  preview, and you add, tweak, or discard it. Gitstream label names come from a
-  daily label index, so the model uses exact spellings, and the `draftNotes`
+  preview, and you add, tweak, or discard it. Label names come from a
+  label index of the Delta repo (about 60 sequential page reads, at most once a week), so the model uses exact spellings, and the `draftNotes`
   setting tells it about your repos, teams and labels.
 - **New badges**: items you have not seen are dotted and floated to the top of
   their lane; "Mark seen" acknowledges them.
@@ -25,7 +28,7 @@ shows whatever is current.
   **Pull requests**, **Reviews** (`/plugins/radar/board/all`, `/board/issues`,
   `/board/prs`, `/board/reviews`; bare `/board` opens All). Every lane has a
   `category` naming its view, and All shows every lane. The category is inferred
-  from the query (review-requested:/reviewed-by:/Gitstream reviewRequested →
+  from the query (review-requested:/reviewed-by:/Gitstream-history reviewRequested →
   reviews, `is:pr` or Gitstream-only → prs, `is:issue` → issues, mixed → all)
   until you pick one in the lane editor, which pins it. The Pull requests and
   Issues views keep only that kind of item. Tab tooltips carry per-view counts,
@@ -42,7 +45,7 @@ shows whatever is current.
     for the thread through `bb.agents.configure`, keyed off the thread's Radar
     metadata (`action`). Other threads only see the `radar` CLI skill.
   - One installed skill is invoked in the opening message, as if picked from the
-    composer's `/` menu. Settings `gitstreamReviewSkill` (Gitstream PRs),
+    composer's `/` menu. Settings `gitstreamReviewSkill` (Gitstream history PRs),
     `reviewSkill` (GitHub/Delta PRs) and `triageSkill` (issues) choose it; empty
     (the default) means none. It is skipped when the target project
     cannot see that skill, or when you already picked a skill in the composer.
@@ -54,13 +57,17 @@ shows whatever is current.
   - GitHub: GraphQL `updatePullRequestBranch(updateMethod: REBASE,
     expectedHeadOid)`, gated by GitHub's `viewerDidAuthor`. A head with
     `behind_by == 0` is reported up to date without any write.
-  - Gitstream: the native `POST repos/{o}/{r}/pulls/{n}/rebase` with
-    `expected_head_sha` (clean-only; conflicts and merge commits are refused
-    with 422 and nothing is pushed; `rebased: false` when already up to date).
-  - Delta: not offered. walgit only has `update-branch`, which merges the base
-    into the head rather than rebasing, and Radar never falls back to a local
-    checkout.
-  `bb radar rebase <PR url | owner/repo#n> [--source github|gitstream] --yes`
+  - Delta: walgit has no server-side rebase (`update-branch` merges), so Radar
+    uses plain git against `origin` in the checkout set in `deltaCheckout`
+    (off when empty). It re-reads the PR with `dt` (yours, open, same repo),
+    fetches only the base and head into private `refs/radar/rebase/<n>/*` refs
+    (`--refmap=`, so `origin/*`, HEAD, branches and the worktree are untouched),
+    refuses merge commits, runs `git replay` (clean-only: a conflict pushes
+    nothing), then `git push --force-with-lease=<branch>:<head Delta reported>`.
+    The private refs are deleted afterwards. Needs git with
+    `git replay --ref-action` (2.52+).
+  - Gitstream history: not offered; Gitstream no longer accepts PR writes.
+  `bb radar rebase <PR url | owner/repo#n> [--source github|delta] --yes`
   does the same from the CLI (without `--yes` it only says what it would do).
 - **Rail badge**: the unseen count sits on Radar's nav-rail icon. bb does not
   mount navPanel sidebar accessories yet, so a content script decorates the rail
@@ -79,7 +86,7 @@ shows whatever is current.
   `bb radar …` (see `skills/radar/SKILL.md`).
 
 Persisted state is configuration only: the lane list, the Focus filter, seen-item keys and
-item → review-thread links live in plugin kv. The cached Gitstream label list can be too big for
+item → review-thread links live in plugin kv. The cached label list can be too big for
 kv's 256KB value cap, so it lives in the plugin database (`label_index` table).
 
 AI execution requires a BB development build exposing `experimental_ai.complete`. On older hosts Radar reports that the API is unsupported, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced; there is no credential fallback. Focus also falls back to name matching after a provider error.
@@ -103,20 +110,22 @@ Radar needs `gh` signed in on the bb host. Everything else is in
 
 | Setting | What it does |
 | --- | --- |
-| `gitstreamRepo`, `gitstreamWebUrl`, `gitstreamLabel`, `gsPath` | Turn on a Gitstream repo (`owner/name`), the https origin its PRs open at, the name shown for it, and the `gs` binary. Empty repo = off. |
-| `deltaHost`, `deltaRepo`, `deltaLabel`, `dtPath` | Same for a Delta repo, read with `dt --host <deltaHost> -R <deltaRepo>`. |
+| `deltaHost`, `deltaRepo`, `deltaLabel`, `dtPath` | Turn on a Delta repo, read with `dt --host <deltaHost> -R <deltaRepo>`. Empty repo = off. |
+| `deltaCheckout` | Absolute path to a local checkout whose `origin` is the Delta repo; turns on Rebase for your Delta PRs. Empty = off. |
+| `gitstreamHistory`, `gitstreamRepo`, `gitstreamWebUrl`, `gitstreamLabel`, `gsPath` | Read-only Gitstream history: off unless `gitstreamHistory` is true and the repo and https web origin are set. Shown as "<label> history". |
 | `areaRepo` | A monorepo whose `//path` labels become Focus areas. |
 | AI provider/model | In **AI & focus**, use BB’s default (no override, stored as `null`) or choose a provider/model with BB’s native picker and save the override. Stored via typed RPC and durable plugin storage, not CLI config. No separate endpoint or key. Legacy `aiBaseUrl`, `aiKeyEnv`, and `aiModel` values are ignored. |
 | `draftNotes` | Plain-words context for the drafter: which repos live where, team names, label conventions. |
 | `maxAgeDays`, `refreshSeconds` | Hide items not updated in N days (default 60, 0 = no limit); poll interval (min 30s). |
 | `reviewSection`, `reviewSkill`, `gitstreamReviewSkill`, `triageSkill` | Thread section for Radar threads, and an installed skill to invoke per kind. |
 
-Example for a monorepo on Gitstream and Delta:
+Example for a monorepo on Delta:
 
 ```sh
-bb plugin config radar set gitstreamRepo acme/monorepo
-bb plugin config radar set gitstreamWebUrl https://gitstream.acme.dev
 bb plugin config radar set deltaHost delta.acme.dev
 bb plugin config radar set deltaRepo acme/monorepo
+bb plugin config radar set deltaCheckout ~/src/monorepo   # optional: Rebase
 bb plugin config radar set areaRepo acme/monorepo
+# optional, read-only: old PRs from before the move
+bb plugin config radar set gitstreamHistory true
 ```

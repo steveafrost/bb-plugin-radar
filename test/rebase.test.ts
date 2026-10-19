@@ -8,43 +8,54 @@ import {
   githubCompareArgs,
   githubPrArgs,
   githubRebaseArgs,
-  gitstreamPrArgs,
-  gitstreamRebaseArgs,
-  gitstreamRebaseResult,
+  deltaMeArgs,
+  deltaPrArgs,
+  deltaPrincipal,
+  gitDeleteRefArgs,
+  gitFetchArgs,
+  gitPushArgs,
+  gitReplayArgs,
+  originMatches,
   parseRebaseTarget,
+  REBASE_SOURCES,
+  replayedHead,
+  safeBranch,
+  verifyDeltaPr,
   verifyGithubPr,
-  verifyGitstreamPr,
 } from "../rebase";
 
 const SHA = "a".repeat(40);
 const BASE = "b".repeat(40);
-const viewer = { github: "medev", gitstream: "me.dev@example.com" };
+const viewer = { github: "medev", delta: "me.dev@example.com" };
 const item = (over: Partial<Item>): Item => ({
   key: "k", source: "github", kind: "pr", repo: "o/r", number: 1, title: "T", url: "",
   author: "medev", draft: false, state: "open", labels: [], createdAt: "", updatedAt: "", ...over,
 });
 
 describe("canRebase (row gating)", () => {
-  it("offers Rebase on your own open GitHub and Gitstream PRs, case-insensitively", () => {
+  it("offers Rebase on your own open GitHub and Delta PRs, case-insensitively", () => {
     expect(canRebase(item({}), viewer)).toBe(true);
     expect(canRebase(item({ author: "MeDev" }), viewer)).toBe(true);
-    expect(canRebase(item({ source: "gitstream", author: "me.dev@example.com" }), viewer)).toBe(true);
+    // Delta rows carry the email's local part; the viewer is the full principal.
+    expect(canRebase(item({ source: "delta", author: "Me.Dev" }), viewer)).toBe(true);
     expect(canRebase(item({ draft: true, state: "open" }), viewer)).toBe(true);
-    expect(canRebase(item({ source: "gitstream", author: "me.dev@example.com", state: "draft" }), viewer)).toBe(true);
+    expect(canRebase(item({ source: "delta", author: "me.dev", state: "draft" }), viewer)).toBe(true);
   });
   it("hides it on other people's PRs, issues, closed or merged PRs", () => {
     expect(canRebase(item({ author: "alice" }), viewer)).toBe(false);
     expect(canRebase(item({ kind: "issue" }), viewer)).toBe(false);
     expect(canRebase(item({ state: "closed" }), viewer)).toBe(false);
     expect(canRebase(item({ state: "merged" }), viewer)).toBe(false);
-    // The GitHub login must not match a Gitstream author, and vice versa.
-    expect(canRebase(item({ source: "gitstream", author: "medev" }), viewer)).toBe(false);
+    // The GitHub login must not match a Delta author, and vice versa.
+    expect(canRebase(item({ source: "delta", author: "medev" }), viewer)).toBe(false);
     expect(canRebase(item({ author: "me.dev@example.com" }), viewer)).toBe(false);
   });
-  it("hides it on Delta (no server-side rebase) and while identity is unknown", () => {
-    expect(canRebase(item({ source: "delta", author: "me.dev" }), { ...viewer, github: "me.dev" })).toBe(false);
-    expect(canRebase(item({ author: "" }), { github: "", gitstream: "" })).toBe(false);
-    expect(canRebase(item({}), { github: "", gitstream: "" })).toBe(false);
+  it("never offers it on read-only Gitstream history, or while identity is unknown / no checkout is set", () => {
+    expect(REBASE_SOURCES.has("gitstream")).toBe(false);
+    expect(canRebase(item({ source: "gitstream", author: "me.dev@example.com" }), viewer)).toBe(false);
+    expect(canRebase(item({ source: "delta", author: "me.dev" }), { ...viewer, delta: "" })).toBe(false);
+    expect(canRebase(item({ author: "" }), { github: "", delta: "" })).toBe(false);
+    expect(canRebase(item({}), { github: "", delta: "" })).toBe(false);
   });
 });
 
@@ -62,19 +73,53 @@ describe("argv construction", () => {
     expect(githubCompareArgs("o/r", BASE, SHA)).toEqual(["api", `repos/o/r/compare/${BASE}...${SHA}`, "--jq", ".behind_by"]);
     expect(() => githubCompareArgs("o/r", "main", SHA)).toThrow();
   });
-  it("uses Gitstream's native rebase endpoint with expected_head_sha", () => {
-    expect(gitstreamPrArgs("acme/monorepo", 2151771)).toEqual(["api", "repos/acme/monorepo/pulls/2151771"]);
-    expect(gitstreamRebaseArgs("acme/monorepo", 2151771, SHA)).toEqual([
-      "api", "-X", "POST", "repos/acme/monorepo/pulls/2151771/rebase", "-f", `expected_head_sha=${SHA}`,
+  it("reads Delta identity and PRs with an explicit host and repo", () => {
+    expect(deltaMeArgs("delta.example.com", "acme/monorepo")).toEqual(["--host", "delta.example.com", "-R", "acme/monorepo", "api", "/api/v1/me"]);
+    expect(deltaPrArgs("delta.example.com", "acme/monorepo", 2261664)).toEqual(["--host", "delta.example.com", "-R", "acme/monorepo", "api", "repos/acme/monorepo/pulls/2261664"]);
+  });
+  it("rebases on Delta with plain git in private refs and a leased push", () => {
+    expect(gitFetchArgs(7, "main", "frost/x")).toEqual([
+      "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--refmap=", "origin",
+      "+refs/heads/main:refs/radar/rebase/7/base", "+refs/heads/frost/x:refs/radar/rebase/7/head",
     ]);
+    expect(gitReplayArgs(7, BASE, SHA)).toEqual(["replay", "--ref-action=print", `--onto=${BASE}`, "--ref=refs/radar/rebase/7/head", `${BASE}..${SHA}`]);
+    const next = "c".repeat(40);
+    expect(gitPushArgs("frost/x", next, SHA)).toEqual([
+      "push", "--porcelain", "--no-follow-tags", `--force-with-lease=refs/heads/frost/x:${SHA}`, "origin", `${next}:refs/heads/frost/x`,
+    ]);
+    expect(gitDeleteRefArgs("refs/radar/rebase/7/head")).toEqual(["update-ref", "-d", "refs/radar/rebase/7/head"]);
+    expect(() => gitDeleteRefArgs("refs/heads/main")).toThrow();
+  });
+  it("reads the replayed head only for Radar's ref and the expected old head", () => {
+    const next = "c".repeat(40);
+    expect(replayedHead(`update refs/radar/rebase/7/head ${next} ${SHA}\n`, 7, SHA)).toBe(next);
+    expect(replayedHead(`update refs/heads/main ${next} ${SHA}`, 7, SHA)).toBeNull();
+    expect(replayedHead(`update refs/radar/rebase/7/head ${next} ${BASE}`, 7, SHA)).toBeNull();
+    expect(replayedHead("", 7, SHA)).toBeNull();
+  });
+  it("accepts only branch names that cannot become options or refspec syntax", () => {
+    for (const name of ["main", "frost/finance-web-date-range-picker", "issue-1030_x.y"]) expect(safeBranch(name), name).toBe(true);
+    for (const name of ["", "-f", "--upload-pack=x", "a..b", "a:b", "+main", "a b", "a/", "/a", "a.lock", ".a", "a//b", "a/.b", "a^", "a~1", "a@{1}", "x\ny"]) {
+      expect(safeBranch(name), name).toBe(false);
+    }
+    expect(() => gitFetchArgs(1, "main", "a:b")).toThrow();
+    expect(() => gitPushArgs("-f", SHA, SHA)).toThrow();
+  });
+  it("matches the checkout's origin to the Delta host and repo", () => {
+    expect(originMatches("https://delta.example.com/acme/monorepo.git\n", "delta.example.com", "acme/monorepo")).toBe(true);
+    expect(originMatches("git@delta.example.com:acme/monorepo.git", "delta.example.com", "acme/monorepo")).toBe(true);
+    expect(originMatches("https://gitstream.example.com/acme/monorepo.git", "delta.example.com", "acme/monorepo")).toBe(false);
+    expect(originMatches("https://delta.example.com.evil.dev/acme/monorepo.git", "delta.example.com", "acme/monorepo")).toBe(false);
+    expect(originMatches("https://delta.example.com/acme/other.git", "delta.example.com", "acme/monorepo")).toBe(false);
   });
   it("rejects untrusted repo, number, SHA and node id shapes", () => {
     for (const repo of ["o/r/x", "../etc", "o/..", "o r/x", "-X/POST", "o/r?x=1", "", "o/-r"]) {
-      expect(() => gitstreamPrArgs(repo, 1), repo).toThrow();
+      expect(() => deltaPrArgs("d.example.com", repo, 1), repo).toThrow();
     }
-    expect(() => gitstreamPrArgs("o/r", 0)).toThrow();
-    expect(() => gitstreamPrArgs("o/r", 1.5)).toThrow();
-    expect(() => gitstreamRebaseArgs("o/r", 1, "abc")).toThrow();
+    expect(() => deltaPrArgs("d.example.com", "o/r", 0)).toThrow();
+    expect(() => deltaPrArgs("d.example.com", "o/r", 1.5)).toThrow();
+    expect(() => gitReplayArgs(1, "main", SHA)).toThrow();
+    expect(() => gitPushArgs("x", "abc", SHA)).toThrow();
     expect(() => githubRebaseArgs("id with space", SHA)).toThrow();
     expect(() => githubRebaseArgs("x\nquery=", SHA)).toThrow();
   });
@@ -92,18 +137,27 @@ describe("server-side re-verification", () => {
     expect(verifyGithubPr(ghPr({ baseRef: null })).ok).toBe(false);
     expect(verifyGithubPr({ data: { repository: { pullRequest: null } } }).ok).toBe(false);
   });
-  const gsPr = (over: Record<string, unknown>) => ({ state: "open", merged: false, user: { login: "Me.Dev@example.com" }, head: { sha: SHA }, ...over });
-  it("checks Gitstream authorship against the resolved principal", () => {
-    expect(verifyGitstreamPr(gsPr({}), "me.dev@example.com")).toEqual({ ok: true, value: { headSha: SHA } });
-    expect(verifyGitstreamPr(gsPr({ user: { login: "other@example.com" } }), "me.dev@example.com").ok).toBe(false);
-    expect(verifyGitstreamPr(gsPr({}), "").ok).toBe(false);
-    expect(verifyGitstreamPr(gsPr({ state: "closed" }), "me.dev@example.com").ok).toBe(false);
-    expect(verifyGitstreamPr(gsPr({ merged: true }), "me.dev@example.com").ok).toBe(false);
-    expect(verifyGitstreamPr(gsPr({ head: { sha: "zz" } }), "me.dev@example.com").ok).toBe(false);
+  const dtPr = (over: Record<string, unknown>) => ({
+    state: "open", merged: false, user: { login: "Me.Dev@example.com" },
+    head: { sha: SHA, ref: "frost/x", repo: { full_name: "acme/monorepo" } }, base: { sha: BASE, ref: "main" }, ...over,
   });
-  it("reads Gitstream's rebased flag", () => {
-    expect(gitstreamRebaseResult({ rebased: true, head_sha: BASE }, SHA)).toMatchObject({ status: "rebased", headSha: BASE });
-    expect(gitstreamRebaseResult({ rebased: false, head_sha: SHA }, SHA)).toMatchObject({ status: "up-to-date" });
+  const me = "me.dev@example.com";
+  it("reads the Delta principal from /api/v1/me", () => {
+    expect(deltaPrincipal({ principal: "me.dev@example.com", anonymous: false })).toBe("me.dev@example.com");
+    expect(deltaPrincipal({ principal: "me.dev@example.com", anonymous: true })).toBe("");
+    expect(deltaPrincipal({ principal: "not an email" })).toBe("");
+    expect(deltaPrincipal(null)).toBe("");
+  });
+  it("checks Delta authorship, state, repo, refs and SHAs", () => {
+    expect(verifyDeltaPr(dtPr({}), me, "acme/monorepo")).toEqual({ ok: true, value: { headSha: SHA, baseSha: BASE, headRef: "frost/x", baseRef: "main" } });
+    expect(verifyDeltaPr(dtPr({ user: { login: "other@example.com" } }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({}), "", "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ state: "closed" }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ merged: true }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ head: { sha: "zz", ref: "frost/x" } }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ head: { sha: SHA, ref: "frost/x", repo: { full_name: "fork/monorepo" } } }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ head: { sha: SHA, ref: "--upload-pack=x" } }), me, "acme/monorepo").ok).toBe(false);
+    expect(verifyDeltaPr(dtPr({ base: { sha: BASE, ref: "a..b" } }), me, "acme/monorepo").ok).toBe(false);
   });
 });
 
@@ -112,16 +166,17 @@ describe("classifyRebaseFailure", () => {
     expect(classifyRebaseFailure("github", "There are no new commits on the base branch.")).toEqual({ upToDate: true });
   });
   it("words conflicts, head races, policy and permission failures", () => {
-    const message = (source: "github" | "gitstream", text: string) => {
+    const message = (source: "github" | "delta", text: string) => {
       const out = classifyRebaseFailure(source, text);
       return out.upToDate ? "up-to-date" : out.message;
     };
     expect(message("github", "gh: merge conflict between base and head")).toMatch(/conflicts/);
-    expect(message("gitstream", "HTTP 422: commit abc does not apply cleanly; not clean")).toMatch(/conflicts/);
-    expect(message("gitstream", "HTTP 422: unprocessable")).toMatch(/not clean/);
-    expect(message("gitstream", "HTTP 409: head moved")).toMatch(/changed/);
+    expect(message("delta", "CONFLICT (content): Merge conflict in a.ts")).toMatch(/conflicts/);
+    expect(message("delta", "! [rejected] frost/x (stale info)")).toMatch(/changed/);
+    expect(message("delta", "! [rejected] frost/x (fetch first)")).toMatch(/changed/);
     expect(message("github", "Expected head oid did not match")).toMatch(/changed/);
-    expect(message("gitstream", "HTTP 405: history policy declined")).toMatch(/policy/);
+    expect(message("delta", "remote: push declined by policy")).toMatch(/policy/);
+    expect(message("delta", "fatal: something odd")).toBe("Delta: something odd");
     expect(message("github", "Resource not accessible by integration")).toMatch(/permission/);
     expect(message("github", "Rebasing is not allowed for this repository")).toMatch(/doesn't allow/);
     expect(message("github", "gh: something odd\nmore")).toBe("GitHub: something odd");

@@ -1,8 +1,10 @@
 /**
  * Which hosts Radar reads besides GitHub, and how their items are named and linked.
  *
- * GitHub (via `gh`) always works. Gitstream (`gs`) and Delta (`dt`) are optional:
- * each turns on when its repo (and host or web URL) is set in plugin settings.
+ * GitHub (via `gh`) always works. Delta (`dt`) is the primary host for repos that
+ * left GitHub (e.g. shop/world) and turns on when its host and repo are set.
+ * Gitstream (`gs`) is read-only history: Gitstream no longer accepts PR writes, so it
+ * is off unless its repo and web URL are set AND the "Gitstream history" toggle is on.
  * Server and panel share one current value: the server sets it from settings, the
  * panel from each snapshot, so lane, scope and rebase helpers read it directly.
  */
@@ -12,7 +14,7 @@ const REPO = /^[\w.-]+\/[\w.-]+$/;
 const HOSTNAME = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 
 export const hostsSchema = z.object({
-  /** Gitstream: PRs listed with `gs api repos/<repo>/pulls`, opened at `<web>/repos/<repo>/pulls/<n>`. */
+  /** Gitstream (read-only history): PRs listed with `gs api repos/<repo>/pulls`, opened at `<web>/repos/<repo>/pulls/<n>`. */
   gitstream: z.object({ repo: z.string(), web: z.string(), label: z.string() }).nullable(),
   /** Delta: GitHub-compatible search with `dt --host <host> -R <repo>`. */
   delta: z.object({ host: z.string(), repo: z.string(), label: z.string() }).nullable(),
@@ -24,6 +26,8 @@ export type Hosts = z.infer<typeof hostsSchema>;
 export const NO_HOSTS: Hosts = { gitstream: null, delta: null, areaRepo: "" };
 
 export type HostSettings = {
+  /** Gitstream is read-only history and stays off unless this is true. */
+  gitstreamHistory?: boolean;
   gitstreamRepo?: string;
   gitstreamWebUrl?: string;
   gitstreamLabel?: string;
@@ -32,6 +36,12 @@ export type HostSettings = {
   deltaLabel?: string;
   areaRepo?: string;
 };
+
+/** "Meteorite" → "Meteorite history": the name says the host is read-only wherever it shows. */
+export function historyLabel(value: string | undefined): string {
+  const label = (value ?? "").trim() || "Gitstream";
+  return /\bhistory\b/i.test(label) ? label : `${label} history`;
+}
 
 /** Settings → Hosts. Anything malformed turns that host off and is reported in `problems`. */
 export function readHosts(values: HostSettings): { hosts: Hosts; problems: string[] } {
@@ -44,7 +54,7 @@ export function readHosts(values: HostSettings): { hosts: Hosts; problems: strin
     return "";
   };
   let gitstream: Hosts["gitstream"] = null;
-  const gsRepo = repo(values.gitstreamRepo, "Gitstream repo");
+  const gsRepo = values.gitstreamHistory === true ? repo(values.gitstreamRepo, "Gitstream repo") : "";
   if (gsRepo !== "") {
     const web = (values.gitstreamWebUrl ?? "").trim().replace(/\/+$/, "");
     let ok = false;
@@ -54,7 +64,7 @@ export function readHosts(values: HostSettings): { hosts: Hosts; problems: strin
     } catch {
       // Not a URL.
     }
-    if (ok) gitstream = { repo: gsRepo, web, label: (values.gitstreamLabel ?? "").trim() || "Gitstream" };
+    if (ok) gitstream = { repo: gsRepo, web, label: historyLabel(values.gitstreamLabel) };
     else problems.push(`Gitstream web URL "${web.slice(0, 80)}" must be an https origin like https://gitstream.example.com`);
   }
   let delta: Hosts["delta"] = null;

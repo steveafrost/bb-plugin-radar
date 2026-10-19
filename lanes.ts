@@ -33,6 +33,7 @@ const labelName = z.string().trim().min(1).max(120).refine((value) => !value.sta
 
 /**
  * Server-side filters of Gitstream's GET /repos/{repo}/pulls (its review API).
+ * Gitstream is read-only history now; these stay so saved history lanes keep working.
  * Principals are @me or an email.
  */
 export const gitstreamQuerySchema = z
@@ -57,17 +58,18 @@ export const gitstreamQuerySchema = z
   })
   .strict();
 
-export const SOURCES = ["github", "gitstream", "delta"] as const;
+/** Delta first: it is the primary host for repos that left GitHub; Gitstream is read-only history. */
+export const SOURCES = ["delta", "github", "gitstream"] as const;
 export type Source = (typeof SOURCES)[number];
 
 /** What the UI calls each source; Gitstream and Delta names come from settings. */
-export const SOURCE_LABEL: Record<Source, string> = { gitstream: "Gitstream", delta: "Delta", github: "GitHub" };
+export const SOURCE_LABEL: Record<Source, string> = { gitstream: "Gitstream history", delta: "Delta", github: "GitHub" };
 onHosts((current) => {
-  SOURCE_LABEL.gitstream = current.gitstream?.label ?? "Gitstream";
+  SOURCE_LABEL.gitstream = current.gitstream?.label ?? "Gitstream history";
   SOURCE_LABEL.delta = current.delta?.label ?? "Delta";
 });
 
-/** Sources Radar can read right now: GitHub, plus Gitstream and Delta when configured. */
+/** Sources Radar can read right now: GitHub, plus Delta when configured and Gitstream history when turned on. */
 export function enabledSources(current: Hosts = hosts()): Source[] {
   return SOURCES.filter((source) => source === "github" || current[source] !== null);
 }
@@ -179,7 +181,7 @@ export const laneSchema = z.preprocess(legacySource, z
     title: z.string().trim().min(1).max(80),
     /**
      * Hosts this lane reads, merged into one list: github = github.com (`gh`),
-     * gitstream = a Gitstream repo via `gs`, delta = a Delta repo via `dt` (both set in settings).
+     * delta = a Delta repo via `dt` (primary), gitstream = read-only Gitstream history via `gs` (both set in settings).
      */
     sources: z
       .array(z.enum(SOURCES))
@@ -231,17 +233,15 @@ export const DEFAULT_LANES: Lane[] = [
   {
     id: "reviews",
     title: "Reviews requested",
-    sources: ["github", "gitstream", "delta"],
+    sources: ["delta", "github"],
     query: "is:open is:pr review-requested:@me archived:false",
-    gitstream: { reviewRequested: "@me" },
     category: "reviews",
   },
   {
     id: "mine",
     title: "My open PRs",
-    sources: ["github", "gitstream", "delta"],
+    sources: ["delta", "github"],
     query: "is:open is:pr author:@me archived:false",
-    gitstream: { author: "@me" },
     collapsed: true,
     category: "prs",
   },
@@ -446,7 +446,7 @@ export function windowDays(filter: LaneFilter | undefined, maxAge = DEFAULT_MAX_
   return days === undefined ? maxAge : Math.min(days, maxAge);
 }
 
-/** Client-side refinements neither `gs` nor GitHub search can express for us. */
+/** Client-side refinements neither host search can express for us. */
 export function applyFilter(items: Item[], filter: LaneFilter | undefined, now = Date.now(), maxAge = DEFAULT_MAX_AGE_DAYS): Item[] {
   filter = { ...filter, updatedWithinDays: windowDays(filter, maxAge) };
   const lower = (values: string[] | undefined) => (values ?? []).map((value) => value.toLowerCase());
@@ -551,8 +551,8 @@ export function classifyToolError(stderr: string): ToolFailure {
   return "other";
 }
 
-/** Your git email, when it is an address, stands in for the Gitstream principal gs did not report. */
-export function gitstreamFallbackEmail(gitEmail: string): string {
+/** Your git email, when it is an address, stands in for the Delta / Gitstream principal the CLI did not report. */
+export function principalFallbackEmail(gitEmail: string): string {
   const email = gitEmail.trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
 }
@@ -590,28 +590,32 @@ export function draftPrompt(
 ) {
   const { gitstream, delta } = hosts();
   const sources = enabledSources();
+  /** Live hosts; Gitstream is read-only history and only joins a lane the user asks to cover history. */
+  const live = sources.filter((source) => source !== "gitstream");
   const gs = gitstream === null ? "" : `"${gitstream.label}" (gitstream, ${gitstream.repo})`;
   const dt = delta === null ? "" : `"${delta.label}" (delta, ${delta.repo} on ${delta.host})`;
+  const labels = `Only use label names that appear in the candidate list below (exact spelling). If none fit, use a distinctive word in the query.
+  Candidate labels matching this request: ${context.candidateLabels.length ? JSON.stringify(context.candidateLabels) : "(label index unavailable; prefer a distinctive word)"}`;
   const routing = [
     `- Available sources: ${sources.map((source) => `"${source}"`).join(", ")}. Never use any other source.`,
-    sources.length > 1
-      ? `- One lane can read several hosts. Personal queues ("my PRs", "reviews requested") should use every available source: ${JSON.stringify(sources)}${gitstream !== null ? " with a query AND a matching gitstream object" : ""}.`
-      : "",
-    gitstream !== null
-      ? `- ${gs} serves only ${gitstream.repo}. Its PRs are filtered server-side by the "gitstream" object; principals are "@me" or an email.
-  The repo can be busy, so narrow other people's PRs server-side with gitstream.labels (exact names) and/or gitstream.query; filter.* is only for small refinements.
-  Only use label names that appear in the candidate list below (exact spelling). If none fit, use gitstream.query with a distinctive word.
-  Candidate labels matching this request: ${context.candidateLabels.length ? JSON.stringify(context.candidateLabels) : "(label index unavailable; prefer query)"}`
+    live.length > 1
+      ? `- One lane can read several hosts. Personal queues ("my PRs", "reviews requested") should use every live source: ${JSON.stringify(live)}.`
       : "",
     delta !== null
-      ? `- ${dt} serves only ${delta.repo}. It runs "query" too, supporting is:pr, is:open, review-requested:, author:, reviewed-by:, assignee:, label:"x", -is:draft. It rejects mentions:, involves: (so leave delta out of those lanes); archived: is stripped automatically.`
+      ? `- ${dt} is the primary, live host for ${delta.repo}. It runs "query" too, supporting is:pr, is:open, review-requested:, author:, reviewed-by:, assignee:, label:"x", -is:draft. It rejects mentions:, involves: (so leave delta out of those lanes); archived: is stripped automatically.
+  The repo can be busy, so narrow other people's PRs there with label:"<exact name>" and/or a distinctive word; filter.* is only for small refinements.
+  ${labels}`
+      : "",
+    gitstream !== null
+      ? `- ${gs} is READ-ONLY HISTORY of ${gitstream.repo}: old PRs from before the move${delta !== null ? ` to ${delta.label}` : ""}. Never add "gitstream" to a lane unless the user explicitly asks for Gitstream/Meteorite history.
+  When asked, its PRs are filtered server-side by the "gitstream" object; principals are "@me" or an email.${delta === null ? `\n  ${labels}` : ""}`
       : "",
     gitstream !== null || delta !== null
-      ? `- ${[gitstream?.repo, delta?.repo].filter((repo, index, all) => repo !== undefined && all.indexOf(repo) === index).join(" and ")} ${gitstream !== null && delta !== null && gitstream.repo === delta.repo ? "is" : "are"} NOT on GitHub; everything else is. Use ${JSON.stringify(sources.filter((source) => source !== "github"))} for lanes only about ${gitstream?.repo ?? delta?.repo}.`
+      ? `- ${[delta?.repo, gitstream?.repo].filter((repo, index, all) => repo !== undefined && all.indexOf(repo) === index).join(" and ")} ${gitstream !== null && delta !== null && gitstream.repo === delta.repo ? "is" : "are"} NOT on GitHub; everything else is. Use ${JSON.stringify(live.filter((source) => source !== "github").length > 0 ? live.filter((source) => source !== "github") : sources.filter((source) => source !== "github"))} for lanes only about ${delta?.repo ?? gitstream?.repo}.`
       : "",
     `- GitHub: use a query that includes is:pr or is:issue unless the user wants both, and usually is:open and archived:false.
   GitHub qualifiers: review-requested:@me, team-review-requested:ORG/TEAM, author:, assignee:, mentions:, involves:, commenter:, reviewed-by:, repo:OWNER/NAME, org:, label:"x", is:draft, -is:draft, draft:false, updated:>=YYYY-MM-DD, sort:updated-desc, in:title, no:assignee.`,
-    `- The user's GitHub login is "${context.githubLogin || "unknown (use @me)"}"${gitstream !== null ? `; their ${gitstream.label} email is "${context.email || "unknown (use @me)"}"` : ""}. Prefer "@me".`,
+    `- The user's GitHub login is "${context.githubLogin || "unknown (use @me)"}"${delta !== null || gitstream !== null ? `; their ${[delta?.label, gitstream?.label].filter(Boolean).join(" / ")} email is "${context.email || "unknown (use @me)"}"` : ""}. Prefer "@me".`,
     `- Dates: today is ${new Date().toISOString().slice(0, 10)}. Prefer filter.updatedWithinDays over hard-coded dates.`,
     "- Do not invent repositories or teams the user did not name; if the request is broad, scope with @me.",
   ].filter(Boolean);
@@ -624,7 +628,7 @@ Lane shape (TypeScript):
   "title": string,                       // short, <= 60 chars
   "sources": (${sources.map((source) => `"${source}"`).join(" | ")})[],  // hosts to read; results are merged into one lane
   "query"?: string,                      // required if sources has ${delta !== null ? "github or delta: GitHub search syntax for /search/issues (shared by both)" : "github: GitHub search syntax for /search/issues"}${gitstream !== null ? `
-  "gitstream"?: {                        // used if sources has gitstream: server-side filters on ${gitstream.repo} pulls
+  "gitstream"?: {                        // only for explicit history lanes (sources has gitstream): server-side filters on ${gitstream.repo} pulls
     "reviewRequested"?: string, "author"?: string, "excludeAuthor"?: string, "assignee"?: string, "reviewedBy"?: string,
     "everyone"?: boolean,                // REQUIRED true when no principal is set, else it defaults to author=@me
     "labels"?: string[],                 // EXACT label names, PR must carry all
@@ -711,7 +715,7 @@ export function reviewPrompt(item: Item): string {
   const repo = oneLine(item.repo, 100);
   const cli =
     item.source === "gitstream"
-      ? "the `gs` CLI"
+      ? "the `gs` CLI, read-only (this is Gitstream history: it no longer accepts PR writes, so nothing can be posted there; if the work moved, look for the matching Delta PR)"
       : item.source === "delta"
         ? `the \`dt\` CLI (\`dt --host ${hosts().delta?.host ?? "<host>"} -R ${repo} pr view ${item.number}\`, \`pr diff\`, \`pr checks\`)`
         : "the `gh` CLI";

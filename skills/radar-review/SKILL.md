@@ -1,6 +1,6 @@
 ---
 name: radar-review
-description: How to review a pull request that was opened from the Radar panel (GitHub, Gitstream or Delta). Use in Radar review threads to gather the PR, review it, and report findings without acting on the PR.
+description: How to review a pull request that was opened from the Radar panel (GitHub, Delta, or read-only Gitstream history). Use in Radar review threads to gather the PR, review it, and report findings without acting on the PR.
 ---
 
 # Reviewing a PR from Radar
@@ -11,8 +11,8 @@ for its host:
 | Host | CLI |
 | --- | --- |
 | GitHub | `gh pr view N -R owner/repo`, `gh pr diff`, `gh pr checks`, `gh api .../comments` |
-| Gitstream | `gs` (load a Gitstream skill if one is installed and not already active) |
 | Delta | `dt --host <host> -R owner/repo pr view N`, `pr diff`, `pr checks` (the host is in the message) |
+| Gitstream history | `gs` reads only. Gitstream no longer accepts PR writes; if the work moved to Delta, find the matching Delta PR (`dt pr list --head <branch>`) and review that |
 
 ## Steps
 

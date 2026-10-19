@@ -105,7 +105,9 @@ describe("multi-source lanes", () => {
     expect(laneSchema.safeParse({ id: "a", title: "A", sources: [] }).success).toBe(false);
     expect(laneSchema.safeParse({ id: "a", title: "A", sources: ["github", "github"], query: "x" }).success).toBe(false);
     expect(laneSchema.safeParse({ id: "a", title: "A", sources: ["gitstream", "delta"] }).success).toBe(false);
-    expect(DEFAULT_LANES[0]!.sources).toEqual(["github", "gitstream", "delta"]);
+    // Delta is primary; read-only Gitstream history is never in a default lane.
+    expect(DEFAULT_LANES[0]!.sources).toEqual(["delta", "github"]);
+    expect(DEFAULT_LANES.some((lane) => lane.sources.includes("gitstream") || lane.gitstream !== undefined)).toBe(false);
     expect(deltaQuery("is:open is:pr author:@me archived:false")).toBe("is:open is:pr author:@me");
     const drafted = parseDraft(JSON.stringify({ title: "Mine", sources: ["github", "delta"], query: "is:pr author:@me", gitstream: { author: "@me" } }));
     expect(drafted.gitstream).toBeUndefined();

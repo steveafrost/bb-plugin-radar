@@ -7,7 +7,7 @@ describe("lane editor draft", () => {
     const lane: Lane = {
       id: "x",
       title: "Everything",
-      sources: ["github", "gitstream", "delta"],
+      sources: ["delta", "github", "gitstream"],
       query: "is:open is:pr",
       gitstream: {
         reviewRequested: "@me", author: "a@s.com", excludeAuthor: "bot", assignee: "b", reviewedBy: "c",

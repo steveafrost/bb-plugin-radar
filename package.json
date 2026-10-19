@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "type": "module",
   "private": true,
-  "description": "Live queues of the PRs and issues that need you on GitHub (plus optional Gitstream and Delta), with one-click review threads.",
+  "description": "Live queues of the PRs and issues that need you on GitHub and Delta (plus optional read-only Gitstream history), with one-click review threads.",
   "repository": {
     "type": "git",
     "url": "https://github.com/steveafrost/bb-plugin-radar.git"
@@ -19,7 +19,7 @@
   },
   "bb": {
     "name": "Radar",
-    "description": "A live panel of the pull requests and issues that need you, on GitHub, plus optional Gitstream and Delta repos. Describe what to track and an LLM turns it into a lane; start a review or triage thread from any row.",
+    "description": "A live panel of the pull requests and issues that need you, on GitHub and Delta, plus optional read-only Gitstream history. Describe what to track and an LLM turns it into a lane; start a review or triage thread from any row.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

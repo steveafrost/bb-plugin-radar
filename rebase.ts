@@ -1,22 +1,26 @@
 /**
- * Server-side "Rebase" for PRs you authored. Pure helpers (gating, argv, response
- * checks, error wording) so the server and the panel agree and tests can cover them.
+ * "Rebase" for PRs you authored. Pure helpers (gating, argv, response checks, error
+ * wording) so the server and the panel agree and tests can cover them.
  *
- * Per host, only first-class server-side rebases are used — never a local checkout:
- * - GitHub: GraphQL `updatePullRequestBranch(updateMethod: REBASE, expectedHeadOid)`.
- * - Gitstream: `POST repos/{o}/{r}/pulls/{n}/rebase` with `expected_head_sha`,
- *   Gitstream's clean-only "Rebase button" (refuses conflicts and merge commits with 422,
- *   returns `rebased: false` when already up to date).
- * - Delta: unsupported. walgit only offers `update-branch`, which merges the base into the
- *   head instead of rebasing, so the action is hidden there.
+ * Per host:
+ * - GitHub: GraphQL `updatePullRequestBranch(updateMethod: REBASE, expectedHeadOid)`, server-side.
+ * - Delta: walgit has no server-side rebase (`update-branch` merges the base in), so Radar
+ *   uses plain git against `origin` in a checkout set in settings, without touching its
+ *   worktree: fetch base and head into private `refs/radar/*` refs, `git replay` the PR's
+ *   commits onto the base (clean-only: conflicts and merge commits are refused), then push
+ *   with `--force-with-lease` pinned to the head Delta reported. Off until a checkout is set.
+ * - Gitstream: none. It is read-only history; its `pulls/{n}/rebase` write no longer works.
  */
 import { hosts } from "./hosts";
-import { SOURCE_LABEL, type Item, type Source } from "./lanes";
+import { SOURCE_LABEL, remoteRepo, type Item, type Source } from "./lanes";
 
-export const REBASE_SOURCES: ReadonlySet<Source> = new Set<Source>(["github", "gitstream"]);
+export const REBASE_SOURCES: ReadonlySet<Source> = new Set<Source>(["github", "delta"]);
 
-/** The signed-in identity per host, as items carry it in `author`. */
-export type Viewer = { github: string; gitstream: string };
+/**
+ * The signed-in identity per host, as items carry it in `author`. Empty means Rebase is
+ * not offered there (Delta stays empty until a rebase checkout is configured).
+ */
+export type Viewer = { github: string; delta: string };
 
 export type RebaseTarget = { source: Source; repo: string; number: number };
 export type RebaseResult = { status: "rebased" | "up-to-date"; message: string; headSha: string };
@@ -27,19 +31,21 @@ const OID = /^[0-9a-f]{40}$/i;
 const NODE_ID = /^[A-Za-z0-9_=-]{1,200}$/;
 
 const sameIdentity = (a: string, b: string) => a !== "" && a.toLowerCase() === b.toLowerCase();
+/** Delta items carry the email's local part (`first.last`); the principal is the full email. */
+const localPart = (value: string) => value.replace(/@[^@\s]+$/, "");
 
 /** Whether the row offers Rebase: an open PR, on a host that can rebase, that you wrote. */
 export function canRebase(item: Pick<Item, "source" | "kind" | "state" | "author">, viewer: Viewer): boolean {
   if (item.kind !== "pr" || !REBASE_SOURCES.has(item.source)) return false;
   const state = item.state.toLowerCase();
   if (state !== "open" && state !== "draft") return false;
-  const me = item.source === "github" ? viewer.github : viewer.gitstream;
-  return sameIdentity(item.author, me);
+  if (item.source === "github") return sameIdentity(item.author, viewer.github);
+  return sameIdentity(localPart(item.author), localPart(viewer.delta));
 }
 
 export function rebaseHelp(source: Source): string {
-  return source === "gitstream"
-    ? `Rebase this PR onto the latest base on ${SOURCE_LABEL.gitstream} (server-side, clean-only; conflicts are refused). Rewrites the remote branch.`
+  return source === "delta"
+    ? `Rebase this PR onto the latest base with git against ${SOURCE_LABEL.delta} (clean-only; conflicts and merge commits are refused). Force-pushes the branch.`
     : "Rebase this PR onto the latest base on GitHub (server-side). Rewrites the remote branch.";
 }
 
@@ -88,13 +94,89 @@ export function githubRebaseArgs(prId: string, headOid: string): string[] {
   if (!NODE_ID.test(prId)) throw new Error("Invalid pull request id.");
   return ["api", "graphql", "-f", `query=${GITHUB_REBASE_MUTATION}`, "-f", `id=${prId}`, "-f", `head=${assertOid(headOid)}`];
 }
-export function gitstreamPrArgs(repo: string, number: number): string[] {
+export function deltaMeArgs(host: string, repo: string): string[] {
   assertRepo(repo);
-  return ["api", `repos/${repo}/pulls/${assertNumber(number)}`];
+  return ["--host", host, "-R", repo, "api", "/api/v1/me"];
 }
-export function gitstreamRebaseArgs(repo: string, number: number, headSha: string): string[] {
+export function deltaPrArgs(host: string, repo: string, number: number): string[] {
   assertRepo(repo);
-  return ["api", "-X", "POST", `repos/${repo}/pulls/${assertNumber(number)}/rebase`, "-f", `expected_head_sha=${assertOid(headSha)}`];
+  return ["--host", host, "-R", repo, "api", `repos/${repo}/pulls/${assertNumber(number)}`];
+}
+
+/** Branch names Radar will put in a refspec: git-valid, no option or refspec syntax. */
+export function safeBranch(name: string): boolean {
+  return (
+    /^[A-Za-z0-9._\/-]{1,250}$/.test(name) &&
+    !name.startsWith("-") && !name.startsWith("/") && !name.endsWith("/") && !name.endsWith(".") && !name.endsWith(".lock") &&
+    !name.includes("..") && !name.includes("//") && !name.includes("/.") && !name.startsWith(".")
+  );
+}
+function assertBranch(name: string): string {
+  if (!safeBranch(name)) throw new Error("Invalid branch name.");
+  return name;
+}
+
+/** Private refs one Delta rebase works in; deleted afterwards. */
+export function radarRefs(number: number): { base: string; head: string } {
+  const prefix = `refs/radar/rebase/${assertNumber(number)}`;
+  return { base: `${prefix}/base`, head: `${prefix}/head` };
+}
+
+/** `git remote get-url origin`, which must be the Delta repo. */
+export function gitOriginArgs(): string[] {
+  return ["remote", "get-url", "origin"];
+}
+/** Whether a remote URL is `https://<host>/<repo>(.git)` (or an ssh form of it). */
+export function originMatches(url: string, host: string, repo: string): boolean {
+  const value = url.trim();
+  const remoteHost = value.match(/^[a-z+]+:\/\/(?:[^@/]+@)?([^/:]+)/i)?.[1] ?? value.match(/^[^@\s]+@([^:]+):/)?.[1] ?? "";
+  return remoteHost.toLowerCase() === host.toLowerCase() && remoteRepo(value) === repo.toLowerCase();
+}
+/**
+ * Fetch exactly the base and head branches into Radar's private refs. `--refmap=` keeps
+ * the fetch from also moving `origin/*` (which other tools in a shared checkout race on).
+ */
+export function gitFetchArgs(number: number, baseRef: string, headRef: string): string[] {
+  const refs = radarRefs(number);
+  return [
+    "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--refmap=", "origin",
+    `+refs/heads/${assertBranch(baseRef)}:${refs.base}`, `+refs/heads/${assertBranch(headRef)}:${refs.head}`,
+  ];
+}
+export function gitRevParseArgs(ref: string): string[] {
+  return ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`];
+}
+/** Exit 0 = the base is already in the head (nothing to do). */
+export function gitIsAncestorArgs(baseOid: string, headOid: string): string[] {
+  return ["merge-base", "--is-ancestor", assertOid(baseOid), assertOid(headOid)];
+}
+/** Merge commits the PR carries; replaying them is refused like Gitstream's clean-only button. */
+export function gitMergesArgs(baseOid: string, headOid: string): string[] {
+  return ["rev-list", "--merges", "--count", `${assertOid(baseOid)}..${assertOid(headOid)}`];
+}
+/** Replays the PR's commits onto the base in the object store only; prints the new head. */
+export function gitReplayArgs(number: number, baseOid: string, headOid: string): string[] {
+  return ["replay", "--ref-action=print", `--onto=${assertOid(baseOid)}`, `--ref=${radarRefs(number).head}`, `${assertOid(baseOid)}..${assertOid(headOid)}`];
+}
+/** `update <ref> <new> <old>` from `git replay --ref-action=print`. */
+export function replayedHead(stdout: string, number: number, previousHead: string): string | null {
+  const ref = radarRefs(number).head;
+  for (const line of stdout.split("\n")) {
+    const [verb, name, next, old] = line.trim().split(/\s+/);
+    if (verb === "update" && name === ref && next !== undefined && OID.test(next) && (old === undefined || old.toLowerCase() === previousHead.toLowerCase())) {
+      return next.toLowerCase();
+    }
+  }
+  return null;
+}
+/** Push the replayed head, leased to the head Delta reported, so a concurrent push is never clobbered. */
+export function gitPushArgs(headRef: string, newOid: string, expectedOid: string): string[] {
+  const branch = `refs/heads/${assertBranch(headRef)}`;
+  return ["push", "--porcelain", "--no-follow-tags", `--force-with-lease=${branch}:${assertOid(expectedOid)}`, "origin", `${assertOid(newOid)}:${branch}`];
+}
+export function gitDeleteRefArgs(ref: string): string[] {
+  if (!/^refs\/radar\/rebase\/\d+\/(base|head)$/.test(ref)) throw new Error("Invalid ref.");
+  return ["update-ref", "-d", ref];
 }
 
 // ---- server-side re-verification -----------------------------------------
@@ -117,30 +199,36 @@ export function verifyGithubPr(response: unknown): Verified<{ id: string; headOi
   return { ok: true, value: { id, headOid, baseOid } };
 }
 
-export function verifyGitstreamPr(response: unknown, me: string): Verified<{ headSha: string }> {
-  const pr = rec(response);
-  if (Object.keys(pr).length === 0) return { ok: false, reason: `${SOURCE_LABEL.gitstream} could not find that pull request.` };
-  if (!sameIdentity(text(rec(pr.user).login), me)) return { ok: false, reason: "Only your own pull requests can be rebased from Radar." };
-  if (pr.merged === true || text(pr.state).toLowerCase() !== "open") return { ok: false, reason: "That pull request is no longer open." };
-  const headSha = text(rec(pr.head).sha);
-  if (!OID.test(headSha)) return { ok: false, reason: `${SOURCE_LABEL.gitstream} returned an unexpected pull request.` };
-  return { ok: true, value: { headSha } };
+/** Delta's `/api/v1/me` → the principal (an email), or "". */
+export function deltaPrincipal(response: unknown): string {
+  const principal = text(rec(response).principal).trim();
+  return rec(response).anonymous === true || !/^[^\s@]+@[^\s@]+$/.test(principal) ? "" : principal;
 }
 
-/** Gitstream's `{ rebased, head_sha, base_sha }`. */
-export function gitstreamRebaseResult(response: unknown, previousHead: string): RebaseResult {
-  const body = rec(response);
-  const headSha = OID.test(text(body.head_sha)) ? text(body.head_sha) : previousHead;
-  return body.rebased === true
-    ? { status: "rebased", message: "Rebased onto the latest base.", headSha }
-    : { status: "up-to-date", message: "Already up to date.", headSha };
+/** Delta's GitHub-shaped pull: your own, open, same-repo branch, with sane refs and SHAs. */
+export function verifyDeltaPr(response: unknown, me: string, repo: string): Verified<{ headSha: string; baseSha: string; headRef: string; baseRef: string }> {
+  const pr = rec(response);
+  if (Object.keys(pr).length === 0) return { ok: false, reason: `${SOURCE_LABEL.delta} could not find that pull request.` };
+  if (!sameIdentity(text(rec(pr.user).login), me)) return { ok: false, reason: "Only your own pull requests can be rebased from Radar." };
+  if (pr.merged === true || text(pr.state).toLowerCase() !== "open") return { ok: false, reason: "That pull request is no longer open." };
+  const head = rec(pr.head);
+  const base = rec(pr.base);
+  const headRepo = text(rec(head.repo).full_name);
+  if (headRepo !== "" && headRepo.toLowerCase() !== repo.toLowerCase()) return { ok: false, reason: "Radar only rebases branches in the same repository." };
+  const headSha = text(head.sha);
+  const baseSha = text(base.sha);
+  const headRef = text(head.ref);
+  const baseRef = text(base.ref);
+  if (!OID.test(headSha) || !OID.test(baseSha)) return { ok: false, reason: `${SOURCE_LABEL.delta} returned an unexpected pull request.` };
+  if (!safeBranch(headRef) || !safeBranch(baseRef)) return { ok: false, reason: "That pull request's branch name can't be rebased from Radar." };
+  return { ok: true, value: { headSha: headSha.toLowerCase(), baseSha: baseSha.toLowerCase(), headRef, baseRef } };
 }
 
 // ---- errors ---------------------------------------------------------------
 
 export type RebaseFailure = { upToDate: true } | { upToDate: false; message: string };
 
-/** Turns gh/gs stdout+stderr from a failed rebase into one short, safe sentence. */
+/** Turns gh/git stdout+stderr from a failed rebase into one short, safe sentence. */
 export function classifyRebaseFailure(source: Source, output: string): RebaseFailure {
   const raw = output.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ");
   if (/no new commits|already up.to.date|is up to date with/i.test(raw)) return { upToDate: true };
@@ -148,7 +236,7 @@ export function classifyRebaseFailure(source: Source, output: string): RebaseFai
   if (/conflict|not clean|cannot be (rebased|updated) cleanly|merge commit/i.test(raw)) {
     return fail("Can't rebase cleanly (conflicts or merge commits). Rebase locally instead.");
   }
-  if (/expected head|head (sha|oid|ref)?.*(changed|moved|mismatch|does not match)|stale info|\b409\b/i.test(raw)) {
+  if (/expected head|head (sha|oid|ref)?.*(changed|moved|mismatch|does not match)|stale info|\b409\b|fetch first|non-fast-forward/i.test(raw)) {
     return fail("The branch changed since Radar last looked. Refresh and try again.");
   }
   if (/rebas\w* (is )?(not allowed|disabled|not enabled)/i.test(raw)) return fail("This repository doesn't allow rebasing pull requests.");
@@ -156,17 +244,16 @@ export function classifyRebaseFailure(source: Source, output: string): RebaseFai
   if (/not authorized|permission|forbidden|resource not accessible|must have (push|write) access|\b403\b/i.test(raw)) {
     return fail("You don't have permission to update this branch.");
   }
-  if (source === "gitstream" && /\b422\b/.test(raw)) return fail(`${SOURCE_LABEL.gitstream} refused the rebase as not clean. Rebase locally instead.`);
   const label = SOURCE_LABEL[source];
-  const first = raw.split("\n").map((line) => line.replace(/^(gh|gs):\s*/, "").trim()).find((line) => line !== "") ?? "rebase failed";
+  const first = raw.split("\n").map((line) => line.replace(/^(gh|git|fatal|error):\s*/, "").trim()).find((line) => line !== "") ?? "rebase failed";
   return fail(`${label}: ${first.slice(0, 180)}`);
 }
 
 // ---- CLI target -----------------------------------------------------------
 
 /**
- * `https://github.com/o/r/pull/7`, `<gitstream web>/repos/o/r/pulls/7`,
- * `https://<delta host>/o/r/pull/7`, or `o/r#7` (source left to the caller).
+ * `https://github.com/o/r/pull/7`, `https://<delta host>/o/r/pull/7`,
+ * `<gitstream web>/repos/o/r/pulls/7` (recognized so it can be refused), or `o/r#7`.
  */
 export function parseRebaseTarget(input: string): { source: Source | null; repo: string; number: number } | null {
   const value = input.trim();
