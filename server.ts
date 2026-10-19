@@ -138,6 +138,12 @@ const toolEnv = {
 };
 
 class UserError extends Error {}
+/** A tool run cancelled by plugin shutdown; callers handle it like any UserError, logging skips it. */
+class ToolAborted extends UserError {
+  constructor(label: string) {
+    super(`${label}: cancelled`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // RPC contract (types shared with app.tsx)
@@ -609,13 +615,17 @@ export default async function plugin(bb: BbPluginApi) {
       return stdout;
     } catch (error) {
       const failure = error as { code?: unknown; stderr?: unknown; killed?: unknown } | null;
+      // Shutdown aborts in-flight tools; that is a cancellation, not a tool failure.
+      if (failure?.code === "ABORT_ERR" || controller.signal.aborted) throw new ToolAborted(label);
       const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
       if (failure?.code === "ENOENT") throw new UserError(`${label}: "${bin}" is not on PATH. Set the path in Radar settings.`);
       if (failure?.killed === true || failure?.code === "ETIMEDOUT") throw new UserError(`${label} timed out.`);
       const kind = classifyToolError(stderr);
       if (kind === "rate-limit") throw new UserError(`${label}: rate limit hit; it will retry next cycle.`);
       if (kind === "auth") throw new UserError(`${label}: not authenticated (${stderr.trim().split("\n")[0]?.slice(0, 160)}).`);
-      const first = stderr.trim().split("\n").find((line) => line.trim() !== "") ?? "command failed";
+      const first =
+        stderr.trim().split("\n").find((line) => line.trim() !== "") ??
+        `command failed${typeof failure?.code === "number" ? ` (exit ${failure.code})` : ""}`;
       throw new UserError(`${label}: ${first.slice(0, 200)}`);
     }
   }
@@ -701,7 +711,9 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.info(`indexed ${labelIndex.names.length} labels from ${labelRepo()}${complete ? "" : ` (first ${pages} pages, merged with the previous index)`}`);
       }
     })()
-      .catch((error) => bb.log.warn(`label index failed: ${String(error)}`))
+      .catch((error) => {
+        if (!(error instanceof ToolAborted) && !disposed) bb.log.warn(`label index failed: ${String(error)}`);
+      })
       .finally(() => {
         labelIndexing = null;
       });
