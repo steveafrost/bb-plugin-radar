@@ -1311,12 +1311,12 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   margin-right: -4px;
   opacity: 1;
 }
-.radar-item__actions > * {
+.radar-item .radar-item__actions > * {
   opacity: 0;
   transition: opacity 120ms;
 }
 .radar-item:is(:hover, :focus-within) .radar-item__actions > *,
-.radar-item__actions[data-active] > * {
+.radar-item .radar-item__actions[data-active] > * {
   opacity: 1;
 }
 .radar-act {
