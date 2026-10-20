@@ -734,16 +734,6 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   display: flex;
   gap: 4px;
   align-self: center;
-  opacity: 0;
-  transition: opacity 120ms;
-}
-.radar-item:hover .radar-item__actions,
-.radar-item:focus-within .radar-item__actions {
-  opacity: 1;
-}
-.radar-item__actions:has(.radar-item__thread),
-.radar-item__actions[data-active] {
-  opacity: 1;
 }
 .radar-item__review,
 .radar-item__thread,
@@ -1314,11 +1304,20 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   margin-top: 8px;
 }
 
-/* Row actions match Pulse: muted icon buttons, always faintly visible, full on hover. */
+/* Row actions appear only while that row is hovered or focused; a rebase in progress
+   (confirm, busy, result) stays visible. */
 .radar-item__actions {
   gap: 2px;
   margin-right: -4px;
-  opacity: 0.55;
+  opacity: 1;
+}
+.radar-item__actions > * {
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.radar-item:is(:hover, :focus-within) .radar-item__actions > *,
+.radar-item__actions[data-active] > * {
+  opacity: 1;
 }
 .radar-act {
   all: unset;
