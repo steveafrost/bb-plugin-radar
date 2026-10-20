@@ -1414,11 +1414,18 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
-.radar-hidden__undo {
+/* Title bar: "Hidden · Undo" for a few seconds after a row is hidden. */
+.radar-header-anchor {
+  display: inline-flex;
+  margin-left: auto;
+}
+.radar.radar-header-undo {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  padding-left: 6px;
+  height: auto;
+  overflow: visible;
+  background: transparent;
   color: var(--r-faint);
   font-size: 12px;
   white-space: nowrap;

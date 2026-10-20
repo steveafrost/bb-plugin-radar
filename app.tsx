@@ -528,21 +528,45 @@ function ScopeGroup({ entry, onOp }: { entry: ScopeEntry; onOp: (op: ScopeOp, ke
 }
 
 // ---------------------------------------------------------------------------
+// The just-hidden item's Undo lives in the title bar (navPanel headerContent), a separate
+// component from the board, so the board publishes it through this small store.
+
+type UndoNotice = { key: string; title: string; undo: () => void };
+const undoNotice = (() => {
+  let current: UndoNotice | null = null;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => current,
+    set: (next: UndoNotice | null) => { current = next; listeners.forEach((listener) => listener()); },
+    subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+  };
+})();
+
+function RadarHeader() {
+  const notice = useSyncExternalStore(undoNotice.subscribe, undoNotice.get, undoNotice.get);
+  return (
+    <span className="radar-header-anchor">
+      {notice !== null ? (
+        <span className="radar radar-header-undo" role="status">
+          <span className="radar-header-undo__text" title={notice.title}>Hidden</span>
+          <button type="button" className="radar-scope__action" onClick={notice.undo}>Undo</button>
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Items hidden one by one (row "Hide from Radar"); separate from Focus, which hides repos/areas.
 
 function HiddenControl({
   count,
-  undo,
   load,
   onUnhide,
-  onUndo,
 }: {
   count: number;
-  /** The item just hidden, for a few seconds. */
-  undo: { key: string; title: string } | null;
   load: () => Promise<HiddenEntry[] | null>;
   onUnhide: (key: string | "all") => Promise<void>;
-  onUndo: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [entries, setEntries] = useState<HiddenEntry[] | null>(null);
@@ -570,8 +594,8 @@ function HiddenControl({
       window.removeEventListener("mousedown", onDown);
     };
   }, [open]);
-  useEffect(() => { if (count === 0 && undo === null) setOpen(false); }, [count, undo]);
-  if (count === 0 && undo === null && !open) return null;
+  useEffect(() => { if (count === 0) setOpen(false); }, [count]);
+  if (count === 0 && !open) return null;
   const unhide = (key: string | "all") => {
     setEntries((list) => (list === null ? list : key === "all" ? [] : list.filter((entry) => entry.key !== key)));
     void onUnhide(key);
@@ -579,12 +603,6 @@ function HiddenControl({
   const tip = `${count} item${count === 1 ? "" : "s"} hidden from Radar`;
   return (
     <div className="radar-scope radar-hidden">
-      {undo !== null ? (
-        <span className="radar-hidden__undo" role="status">
-          <span className="radar-hidden__undo-text" title={undo.title}>Hidden</span>
-          <button type="button" className="radar-scope__action" onClick={onUndo}>Undo</button>
-        </span>
-      ) : null}
       {count > 0 ? (
         <button
           type="button"
@@ -1240,6 +1258,16 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
     },
     [mutate, rpc],
   );
+  useEffect(() => {
+    undoNotice.set(undo === null ? null : {
+      ...undo,
+      undo: () => {
+        setUndo(null);
+        void unhide(undo.key);
+      },
+    });
+  }, [undo, unhide]);
+  useEffect(() => () => undoNotice.set(null), []);
   const loadHidden = useCallback(() => call(rpc.call("radar_hidden_items", null) as Promise<HiddenEntry[]>), [call, rpc]);
   const reviewActions = useMemo(
     () => ({
@@ -1341,17 +1369,6 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               onSet={(enabled) => void mutate(rpc.call("radar_focus_set", { enabled }))}
               onDescribe={async (description) => (await mutate(rpc.call("radar_focus_describe", { description }))) !== null}
             />
-            <HiddenControl
-              count={snapshot?.hiddenCount ?? 0}
-              undo={undo}
-              load={loadHidden}
-              onUnhide={unhide}
-              onUndo={() => {
-                if (undo === null) return;
-                setUndo(null);
-                void unhide(undo.key);
-              }}
-            />
             <span className="radar-toolbar-sep" aria-hidden="true" />
             <button
               type="button"
@@ -1367,6 +1384,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               </svg>
             </button>
             <span className="radar-toolbar-sep" aria-hidden="true" />
+            <HiddenControl count={snapshot?.hiddenCount ?? 0} load={loadHidden} onUnhide={unhide} />
             <button
               type="button"
               className="radar-icon-btn"
@@ -1543,7 +1561,7 @@ function AiSettings() {
 export default definePluginApp((app) => {
   app.slots.settingsSection({ id: "ai-focus", title: "AI & focus", component: AiSettings });
   app.slots.navPanel({
-    headerContent: () => <span className="radar-header-anchor" aria-hidden="true" />,
+    headerContent: RadarHeader,
     id: "board",
     title: "Radar",
     icon: "Radar",

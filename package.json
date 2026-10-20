@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-radar",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "private": true,
   "description": "Live queues of the PRs and issues that need you on GitHub and Delta (plus optional read-only Gitstream history), with one-click review threads.",
