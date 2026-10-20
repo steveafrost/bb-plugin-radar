@@ -24,7 +24,10 @@ bb radar defaults                          # add any missing default lanes, keep
 bb radar focus "<what helps you focus>"    # e.g. "no billing stuff": AI picks repos/areas to hide or show; Focus on
 bb radar focus <repo|area>…                # show only these (exact names / unique tails like billing, mobile)
 bb radar focus --add <repo|area>…          # add to the focus
-bb radar hide <repo|area>… / show <…>      # hide or unhide everywhere (lanes, every view, badge)
+bb radar hide <repo|area>… / show <…>      # hide or unhide whole repos/areas everywhere (Focus; lanes, every view, badge)
+bb radar hide-item <url|key>               # hide ONE PR/issue everywhere until unhidden (key: github:owner/repo#12; owner/repo#12 if unique)
+bb radar unhide-item <url|key> | --all     # bring one (or every) hidden item back
+bb radar hidden [--json]                   # items hidden one by one, newest first
 bb radar focus --off | --on                # Focus off = normal board (focus is kept); --on resumes it
 bb radar scopes [--json]                   # repos + area-repo areas in results, counts, focus state
 bb radar list --all                        # ignore the focus filter
@@ -35,6 +38,8 @@ bb radar rebase <PR url|owner/repo#n> --yes  # rebase YOUR open PR (GitHub serve
 ## Focus
 
 Scope keys: repos are `owner/name`; areas of the `areaRepo` setting (a monorepo) are `//<path>` keys from its `//...` labels, cut to three segments; `//no-area` is that repo with no area label. Focus = show only those; hidden = drop those (a PR touching several areas stays while any of its areas is shown). It applies to every lane, every view, the rail badge and `status`/`list`; hidden items are never counted new or marked seen. `bb radar status` prints the focus line and per-lane hidden counts.
+
+Hidden items (`hide-item`) are separate from Focus: one PR or issue, by key, gone from every lane, view, the badge, `status` and `list` (even `list --all`), never marked seen. A hide lasts until `unhide-item`; an entry whose item has been in no lane for 30 days is pruned. Only hide or unhide when the user asks.
 
 `add` sends the description through BB’s configured-provider text completion API, validates the drafted lane,
 runs it once, and prints how many items match. Use `--dry-run` to preview first.

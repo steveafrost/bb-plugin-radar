@@ -63,6 +63,22 @@ import {
 } from "./lanes";
 import { enabledSources } from "./lanes";
 import { hosts, hostsSchema, readHosts, setHosts } from "./hosts";
+import {
+  addHidden,
+  entryFor,
+  hiddenEntrySchema,
+  hiddenSet,
+  HIDDEN_STALE_DAYS,
+  KEY_PATTERN,
+  normKey,
+  parseHidden,
+  parseItemRef,
+  reconcileHidden,
+  removeHidden,
+  resolveItemKey,
+  withoutHidden,
+  type HiddenEntry,
+} from "./hidden";
 import { actionFor, DEFAULT_SKILL_SETTINGS, hostSkillFor, selectedSkills, withSkillMention } from "./review-skills";
 import {
   applyScopeOp,
@@ -205,13 +221,15 @@ const snapshotSchema = z.object({
   /** Configured Delta / Gitstream-history hosts and area repo; the panel mirrors them. */
   hosts: hostsSchema,
   skills: z.object({ reviewSkill: z.string(), gitstreamReviewSkill: z.string(), triageSkill: z.string() }),
+  /** Items hidden one by one (radar_hidden_items lists them); already removed from `results`. */
+  hiddenCount: z.number(),
 });
 
 export type RadarItem = z.infer<typeof itemSchema>;
 export type ReviewContext = { title: string; prompt: string; defaultProjectId: string | null };
 export type LaneResult = z.infer<typeof laneResultSchema>;
 export type RadarSnapshot = Omit<z.infer<typeof snapshotSchema>, "lanes"> & { lanes: Lane[] };
-export type { FocusState, Lane, RebaseResult, ScopeEntry, ScopeFilter };
+export type { FocusState, HiddenEntry, Lane, RebaseResult, ScopeEntry, ScopeFilter };
 
 export const rpcContract = defineRpcContract({
   radar_snapshot: { input: z.null(), output: z.any() },
@@ -223,6 +241,18 @@ export const rpcContract = defineRpcContract({
   radar_lanes_reorder: { input: z.object({ ids: z.array(z.string()) }), output: z.any() },
   radar_lanes_reset: { input: z.null(), output: z.any() },
   radar_acknowledge: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
+  /** Hides one item (by key) from every lane, view, count and the badge, until unhidden. */
+  radar_hide_item: { input: z.object({ key: z.string().max(260).regex(KEY_PATTERN) }), output: z.any() },
+  /** Unhides one item, or every hidden item with `all: true`. */
+  radar_unhide_item: {
+    input: z.union([
+      z.object({ key: z.string().max(260).regex(KEY_PATTERN) }).strict(),
+      z.object({ all: z.literal(true) }).strict(),
+    ]),
+    output: z.any(),
+  },
+  /** Hidden items, newest first, for the restore list. */
+  radar_hidden_items: { input: z.null(), output: z.array(hiddenEntrySchema) },
   radar_mark_seen: {
     /** `view` limits it to what that view shows; `kind` is the pre-category form (pr = prs, issue = issues). */
     input: z.object({ laneId: z.string().optional(), view: z.enum(CATEGORIES).optional(), kind: z.enum(["pr", "issue"]).optional() }),
@@ -529,7 +559,45 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(db, [
     "CREATE TABLE label_index (name TEXT PRIMARY KEY) WITHOUT ROWID",
     "CREATE TABLE label_index_meta (id INTEGER PRIMARY KEY CHECK (id = 1), indexed_at TEXT NOT NULL)",
+    // Per-item hides: id = lowercased item key, entry = the validated HiddenEntry as JSON.
+    "CREATE TABLE hidden_items (id TEXT PRIMARY KEY, entry TEXT NOT NULL) WITHOUT ROWID",
   ]);
+  const putHiddenRows = db.transaction((entries: HiddenEntry[]) => {
+    const upsert = db.prepare("INSERT INTO hidden_items (id, entry) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET entry = excluded.entry");
+    for (const entry of entries) upsert.run(normKey(entry.key), JSON.stringify(entry));
+  });
+  const deleteHiddenRows = db.transaction((entries: HiddenEntry[]) => {
+    const remove = db.prepare("DELETE FROM hidden_items WHERE id = ?");
+    for (const entry of entries) remove.run(normKey(entry.key));
+  });
+  const replaceHiddenRows = db.transaction((entries: HiddenEntry[]) => {
+    db.prepare("DELETE FROM hidden_items").run();
+    putHiddenRows(entries);
+  });
+  /** Bad or duplicate rows are dropped (and the table rewritten) rather than failing the load. */
+  function loadHidden(): HiddenEntry[] {
+    const rows = db.prepare("SELECT entry FROM hidden_items").all() as { entry: unknown }[];
+    const values = rows.map((row) => {
+      try {
+        return typeof row.entry === "string" ? (JSON.parse(row.entry) as unknown) : null;
+      } catch {
+        return null;
+      }
+    });
+    const { entries, dropped } = parseHidden(values);
+    if (dropped > 0) {
+      bb.log.warn(`dropped ${dropped} invalid or excess hidden item row(s)`);
+      replaceHiddenRows(entries);
+    }
+    return entries;
+  }
+  let hiddenItems: HiddenEntry[] = loadHidden();
+  let hiddenKeys = hiddenSet(hiddenItems);
+  const isHidden = (item: { key: string }) => hiddenKeys.has(normKey(item.key));
+  function setHidden(next: HiddenEntry[]) {
+    hiddenItems = next;
+    hiddenKeys = hiddenSet(next);
+  }
   function loadLabelIndex(): LabelIndex | null {
     const meta = db.prepare("SELECT indexed_at FROM label_index_meta WHERE id = 1").get() as { indexed_at: string } | undefined;
     if (meta === undefined) return null;
@@ -568,7 +636,7 @@ export default async function plugin(bb: BbPluginApi) {
   function snapshot(): RadarSnapshot {
     return {
       lanes,
-      results: Object.fromEntries(Object.entries(results).map(([id, result]) => {
+      results: withoutHidden(Object.fromEntries(Object.entries(results).map(([id, result]) => {
         const lane = lanes.find(l => l.id === id);
         if (!lane || !isMentionLane(lane)) return [id, result];
         return [id, { ...result,
@@ -576,7 +644,7 @@ export default async function plugin(bb: BbPluginApi) {
           items: result.items.filter(item => item.source !== "github" || mentions.metadata(item.key).generation === 0 || mentions.metadata(item.key).canAck)
             .map(item => ({ ...item, canAcknowledge: item.source === "github" && mentions.metadata(item.key).canAck })),
         }];
-      })),
+      })), hiddenKeys),
       fetchedAt,
       refreshing,
       githubLogin,
@@ -589,6 +657,7 @@ export default async function plugin(bb: BbPluginApi) {
       maxAgeDays: config.maxAgeDays,
       hosts: hosts(),
       skills: { reviewSkill: config.reviewSkill, gitstreamReviewSkill: config.gitstreamReviewSkill, triageSkill: config.triageSkill },
+      hiddenCount: hiddenItems.length,
     };
   }
 
@@ -870,6 +939,7 @@ export default async function plugin(bb: BbPluginApi) {
         await pool([...lanes], refreshLane);
         await syncMentions();
         fetchedAt = new Date().toISOString();
+        reconcileHiddenItems();
         // Drop results and seen sets for lanes that no longer exist.
         const ids = new Set(lanes.map((lane) => lane.id));
         for (const id of Object.keys(results)) if (!ids.has(id)) delete results[id];
@@ -1016,8 +1086,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (laneId === undefined && !laneInView(lane, view)) continue;
       const result = results[lane.id];
       if (result === undefined) continue;
-      // Hidden items stay new so they surface when the focus filter changes.
-      const hit = (item: RadarItem) => itemInView(item, view) && visible(item);
+      // Focus-hidden and hidden items stay new so they surface when the filter changes or they're unhidden.
+      const hit = (item: RadarItem) => itemInView(item, view) && visible(item) && !isHidden(item);
       // Non-new items are already seen, so this keeps the other view's new items new.
       seen[lane.id] = result.items.filter((item) => !item.isNew || hit(item)).map((item) => item.key);
       result.items = result.items.map((item) => (hit(item) ? { ...item, isNew: false } : item));
@@ -1033,6 +1103,59 @@ export default async function plugin(bb: BbPluginApi) {
       if (item !== undefined) return item;
     }
     return undefined;
+  }
+
+  /** Bumps lastSeenAt for hidden items still on the board; prunes ones gone 30+ days. */
+  function reconcileHiddenItems(): void {
+    if (hiddenItems.length === 0) return;
+    const canPrune = lanes.some((lane) => {
+      const result = results[lane.id];
+      return result !== undefined && result.error === "" && result.fetchedAt !== "";
+    });
+    const { entries, touched, pruned } = reconcileHidden(hiddenItems, allItems(), new Date(), canPrune);
+    if (touched.length === 0 && pruned.length === 0) return;
+    try {
+      putHiddenRows(touched);
+      deleteHiddenRows(pruned);
+      setHidden(entries);
+      if (pruned.length > 0) bb.log.info(`unhid ${pruned.length} item(s) not seen in any lane for ${HIDDEN_STALE_DAYS} days`);
+    } catch (error) {
+      bb.log.warn(`hidden items write failed: ${String(error)}`);
+    }
+  }
+
+  async function hideItem(key: string): Promise<RadarSnapshot> {
+    const item = allItems().find((candidate) => normKey(candidate.key) === normKey(key));
+    if (item === undefined) {
+      if (hiddenKeys.has(normKey(key))) return snapshot();
+      throw new UserError("That item is no longer in any lane; refresh and try again.");
+    }
+    const entry = entryFor(item, new Date());
+    if (entry === null) throw new UserError("That item can't be hidden (unexpected key or data).");
+    const { entries, evicted } = addHidden(hiddenItems, entry);
+    putHiddenRows([entry]);
+    deleteHiddenRows(evicted);
+    setHidden(entries);
+    publish();
+    return snapshot();
+  }
+
+  async function unhideItems(keys: string[] | "all"): Promise<{ snapshot: RadarSnapshot; removed: HiddenEntry[] }> {
+    const { entries, removed } = removeHidden(hiddenItems, keys);
+    if (keys === "all") replaceHiddenRows([]);
+    else deleteHiddenRows(removed);
+    setHidden(entries);
+    publish();
+    return { snapshot: snapshot(), removed };
+  }
+
+  /** CLI <url|key|owner/repo#n> → a key on the board or in the hidden list. */
+  function cliItemKey(input: string, among: { key: string; source: Source; repo: string; number: number }[]): string {
+    const ref = parseItemRef(input);
+    if (ref === null) throw new UserError(`"${input.slice(0, 120)}" is not a PR/issue URL, a Radar key (github:owner/repo#12) or owner/repo#12.`);
+    const key = resolveItemKey(ref, among);
+    if (typeof key !== "string") throw new UserError(key.error);
+    return key;
   }
 
   /** Unique new items across lanes (an item can sit in several lanes), focus filter applied. */
@@ -1457,6 +1580,9 @@ export default async function plugin(bb: BbPluginApi) {
       void syncMentions().catch(error => bb.log.warn(`mention sync failed: ${String(error)}`));
       return snapshot();
     },
+    radar_hide_item: ({ key }) => hideItem(key),
+    radar_unhide_item: async (input) => (await unhideItems("all" in input ? "all" : [input.key])).snapshot,
+    radar_hidden_items: () => hiddenItems,
     radar_mark_seen: ({ laneId, view, kind }) => markSeen(laneId, view ?? (kind === "pr" ? "prs" : kind === "issue" ? "issues" : "all")),
     radar_draft: ({ description }) => draftLane(description),
     radar_scope: ({ op, keys }) => editScope(op, keys),
@@ -1528,10 +1654,15 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb radar focus --off | --on               turn Focus off (back to normal) / resume the last one",
     "  bb radar hide <repo|area>…                hide from every lane, view and the badge",
     "  bb radar show <repo|area>…                undo hide (adds to the focus while one is set)",
+    "  bb radar hide-item <url|key>              hide one PR or issue everywhere until unhidden",
+    "  bb radar unhide-item <url|key> | --all    bring hidden items back",
+    "  bb radar hidden [--json]                  list items hidden one by one",
     "  bb radar rebase <url|owner/repo#n> --yes  rebase your own open PR (GitHub server-side; Delta via git)",
     "",
     "Repos are owner/name (or a unique tail, e.g. billing); areas of the area repo (a setting)",
     "are //<path> label keys (or a unique tail, e.g. mobile); no-area is that repo without an area label.",
+    "hide/show work on whole repos/areas (Focus); hide-item/unhide-item on single items. An item hide",
+    `lasts until undone; one whose item has been in no lane for ${HIDDEN_STALE_DAYS} days is dropped.`,
   ].join("\n");
 
   function describeLane(lane: Lane): string {
@@ -1560,6 +1691,9 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "focus", summary: "Focus mode: describe it, or name repos/areas; --off / --on", usage: "bb radar focus <description…> | <repo|area>… | --add <…> | --off | --on" },
       { name: "hide", summary: "Hide repos/areas everywhere", usage: "bb radar hide <repo|area>…" },
       { name: "show", summary: "Unhide repos/areas", usage: "bb radar show <repo|area>…" },
+      { name: "hide-item", summary: "Hide one PR or issue everywhere", usage: "bb radar hide-item <url|key|owner/repo#n>" },
+      { name: "unhide-item", summary: "Unhide one item, or all", usage: "bb radar unhide-item <url|key|owner/repo#n> | --all" },
+      { name: "hidden", summary: "List items hidden one by one", usage: "bb radar hidden [--json]" },
       {
         name: "rebase",
         summary: "Rebase your own open PR onto its base (GitHub server-side, Delta via git replay + leased push; needs --yes)",
@@ -1581,28 +1715,30 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: `Refreshed ${lanes.length} lanes.` };
           case "status": {
             if (fetchedAt === "") await refreshAll();
-            const hiddenKeys = new Set(allItems().filter((item) => !visible(item)).map((item) => item.key));
+            const focusHidden = new Set(allItems().filter((item) => !visible(item) && !isHidden(item)).map((item) => item.key));
             if (json) {
               return {
                 exitCode: 0,
-                stdout: JSON.stringify({ ...snapshot(), scopeSummary: { active: isActive(scope), hiddenItems: hiddenKeys.size, newCount: newCount() } }),
+                stdout: JSON.stringify({ ...snapshot(), scopeSummary: { active: isActive(scope), hiddenItems: focusHidden.size, newCount: newCount() } }),
               };
             }
             const lines = lanes.map((lane) => {
               const result = results[lane.id];
-              const shown = result?.items.filter(visible) ?? [];
-              const hidden = (result?.items.length ?? 0) - shown.length;
+              const mine = result?.items.filter((item) => !isHidden(item)) ?? [];
+              const shown = mine.filter(visible);
+              const hidden = mine.length - shown.length;
               const fresh = shown.filter((item) => item.isNew).length;
               const notes = [fresh > 0 ? `${fresh} new` : "", hidden > 0 ? `${hidden} hidden` : ""].filter(Boolean).join(", ");
               const tail = result?.error ? `  ERROR: ${result.error}` : notes ? `  (${notes})` : "";
               return `${String(shown.length).padStart(3)}  ${lane.title} [${lane.id}]${tail}`;
             });
             const filterLine = isActive(scope)
-              ? `focus: ON ${focusState.description ? `“${focusState.description}” → ` : ""}${describeScope(scope)} (${hiddenKeys.size} item${hiddenKeys.size === 1 ? "" : "s"} hidden; bb radar focus --off to turn off)`
+              ? `focus: ON ${focusState.description ? `“${focusState.description}” → ` : ""}${describeScope(scope)} (${focusHidden.size} item${focusHidden.size === 1 ? "" : "s"} hidden; bb radar focus --off to turn off)`
               : isActive(focusState)
                 ? `focus: off (last: ${focusState.summary || describeScope(focusState)}; bb radar focus --on to resume)`
                 : "focus: off";
-            return { exitCode: 0, stdout: [`fetched ${fetchedAt || "(never)"}`, filterLine, ...lines].join("\n") };
+            const hiddenLine = hiddenItems.length > 0 ? [`hidden items: ${hiddenItems.length} (bb radar hidden)`] : [];
+            return { exitCode: 0, stdout: [`fetched ${fetchedAt || "(never)"}`, filterLine, ...hiddenLine, ...lines].join("\n") };
           }
           case "list": {
             if (fetchedAt === "") await refreshAll();
@@ -1620,7 +1756,7 @@ export default async function plugin(bb: BbPluginApi) {
               .filter((lane) => (laneId === undefined || lane.id === laneId) && laneInView(lane, view))
               .flatMap((lane) =>
                 (results[lane.id]?.items ?? [])
-                  .filter((item) => itemInView(item, view) && (!onlyNew || item.isNew) && (everything || visible(item)))
+                  .filter((item) => !isHidden(item) && itemInView(item, view) && (!onlyNew || item.isNew) && (everything || visible(item)))
                   .map((item) => ({ lane: lane.id, ...item })),
               );
             if (json) return { exitCode: 0, stdout: JSON.stringify(rows) };
@@ -1735,6 +1871,41 @@ export default async function plugin(bb: BbPluginApi) {
                 : isActive(scope)
                   ? `Focus on: ${describeScope(scope)} (${hidden} hidden)`
                   : "Focus off: showing everything.",
+            };
+          }
+          case "hide-item": {
+            if (rest.length !== 1) return { exitCode: 1, stderr: "Usage: bb radar hide-item <url|key|owner/repo#n>" };
+            if (fetchedAt === "") await refreshAll();
+            const key = cliItemKey(rest[0]!, allItems());
+            const already = hiddenKeys.has(normKey(key));
+            await hideItem(key);
+            const entry = hiddenItems.find((candidate) => normKey(candidate.key) === normKey(key));
+            return {
+              exitCode: 0,
+              stdout: json ? JSON.stringify(entry ?? null) : `${already ? "Already hidden" : "Hidden"}: ${key}${entry?.title ? `  ${entry.title.slice(0, 80)}` : ""}`,
+            };
+          }
+          case "unhide-item": {
+            const all = rest.includes("--all");
+            const positional = rest.filter((arg) => arg !== "--all");
+            if (all === (positional.length > 0) || positional.length > 1) {
+              return { exitCode: 1, stderr: "Usage: bb radar unhide-item <url|key|owner/repo#n> | --all" };
+            }
+            const { removed } = all ? await unhideItems("all") : await unhideItems([cliItemKey(positional[0]!, hiddenItems)]);
+            if (!all && removed.length === 0) return { exitCode: 1, stderr: `${positional[0]} is not hidden. Run bb radar hidden.` };
+            return {
+              exitCode: 0,
+              stdout: json ? JSON.stringify(removed) : all ? `Unhid ${removed.length} item${removed.length === 1 ? "" : "s"}.` : `Unhid ${removed[0]!.key}.`,
+            };
+          }
+          case "hidden": {
+            if (json) return { exitCode: 0, stdout: JSON.stringify(hiddenItems) };
+            if (hiddenItems.length === 0) return { exitCode: 0, stdout: "No hidden items." };
+            return {
+              exitCode: 0,
+              stdout: hiddenItems
+                .map((entry) => `${entry.hiddenAt.slice(0, 10)}  ${entry.key.padEnd(40)} ${entry.title.slice(0, 70)}  ${entry.url}`)
+                .join("\n"),
             };
           }
           case "rebase": {

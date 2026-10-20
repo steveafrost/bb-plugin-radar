@@ -12,6 +12,10 @@ A lane is a saved query that can hit several hosts at once. The defaults cover r
 
 Hide repos across every lane ("no billing", "only the mobile app"). Type it in words or toggle scopes by hand. Point `areaRepo` at a monorepo and its `//path` labels become areas you can hide or focus too.
 
+## Hide one item
+
+The eye-off action on any row hides that one PR or issue from every lane, view, count and the rail badge, with a brief Undo. The muted eye-off count in the toolbar lists hidden items to unhide one by one or all at once. A hide lasts until you undo it; one whose item has been in no lane for 30 days is dropped. Hides live in Radar's plugin database on your bb host.
+
 ## Review and triage threads
 
 Every row can start a bb thread through bb's own new-thread composer, with the project picked from the repo. Threads land in a **Reviews** thread section and the row links to them until archived.
@@ -25,7 +29,7 @@ Radar threads get skills attached:
 
 ## CLI and agent skill
 
-`bb radar` lists lanes and items, adds or edits lanes, and sets focus, so agents can answer "what needs my review?" through the bundled `radar` skill.
+`bb radar` lists lanes and items, adds or edits lanes, sets focus and hides single items, so agents can answer "what needs my review?" through the bundled `radar` skill.
 
 ## Requirements
 

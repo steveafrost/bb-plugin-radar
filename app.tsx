@@ -9,7 +9,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { DraftResult, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract } from "./server";
+import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract } from "./server";
 import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { mountRailBadge } from "./badge";
 import type { AiOverride } from "./ai";
@@ -147,6 +147,7 @@ const ReviewActions = createContext<{
   threadFor: (key: string) => string | undefined;
   review: (item: RadarItem) => void;
   acknowledge: (item: RadarItem) => void;
+  hide: (item: RadarItem) => void;
   open: (threadId: string) => void;
   viewer: Viewer;
   rebase: (item: RadarItem) => Promise<RebaseResult>;
@@ -249,6 +250,7 @@ function ItemRow({ item }: { item: RadarItem }) {
       </div>
       {actions !== null ? (
         <span className="radar-item__actions" data-active={rebaseActive || undefined}>
+          <ActionIcon icon="eyeOff" label="Hide from Radar" tip="Hide from Radar" onClick={() => actions.hide(item)} />
           {item.canAcknowledge ? <button type="button" className="radar-act radar-act--acknowledge" title="Clear this mention and mark its GitHub notification read" onClick={() => actions.acknowledge(item)}>Acknowledge</button> : null}
           {showRebase ? <RebaseAction item={item} rebase={actions.rebase} onActive={setRebaseActive} /> : null}
           {threadId !== undefined ? (
@@ -483,7 +485,7 @@ function FocusControl({
                 <div className="radar-scope__current">
                   <Glyph name="zen" className="radar-icon" />
                   <span className="radar-scope__current-text">{state?.summary || describeScope(state!)}</span>
-                  {hidden > 0 ? <span className="radar-scope__muted">{hidden} hidden</span> : null}
+                  {hidden > 0 ? <span className="radar-scope__muted" title="Items this focus leaves out">{hidden} filtered out</span> : null}
                   <button type="button" className="radar-scope__action" onClick={() => onSet(false)}>
                     Turn off
                   </button>
@@ -522,6 +524,114 @@ function ScopeGroup({ entry, onOp }: { entry: ScopeEntry; onOp: (op: ScopeOp, ke
         <ScopeRow key={child.key} entry={child} child onOp={onOp} />
       ))}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Items hidden one by one (row "Hide from Radar"); separate from Focus, which hides repos/areas.
+
+function HiddenControl({
+  count,
+  undo,
+  load,
+  onUnhide,
+  onUndo,
+}: {
+  count: number;
+  /** The item just hidden, for a few seconds. */
+  undo: { key: string; title: string } | null;
+  load: () => Promise<HiddenEntry[] | null>;
+  onUnhide: (key: string | "all") => Promise<void>;
+  onUndo: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState<HiddenEntry[] | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    void load().then((list) => { if (active && list !== null) setEntries(list); });
+    return () => { active = false; };
+  }, [open, count, load]);
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      close();
+      document.querySelector<HTMLButtonElement>(".radar-hidden__trigger")?.focus();
+    };
+    const onDown = (event: MouseEvent) => {
+      if (!(event.target as Element | null)?.closest?.(".radar-hidden")) close();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+  useEffect(() => { if (count === 0 && undo === null) setOpen(false); }, [count, undo]);
+  if (count === 0 && undo === null && !open) return null;
+  const unhide = (key: string | "all") => {
+    setEntries((list) => (list === null ? list : key === "all" ? [] : list.filter((entry) => entry.key !== key)));
+    void onUnhide(key);
+  };
+  const tip = `${count} item${count === 1 ? "" : "s"} hidden from Radar`;
+  return (
+    <div className="radar-scope radar-hidden">
+      {undo !== null ? (
+        <span className="radar-hidden__undo" role="status">
+          <span className="radar-hidden__undo-text" title={undo.title}>Hidden</span>
+          <button type="button" className="radar-scope__action" onClick={onUndo}>Undo</button>
+        </span>
+      ) : null}
+      {count > 0 ? (
+        <button
+          type="button"
+          className="radar-icon-btn radar-hidden__trigger"
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          aria-label={tip}
+          title={tip}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <Glyph name="eyeOff" className="radar-icon" />
+          <span className="radar-hidden__count">{count}</span>
+        </button>
+      ) : null}
+      {open ? (
+        <div className="radar-scope__pop radar-hidden__pop" role="dialog" aria-label="Hidden items">
+          <div className="radar-scope__label radar-hidden__head">
+            <span>Hidden from Radar</span>
+            {(entries?.length ?? 0) > 1 ? (
+              <button type="button" className="radar-scope__action" onClick={() => unhide("all")}>Unhide all</button>
+            ) : null}
+          </div>
+          {entries === null ? <p className="radar-scope__empty">Loading…</p> : null}
+          {entries !== null && entries.length === 0 ? <p className="radar-scope__empty">Nothing hidden.</p> : null}
+          <ul className="radar-scope__list">
+            {(entries ?? []).map((entry) => (
+              <li key={entry.key} className="radar-hidden__row">
+                <Glyph name={entry.kind === "pr" ? "pr" : "issue"} className="radar-icon radar-hidden__kind" />
+                <span className="radar-hidden__main">
+                  {entry.url !== "" ? (
+                    <UrlLink className="radar-hidden__title" href={entry.url}>{entry.title || `#${entry.number}`}</UrlLink>
+                  ) : (
+                    <span className="radar-hidden__title">{entry.title || `#${entry.number}`}</span>
+                  )}
+                  <span className="radar-hidden__meta radar-mono" title={`Hidden ${entry.hiddenAt.slice(0, 10)}`}>
+                    {entry.repo}#{entry.number}{entry.source !== "github" ? ` · ${SOURCE_LABEL[entry.source]}` : ""}
+                  </span>
+                </span>
+                <button type="button" className="radar-scope__action" aria-label={`Unhide ${entry.repo}#${entry.number}`} onClick={() => unhide(entry.key)}>
+                  Unhide
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1115,9 +1225,33 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const { rpc, snapshot, error, setError, mutate, call, optimistic } = useRadar();
   const navigate = useBbNavigate();
   const [reviewing, setReviewing] = useState<{ item: RadarItem; context: ReviewContext } | null>(null);
+  const [undo, setUndo] = useState<{ key: string; title: string } | null>(null);
+  /** In-flight hides, so an Undo can't reach the server before its hide. */
+  const hiding = useRef(new Map<string, Promise<unknown>>());
+  useEffect(() => {
+    if (undo === null) return;
+    const timer = setTimeout(() => setUndo(null), 6000);
+    return () => clearTimeout(timer);
+  }, [undo]);
+  const unhide = useCallback(
+    async (key: string | "all") => {
+      await Promise.all(key === "all" ? [...hiding.current.values()] : [hiding.current.get(key)]);
+      await mutate(rpc.call("radar_unhide_item", key === "all" ? { all: true } : { key }));
+    },
+    [mutate, rpc],
+  );
+  const loadHidden = useCallback(() => call(rpc.call("radar_hidden_items", null) as Promise<HiddenEntry[]>), [call, rpc]);
   const reviewActions = useMemo(
     () => ({
       threadFor: (key: string) => snapshot?.reviews[key]?.threadId,
+      hide: (item: RadarItem) => {
+        setUndo({ key: item.key, title: item.title });
+        const done = optimistic({ kind: "hide", key: item.key }, rpc.call("radar_hide_item", { key: item.key })).then((next) => {
+          if (next === null) setUndo((current) => (current?.key === item.key ? null : current));
+        });
+        hiding.current.set(item.key, done);
+        void done.finally(() => { if (hiding.current.get(item.key) === done) hiding.current.delete(item.key); });
+      },
       acknowledge: (item: RadarItem) => { void optimistic({ kind: "acknowledge", key: item.key }, rpc.call("radar_acknowledge", { key: item.key })); },
       open: (threadId: string) => navigate.toThread(threadId),
       review: (item: RadarItem) => {
@@ -1206,6 +1340,17 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               onOp={(op, keys) => void mutate(rpc.call("radar_scope", { op, keys }))}
               onSet={(enabled) => void mutate(rpc.call("radar_focus_set", { enabled }))}
               onDescribe={async (description) => (await mutate(rpc.call("radar_focus_describe", { description }))) !== null}
+            />
+            <HiddenControl
+              count={snapshot?.hiddenCount ?? 0}
+              undo={undo}
+              load={loadHidden}
+              onUnhide={unhide}
+              onUndo={() => {
+                if (undo === null) return;
+                setUndo(null);
+                void unhide(undo.key);
+              }}
             />
             <span className="radar-toolbar-sep" aria-hidden="true" />
             <button

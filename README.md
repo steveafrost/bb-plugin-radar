@@ -82,12 +82,25 @@ shows whatever is current.
   many items it hides; "Turn off" restores the normal board and keeps the focus to
   resume. The Focus popover also lists the repos/areas in the view with counts to
   hide (eye) or "Only" one by hand. Without AI it matches repo/area names.
+- **Hide one item**: the eye-off row action ("Hide from Radar") takes one PR or
+  issue off every lane, view, view count and the rail badge at once (optimistic),
+  with a few-second Undo in the toolbar. The muted eye-off count next to Filter
+  opens the hidden list: each item with Unhide, plus Unhide all. This is separate
+  from Focus (whole repos/areas). Hidden items are never marked seen, so an
+  unhidden item comes back as new if it was. A hide lasts until undone; an entry
+  whose item has been in no lane result for 30 days is pruned (pruning is skipped
+  when every lane failed). At most 1000 hides; the oldest go first. CLI:
+  `bb radar hide-item <url|key>`, `bb radar unhide-item <url|key> | --all`,
+  `bb radar hidden`.
 - **Configurable**: edit, reorder, collapse, or remove lanes in the panel, or use
   `bb radar …` (see `skills/radar/SKILL.md`).
 
 Persisted state is configuration only: the lane list, the Focus filter, seen-item keys and
-item → review-thread links live in plugin kv. The cached label list can be too big for
-kv's 256KB value cap, so it lives in the plugin database (`label_index` table).
+item → review-thread links live in plugin kv. The cached label list and the hidden items
+can be too big for kv's 256KB value cap, so they live in the plugin database
+(`label_index`; `hidden_items`, one row per item: lowercased key → JSON
+`{ key, source, kind, repo, number, title, url, hiddenAt, lastSeenAt }`, validated on load,
+bad rows dropped).
 
 AI execution requires a BB development build exposing `experimental_ai.complete`. On older hosts Radar reports that the API is unsupported, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced; there is no credential fallback. Focus also falls back to name matching after a provider error.
 
