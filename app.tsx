@@ -393,7 +393,7 @@ function FocusControl({
       }
     };
     const onDown = (event: MouseEvent) => {
-      if (!(event.target as Element | null)?.closest?.(".radar-scope")) close();
+      if (!(event.target as Element | null)?.closest?.(".radar-filter")) close();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
@@ -414,7 +414,7 @@ function FocusControl({
     });
   };
   return (
-    <div className="radar-scope">
+    <div className="radar-scope radar-filter">
       <button
         type="button"
         className="radar-btn radar-focus radar-filter__trigger"

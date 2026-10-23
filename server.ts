@@ -1171,8 +1171,13 @@ export default async function plugin(bb: BbPluginApi) {
     return Object.values(results).flatMap((result) => result.items);
   }
 
+  /** Lane items minus ones hidden one by one: what every count and scope list is built from. */
+  function shownItems(): RadarItem[] {
+    return allItems().filter((item) => !isHidden(item));
+  }
+
   function catalog(): ScopeEntry[] {
-    return scopeCatalog(allItems(), scope);
+    return scopeCatalog(shownItems(), scope);
   }
 
   async function saveFocus(next: FocusState): Promise<RadarSnapshot> {
@@ -1188,7 +1193,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** "i don't want to see any billing stuff" → hide acme/billing, Focus on. */
   async function describeFocus(description: string): Promise<RadarSnapshot> {
-    const entries = scopeCatalog(allItems(), EMPTY_SCOPE);
+    const entries = scopeCatalog(shownItems(), EMPTY_SCOPE);
     const known = [...new Set([...catalogKeys(entries), ...focusState.focus, ...focusState.hidden])];
     let choice: { focus: string[]; hidden: string[]; summary: string };
     if (!aiState().available) {
@@ -1863,7 +1868,7 @@ export default async function plugin(bb: BbPluginApi) {
             } else {
               await editScope(command === "focus" ? "add-focus" : (command as ScopeOp), resolveScopes(names));
             }
-            const hidden = new Set(allItems().filter((item) => !visible(item)).map((item) => item.key)).size;
+            const hidden = new Set(shownItems().filter((item) => !visible(item)).map((item) => item.key)).size;
             return {
               exitCode: 0,
               stdout: json
