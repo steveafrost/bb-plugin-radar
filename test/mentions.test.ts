@@ -205,3 +205,35 @@ describe("mention acknowledgements", () => {
     expect(f.patches()).toHaveLength(0);
   });
 });
+
+describe("mention candidates (audit)", () => {
+  it("scans only due items but keeps every current item visible and applies queued acks", async () => {
+    const f = fixture();
+    const other: MentionItem = { ...item, key: `${item.key}:copy` };
+    await f.tracker.reconcile([item], "alice");
+    expect(f.tracker.acknowledge(item.key)).toBe(true);
+    f.calls.length = 0;
+    const result = await f.tracker.reconcile([item, other], "alice", [other]);
+    expect(result.scannedKeys).toEqual([other.key]);
+    expect(f.calls.filter((c) => c.endsWith("/issues/1"))).toHaveLength(1); // only `other`
+    // The queued acknowledgement for the unchanged item is still written.
+    expect(f.patches()).toEqual(["PATCH /notifications/threads/7"]);
+    expect(f.tracker.metadata(item.key).pending).toBe(false);
+  });
+
+  it("prune drops tracked items not in the current set", async () => {
+    const f = fixture();
+    await f.tracker.reconcile([item], "alice");
+    expect(f.tracker.metadata(item.key).generation).toBe(1);
+    expect(f.tracker.prune(new Set())).toBe(true);
+    expect(f.tracker.metadata(item.key)).toMatchObject({ generation: 0, canAck: false });
+    expect(Object.values(f.state.accounts)[0]!.items).toEqual({});
+    expect(f.tracker.prune(new Set())).toBe(false);
+  });
+
+  it("skips the notifications read when nothing is tracked", async () => {
+    const f = fixture();
+    await f.tracker.reconcile([], "alice");
+    expect(f.calls).toEqual([]);
+  });
+});

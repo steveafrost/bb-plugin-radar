@@ -113,8 +113,25 @@ export class MentionTracker {
     return match ? `${match[1]!.toLowerCase()}#${Number(match[2])}` : null;
   }
 
-  async reconcile(items: MentionItem[], login: string): Promise<{
-    visibleKeys: string[]; error: string | null;
+  /** Drops tracked items (in every account) whose key is not in `keep`; true when any went. */
+  prune(keep: ReadonlySet<string>): boolean {
+    let changed = false;
+    for (const account of Object.values(this.state.accounts)) {
+      for (const key of Object.keys(account.items)) {
+        if (!keep.has(key)) { delete account.items[key]; changed = true; }
+      }
+    }
+    for (const key of this.current) if (!keep.has(key)) this.current.delete(key);
+    return changed;
+  }
+
+  /**
+   * `items` is the full current candidate set (it decides visibility); only `due` is
+   * re-scanned. Notification read state and queued acknowledgements are applied to every
+   * current item already tracked, so an unchanged item still gets its pending write.
+   */
+  async reconcile(items: MentionItem[], login: string, due: MentionItem[] = items): Promise<{
+    visibleKeys: string[]; error: string | null; scannedKeys: string[];
   }> {
     if (this.running) throw new Error("Mention reconciliation already running");
     this.running = true;
@@ -127,7 +144,9 @@ export class MentionTracker {
       const account = this.account;
       this.current = new Set(items.map(i => i.key));
       const scanned = new Map<string, MentionItem>();
-      for (const item of items) {
+      const failed = new Set<string>();
+      for (const item of due) {
+        if (!this.current.has(item.key)) continue;
         try {
           if (!/^[\w.-]+\/[\w.-]+$/.test(item.repo) || !Number.isSafeInteger(item.number) || item.number < 1
             || !["pr", "issue"].includes(item.kind) || !item.key) throw new Error("Invalid candidate");
@@ -139,16 +158,20 @@ export class MentionTracker {
           // Preserve tombstones: a temporarily missing/deleted ID is not a new ID.
           Object.assign(e.content, content);
           scanned.set(item.key, item);
-        } catch (error) { errors.push(`${item.key}: ${String(error)}`); }
+        } catch (error) { failed.add(item.key); errors.push(`${item.key}: ${String(error)}`); }
       }
-      let notifications: Thread[];
-      try {
-        notifications = (await this.pages("/notifications?all=true")).map(row => thread.parse(row));
-      } catch (error) {
-        errors.push(`Notifications: ${String(error)}`);
-        notifications = [];
+      // Tracked, current items whose scan did not fail this cycle (unchanged ones keep their generation).
+      const handled = items.filter(i => !failed.has(i.key) && Object.hasOwn(account.items, i.key));
+      let notifications: Thread[] = [];
+      if (handled.length > 0) {
+        try {
+          notifications = (await this.pages("/notifications?all=true")).map(row => thread.parse(row));
+        } catch (error) {
+          errors.push(`Notifications: ${String(error)}`);
+        }
       }
-      for (const [key, item] of scanned) {
+      for (const item of handled) {
+        const key = item.key;
         const e = account.items[key]!;
         const matches = notifications.filter(t => this.subject(t) === `${item.repo.toLowerCase()}#${item.number}`);
         if (!matches.length) continue; // Missing is unknown, never read.
@@ -172,11 +195,11 @@ export class MentionTracker {
         if (complete && e.pending === generation && e.generation === generation) e.pending = null;
       }
       account.error = errors.length ? errors.join("\n") : null;
-      return { visibleKeys: items.filter(i => this.metadata(i.key).canAck).map(i => i.key), error: account.error };
+      return { visibleKeys: items.filter(i => this.metadata(i.key).canAck).map(i => i.key), error: account.error, scannedKeys: [...scanned.keys()] };
     } catch (error) {
       const message = String(error);
       if (this.account) this.account.error = message;
-      return { visibleKeys: items.filter(i => this.metadata(i.key).canAck).map(i => i.key), error: message };
+      return { visibleKeys: items.filter(i => this.metadata(i.key).canAck).map(i => i.key), error: message, scannedKeys: [] };
     } finally { this.running = false; }
   }
 }
