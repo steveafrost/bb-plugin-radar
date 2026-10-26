@@ -139,6 +139,8 @@ const AI_TIMEOUT_MS = 45_000;
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const LANE_CONCURRENCY = 3;
 const CLI_ROW_LIMIT = 80;
+/** markSeen keeps up to this many lane-limits of seen keys that are not in the current result. */
+const SEEN_CARRY_FACTOR = 4;
 /** Lane and focus descriptions: the same cap as the RPCs and the stored schemas. */
 const MAX_DESCRIPTION = 600;
 const DESCRIPTION_TOO_LONG = `Keep the description under ${MAX_DESCRIPTION} characters.`;
@@ -1208,8 +1210,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (result === undefined) continue;
       // Focus-hidden and hidden items stay new so they surface when the filter changes or they're unhidden.
       const hit = (item: RadarItem) => itemInView(item, view) && visible(item) && !isHidden(item);
-      // Non-new items are already seen, so this keeps the other view's new items new.
-      seen[lane.id] = result.items.filter((item) => !item.isNew || hit(item)).map((item) => item.key);
+      // Non-new items are already seen, so this keeps the other view's new items new. Keys seen
+      // before but missing now (a host that is down, the limit cut) are kept, capped, so they
+      // do not come back as new.
+      const current = new Set(result.items.map((item) => item.key));
+      const carried = (seen[lane.id] ?? []).filter((key) => !current.has(key)).slice(-SEEN_CARRY_FACTOR * (lane.limit ?? 30));
+      seen[lane.id] = [...carried, ...result.items.filter((item) => !item.isNew || hit(item)).map((item) => item.key)];
       result.items = result.items.map((item) => (hit(item) ? { ...item, isNew: false } : item));
     }
     await persistSeen();

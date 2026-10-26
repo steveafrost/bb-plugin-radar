@@ -15,9 +15,10 @@ async function trackedKeys(bb: Bb): Promise<Record<string, unknown>> {
 }
 const here = new URL("./", import.meta.url).pathname;
 /** Boots Radar on a fresh fake host whose database is a copy of `file` (a restart). */
-async function restartOn(file: string, settings: Record<string, unknown>, lanes: unknown) {
+async function restartOn(file: string, settings: Record<string, unknown>, lanes: unknown, kv: Record<string, unknown> = {}) {
   const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
   const host = createFakePluginHost({ pluginId: "radar", settings: { ghPath: join(here, "gh"), dtPath: join(here, "dt"), ...settings } as never });
+  for (const [key, value] of Object.entries(kv)) await host.bb.storage.kv.set(key, value);
   const handle = host.bb.storage.database();
   const target = handle.name;
   handle.close();
@@ -78,7 +79,7 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F2 marking seen during a one-host outage re-badges every item of that host when it recovers", async () => {
+  it("F2 marking seen during a one-host outage does not re-badge that host's items when it recovers", async () => {
     const gh = [node("o/r", 1), node("o/r", 2)];
     const delta = [deltaRow(11), deltaRow(12), deltaRow(13)];
     setState({ searches: [{ match: "mine", nodes: gh }], deltaItems: delta });
@@ -92,11 +93,29 @@ describe("audit: integration", () => {
     setState({ searches: [{ match: "mine", nodes: gh }], deltaItems: delta });
     await harness.runCli(["refresh"]);
     const fresh = JSON.parse((await harness.runCli(["list", "--new", "--json"])).stdout) as { key: string }[];
-    console.log("F2 new after recovery:", fresh.map((i) => i.key));
-    expect(fresh.map((i) => i.key).sort()).toEqual(["delta:acme/mono#11", "delta:acme/mono#12", "delta:acme/mono#13"]);
+    expect(fresh).toEqual([]);
     const badge = await (await harness.fetchHttp("GET", "/badge")).json();
-    expect(badge.new).toBe(3);
+    expect(badge.new).toBe(0);
     await harness.dispose();
+  });
+
+  it("F2b carried seen keys are capped at 4 x the lane limit", async () => {
+    setState({ searches: [{ match: "cap", nodes: [node("o/r", 1)] }] });
+    const { bb, harness } = await boot({}, [lane("c", "is:open cap", { limit: 2 })]);
+    await harness.runCli(["refresh"]);
+    const old = Array.from({ length: 20 }, (_, i) => `github:o/r#${100 + i}`);
+    await bb.storage.kv.set("seen", { c: [...old, "github:o/r#1"] });
+    // Reload the seen map through a lane edit-free path: a second boot on a copy of the store.
+    const file = join(mkdtempSync(join(tmpdir(), "radar-restart-")), "data.db");
+    await db(bb).backup(file);
+    const seenValue = await bb.storage.kv.get("seen");
+    await harness.dispose();
+    const second = await restartOn(file, {}, [lane("c", "is:open cap", { limit: 2 })], { seen: seenValue });
+    await second.harness.runCli(["refresh"]);
+    await second.harness.runCli(["seen", "c"]);
+    const stored = (await second.bb.storage.kv.get("seen")) as Record<string, string[]>;
+    expect(stored.c).toEqual([...old.slice(-8), "github:o/r#1"]);
+    await second.harness.dispose();
   });
 
   it("F3 mention candidates come only from the current Mentions lane; unchanged items are not re-scanned", async () => {
