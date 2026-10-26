@@ -117,9 +117,11 @@ import {
   gitMergesArgs,
   gitOriginArgs,
   gitPushArgs,
+  gitPushUrlsArgs,
   gitReplayArgs,
   gitRevParseArgs,
   originMatches,
+  pushUrlsMatch,
   radarRefs,
   replayedHead,
   parseRebaseTarget,
@@ -1655,7 +1657,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (target.repo.toLowerCase() !== delta.repo.toLowerCase()) throw new UserError(`Radar only rebases ${delta.repo} PRs on ${SOURCE_LABEL.delta}.`);
     const git = (args: string[], label: string, timeoutMs?: number) => capture("git", args, label, { cwd, timeoutMs });
     const origin = await git(gitOriginArgs(), "git remote");
-    if (!origin.ok || !originMatches(origin.stdout, delta.host, delta.repo)) {
+    // The push goes to origin's push URLs (pushurl, pushInsteadOf), so check those as well as the fetch URL.
+    const pushUrls = origin.ok && originMatches(origin.stdout, delta.host, delta.repo) ? await git(gitPushUrlsArgs(), "git remote") : null;
+    if (pushUrls === null || !pushUrls.ok || !pushUrlsMatch(pushUrls.stdout, delta.host, delta.repo)) {
       throw new UserError(`The rebase checkout's origin is not https://${delta.host}/${delta.repo}. Fix the checkout path in Radar settings.`);
     }
     const me = await resolveDeltaMe();

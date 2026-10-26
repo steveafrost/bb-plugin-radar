@@ -16,6 +16,8 @@ import {
   gitPushArgs,
   gitReplayArgs,
   originMatches,
+  gitPushUrlsArgs,
+  pushUrlsMatch,
   parseRebaseTarget,
   REBASE_SOURCES,
   replayedHead,
@@ -200,5 +202,35 @@ describe("parseRebaseTarget", () => {
     for (const input of ["", "o/r", "#5", "https://evil.example/o/r/pull/1", "o/../r#1", "o/r#0", "http://github.com/o/r/pull/1"]) {
       expect(parseRebaseTarget(input), input).toBeNull();
     }
+  });
+});
+
+describe("Delta push URL check (audit)", () => {
+  const host = "delta.example.com";
+  const repo = "acme/monorepo";
+  it("needs every push URL to be the Delta repo", () => {
+    expect(gitPushUrlsArgs()).toEqual(["remote", "get-url", "--push", "--all", "origin"]);
+    expect(pushUrlsMatch("https://delta.example.com/acme/monorepo\n", host, repo)).toBe(true);
+    expect(pushUrlsMatch("https://delta.example.com/acme/monorepo.git\ngit@delta.example.com:acme/monorepo.git\n", host, repo)).toBe(true);
+    expect(pushUrlsMatch("https://delta.example.com/acme/monorepo\nhttps://evil.example.com/acme/monorepo\n", host, repo)).toBe(false);
+    expect(pushUrlsMatch("", host, repo)).toBe(false);
+  });
+
+  it("catches a pushurl or pushInsteadOf that differs from the fetch URL (real git)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "radar-pushurl-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
+    git("init", "-q");
+    git("remote", "add", "origin", "https://delta.example.com/acme/monorepo");
+    expect(pushUrlsMatch(git(...gitPushUrlsArgs()), host, repo)).toBe(true);
+    git("config", "remote.origin.pushurl", "https://evil.example.com/acme/monorepo");
+    expect(originMatches(git("remote", "get-url", "origin"), host, repo)).toBe(true);
+    expect(pushUrlsMatch(git(...gitPushUrlsArgs()), host, repo)).toBe(false);
+    git("config", "--unset", "remote.origin.pushurl");
+    git("config", "url.https://evil.example.com/.pushInsteadOf", "https://delta.example.com/");
+    expect(pushUrlsMatch(git(...gitPushUrlsArgs()), host, repo)).toBe(false);
   });
 });

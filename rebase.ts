@@ -126,6 +126,18 @@ export function radarRefs(number: number): { base: string; head: string } {
 export function gitOriginArgs(): string[] {
   return ["remote", "get-url", "origin"];
 }
+/**
+ * `git remote get-url --push --all origin`: every URL a push to origin goes to, with
+ * `pushurl`, `insteadOf` and `pushInsteadOf` expanded. Each must be the Delta repo too.
+ */
+export function gitPushUrlsArgs(): string[] {
+  return ["remote", "get-url", "--push", "--all", "origin"];
+}
+/** Whether every push URL (one per line, at least one) is the Delta repo. */
+export function pushUrlsMatch(stdout: string, host: string, repo: string): boolean {
+  const urls = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  return urls.length > 0 && urls.every((url) => originMatches(url, host, repo));
+}
 /** Whether a remote URL is `https://<host>/<repo>(.git)` (or an ssh form of it). */
 export function originMatches(url: string, host: string, repo: string): boolean {
   const value = url.trim();
