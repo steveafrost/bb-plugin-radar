@@ -1,14 +1,15 @@
 /**
  * bb-plugin-radar — backend entry.
  *
- * A live, storage-free view of the PR/issue queues that need you. Each "lane"
+ * A live view of the PR/issue queues that need you. Each "lane"
  * is a saved query over one or more hosts: a Delta repo (`dt api search/issues`, the
  * primary host for repos that left GitHub, e.g. shop/world), GitHub (`gh api graphql`
  * search) and, only when turned on as read-only history, a Gitstream repo
  * (`gs api repos/<repo>/pulls`; Gitstream no longer accepts PR writes). The server polls every lane on an interval, keeps
  * only the latest result in memory, and pushes a realtime signal so the panel
- * re-reads it. The only persisted state is configuration: the lane list and
- * which items you have already seen (so new arrivals can be badged).
+ * re-reads it. Persisted state is small configuration in plugin kv (lanes, focus,
+ * seen keys, review links) plus the plugin database for anything that can grow:
+ * the label index, hidden items, mention tracking and the last results.
  *
  * "Track something" sends a natural-language description to an OpenAI-compatible
  * endpoint (set in settings), which drafts a lane; the panel previews its live results before you
@@ -1212,6 +1213,12 @@ export default async function plugin(bb: BbPluginApi) {
   // ---- mutations ----------------------------------------------------------
 
   async function upsertLane(input: unknown): Promise<RadarSnapshot> {
+    await putLane(input);
+    return snapshot();
+  }
+
+  /** Creates or replaces a lane; returns its id (generated from the title when none was given). */
+  async function putLane(input: unknown): Promise<string> {
     const candidate = input as Partial<Lane> | null;
     if (candidate === null || typeof candidate !== "object") throw new UserError("Missing lane.");
     const id =
@@ -1244,7 +1251,7 @@ export default async function plugin(bb: BbPluginApi) {
       void refreshLane(lane).then(() => isMentionLane(lane) ? syncMentions() : undefined).catch(error => bb.log.warn(`lane refresh failed: ${String(error)}`));
     }
     publish();
-    return snapshot();
+    return lane.id;
   }
 
   async function deleteLane(laneId: string): Promise<RadarSnapshot> {
@@ -1861,23 +1868,24 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb radar list [--lane <id>] [--view reviews|prs|issues|all] [--new] [--all] [--json]",
     "                                            --view: what that panel view shows; --all ignores the focus filter",
     "  bb radar lanes [--json]                   configured lanes, their view (category) and queries",
-    "  bb radar add <description…> [--dry-run]   draft a lane with the LLM and add it",
+    "  bb radar add <description…> [--dry-run] [--json]  draft a lane with the LLM and add it",
     "  bb radar remove <lane-id>",
     "  bb radar seen [<lane-id>]                 mark items as seen",
     "  bb radar refresh",
     "  bb radar defaults                         add missing default lanes",
-    "  bb radar put '<lane json>'                create or replace a lane (category inferred unless given)",
+    "  bb radar put '<lane json>'                create or replace a lane (category inferred unless given; prints its id)",
     "  bb radar scopes [--json]                  repos (and area-repo areas) in results, with the focus filter",
-    "  bb radar focus <description…>             e.g. \"no billing stuff\": AI picks repos/areas, Focus on",
+    "  bb radar focus <description…> [--json]    e.g. \"no billing stuff\": AI picks repos/areas, Focus on",
     "  bb radar focus <repo|area>…               show only these (exact names)",
     "  bb radar focus --add <repo|area>…         add to the focus",
     "  bb radar focus --off | --on               turn Focus off (back to normal) / resume the last one",
-    "  bb radar hide <repo|area>…                hide from every lane, view and the badge",
-    "  bb radar show <repo|area>…                undo hide (adds to the focus while one is set)",
-    "  bb radar hide-item <url|key>              hide one PR or issue everywhere until unhidden",
-    "  bb radar unhide-item <url|key> | --all    bring hidden items back",
+    "  bb radar hide <repo|area>… [--json]       hide from every lane, view and the badge",
+    "  bb radar show <repo|area>… [--json]       undo hide (adds to the focus while one is set)",
+    "  bb radar hide-item <url|key> [--json]     hide one PR or issue everywhere until unhidden",
+    "  bb radar unhide-item <url|key> | --all [--json]  bring hidden items back",
     "  bb radar hidden [--json]                  list items hidden one by one",
-    "  bb radar rebase <url|owner/repo#n> --yes  rebase your own open PR (GitHub server-side; Delta via git)",
+    "  bb radar rebase <url|owner/repo#n> [--source github|delta] --yes [--json]",
+    "                                            rebase your own open PR (GitHub server-side; Delta via git)",
     "",
     "Repos are owner/name (or a unique tail, e.g. billing); areas of the area repo (a setting)",
     "are //<path> label keys (or a unique tail, e.g. mobile); no-area is that repo without an area label.",
@@ -1901,23 +1909,23 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "status", summary: "Per-lane counts", usage: "bb radar status [--json]" },
       { name: "list", summary: "List items", usage: "bb radar list [--lane <id>] [--view reviews|prs|issues|all] [--new] [--all] [--json]" },
       { name: "lanes", summary: "List configured lanes with their view (category)", usage: "bb radar lanes [--json]" },
-      { name: "add", summary: "Draft a lane from a description and add it", usage: "bb radar add <description…> [--dry-run]" },
+      { name: "add", summary: "Draft a lane from a description and add it", usage: "bb radar add <description…> [--dry-run] [--json]" },
       { name: "remove", summary: "Remove a lane", usage: "bb radar remove <lane-id>" },
       { name: "seen", summary: "Mark items seen", usage: "bb radar seen [<lane-id>]" },
       { name: "refresh", summary: "Refetch every lane now", usage: "bb radar refresh" },
-      { name: "put", summary: "Create or replace a lane from JSON", usage: "bb radar put '<lane json>'" },
+      { name: "put", summary: "Create or replace a lane from JSON; prints its id", usage: "bb radar put '<lane json>'" },
       { name: "defaults", summary: "Add any missing default lanes (keeps yours)", usage: "bb radar defaults" },
       { name: "scopes", summary: "Repos and areas in results, with the focus filter", usage: "bb radar scopes [--json]" },
-      { name: "focus", summary: "Focus mode: describe it, or name repos/areas; --off / --on", usage: "bb radar focus <description…> | <repo|area>… | --add <…> | --off | --on" },
-      { name: "hide", summary: "Hide repos/areas everywhere", usage: "bb radar hide <repo|area>…" },
-      { name: "show", summary: "Unhide repos/areas", usage: "bb radar show <repo|area>…" },
-      { name: "hide-item", summary: "Hide one PR or issue everywhere", usage: "bb radar hide-item <url|key|owner/repo#n>" },
-      { name: "unhide-item", summary: "Unhide one item, or all", usage: "bb radar unhide-item <url|key|owner/repo#n> | --all" },
+      { name: "focus", summary: "Focus mode: describe it, or name repos/areas; --off / --on", usage: "bb radar focus <description…> | <repo|area>… | --add <…> | --off | --on [--json]" },
+      { name: "hide", summary: "Hide repos/areas everywhere", usage: "bb radar hide <repo|area>… [--json]" },
+      { name: "show", summary: "Unhide repos/areas", usage: "bb radar show <repo|area>… [--json]" },
+      { name: "hide-item", summary: "Hide one PR or issue everywhere", usage: "bb radar hide-item <url|key|owner/repo#n> [--json]" },
+      { name: "unhide-item", summary: "Unhide one item, or all", usage: "bb radar unhide-item <url|key|owner/repo#n> | --all [--json]" },
       { name: "hidden", summary: "List items hidden one by one", usage: "bb radar hidden [--json]" },
       {
         name: "rebase",
         summary: "Rebase your own open PR onto its base (GitHub server-side, Delta via git replay + leased push; needs --yes)",
-        usage: "bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes]",
+        usage: "bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes] [--json]",
       },
     ],
     async run(argv) {
@@ -2034,13 +2042,13 @@ export default async function plugin(bb: BbPluginApi) {
             } catch {
               return { exitCode: 1, stderr: "Usage: bb radar put '<lane json>'" };
             }
+            let id: string;
             try {
-              await upsertLane(lane);
+              id = await putLane(lane);
             } catch (error) {
               return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
             }
-            const id = (lane as { id?: unknown }).id;
-            return { exitCode: 0, stdout: `Saved ${typeof id === "string" ? id : "lane"}.` };
+            return { exitCode: 0, stdout: `Saved ${id}.` };
           }
           case "remove": {
             const id = rest[0];
@@ -2145,7 +2153,7 @@ export default async function plugin(bb: BbPluginApi) {
             const sourceIndex = rest.indexOf("--source");
             const sourceFlag = sourceIndex >= 0 ? rest[sourceIndex + 1] : undefined;
             const positional = rest.filter((arg, index) => !arg.startsWith("--") && (sourceIndex < 0 || index !== sourceIndex + 1));
-            if (positional.length !== 1) {
+            if (positional.length !== 1 || (sourceIndex >= 0 && (sourceFlag === undefined || sourceFlag.startsWith("--")))) {
               return { exitCode: 1, stderr: "Usage: bb radar rebase <PR url | owner/repo#number> [--source github|delta] [--yes]" };
             }
             if (fetchedAt === "") await refreshAll();

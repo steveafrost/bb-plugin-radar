@@ -6,7 +6,7 @@ description: Read or configure the Radar panel — live queues of pull requests 
 # Radar
 
 Radar polls a list of *lanes* (saved queries) and shows the current results in a
-bb panel. Radar stores only its own state in bb (lanes, focus, seen keys, review-thread links, single-item hides and a cache of the last results); every refresh is a live read from `gh api graphql` search (GitHub; GraphQL budget, not the 30/min REST search limit) and, when set up in settings, `dt api search/issues` (Delta, the primary host for repos like shop/world; `author:@me` resolves server-side) and, only when the history toggle is on, `gs api repos/<repo>/pulls` (read-only Gitstream history). Delta labels are indexed weekly so the LLM picks exact label names. Lanes skip sources that are not set up.
+bb panel. Radar stores only its own state in bb: lanes, focus, seen keys and review-thread links in plugin kv, and the label index, single-item hides, mention-acknowledgement tracking and a cache of the last results in its plugin database; every refresh is a live read from `gh api graphql` search (GitHub; GraphQL budget, not the 30/min REST search limit) and, when set up in settings, `dt api search/issues` (Delta, the primary host for repos like shop/world; `author:@me` resolves server-side) and, only when the history toggle is on, `gs api repos/<repo>/pulls` (read-only Gitstream history). Delta labels are indexed weekly so the LLM picks exact label names. Lanes skip sources that are not set up.
 
 ## Commands
 
@@ -14,24 +14,24 @@ bb panel. Radar stores only its own state in bb (lanes, focus, seen keys, review
 bb radar status [--json]                   # per-lane counts, new counts, errors
 bb radar list [--lane <id>] [--new] [--json]  # items; * marks unseen
 bb radar lanes [--json]                    # lane ids, titles, view (category), queries, filters
-bb radar add <description…> [--dry-run]    # LLM drafts a lane from plain English and adds it
+bb radar add <description…> [--dry-run] [--json]  # LLM drafts a lane from plain English and adds it
 bb radar remove <lane-id>
 bb radar seen [<lane-id>]                  # acknowledge current items
 bb radar refresh
-bb radar put '<lane json>'                 # create/replace a lane (shape below; same as lanes --json)
+bb radar put '<lane json>'                 # create/replace a lane (shape below; same as lanes --json); prints the lane id
 bb radar defaults                          # add any missing default lanes, keeping yours
-bb radar focus "<what helps you focus>"    # e.g. "no billing stuff": AI picks repos/areas to hide or show; Focus on
+bb radar focus "<what helps you focus>" [--json]  # e.g. "no billing stuff": AI picks repos/areas to hide or show; Focus on
 bb radar focus <repo|area>…                # show only these (exact names / unique tails like billing, mobile)
 bb radar focus --add <repo|area>…          # add to the focus
-bb radar hide <repo|area>… / show <…>      # hide or unhide whole repos/areas everywhere (Focus; lanes, every view, badge)
-bb radar hide-item <url|key>               # hide ONE PR/issue everywhere until unhidden (key: github:owner/repo#12; owner/repo#12 if unique)
-bb radar unhide-item <url|key> | --all     # bring one (or every) hidden item back
+bb radar hide <repo|area>… / show <…> [--json]  # hide or unhide whole repos/areas everywhere (Focus; lanes, every view, badge)
+bb radar hide-item <url|key> [--json]      # hide ONE PR/issue everywhere until unhidden (key: github:owner/repo#12; owner/repo#12 if unique)
+bb radar unhide-item <url|key> | --all [--json]  # bring one (or every) hidden item back
 bb radar hidden [--json]                   # items hidden one by one, newest first
 bb radar focus --off | --on                # Focus off = normal board (focus is kept); --on resumes it
 bb radar scopes [--json]                   # repos + area-repo areas in results, counts, focus state
 bb radar list --all                        # ignore the focus filter
 bb radar list --view reviews|prs|issues|all  # what one panel view shows
-bb radar rebase <PR url|owner/repo#n> --yes  # rebase YOUR open PR (GitHub server-side; Delta via git replay + leased push when deltaCheckout is set); rewrites the branch, only on explicit request
+bb radar rebase <PR url|owner/repo#n> [--source github|delta] --yes [--json]  # rebase YOUR open PR (GitHub server-side; Delta via git replay + leased push when deltaCheckout is set); rewrites the branch, only on explicit request; --source picks the host when owner/repo#n is ambiguous
 ```
 
 ## Focus

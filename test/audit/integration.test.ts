@@ -281,3 +281,43 @@ describe("audit: poll service", () => {
     await harness.dispose();
   }, 15000);
 });
+
+describe("audit: CLI extras", () => {
+  it("put without an id prints the id it created", async () => {
+    setState({ searches: [] });
+    const { harness } = await boot({}, [lane("a", "is:open alpha")]);
+    const put = await harness.runCli(["put", JSON.stringify({ title: "My New Lane", sources: ["github"], query: "is:open beta" })]);
+    expect(put.exitCode).toBe(0);
+    const lanes = JSON.parse((await harness.runCli(["lanes", "--json"])).stdout) as { id: string }[];
+    const created = lanes.find((l) => l.id !== "a")!.id;
+    expect(put.stdout).toBe(`Saved ${created}.`);
+    await harness.dispose();
+  });
+
+  it("rebase --source with no value is a usage error", async () => {
+    setState({ searches: [] });
+    const { harness } = await boot({}, [lane("a", "is:open alpha")]);
+    for (const argv of [["rebase", "o/r#1", "--source"], ["rebase", "o/r#1", "--source", "--yes"]]) {
+      const r = await harness.runCli(argv);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toMatch(/^Usage: bb radar rebase/);
+    }
+    await harness.dispose();
+  });
+
+  it("help and the radar skill list the flags the CLI accepts", async () => {
+    const { readFileSync } = await import("node:fs");
+    const skill = readFileSync(new URL("../../skills/radar/SKILL.md", import.meta.url), "utf8");
+    setState({ searches: [] });
+    const { harness } = await boot({}, [lane("a", "is:open alpha")]);
+    const help = (await harness.runCli(["help"])).stdout;
+    for (const text of [help, skill]) {
+      expect(text).toMatch(/radar add <description…> \[--dry-run\] \[--json\]/);
+      expect(text).toMatch(/radar focus .*\[--json\]/);
+      expect(text).toMatch(/radar hide-item <url\|key> \[--json\]/);
+      expect(text).toMatch(/radar unhide-item <url\|key> \| --all \[--json\]/);
+      expect(text).toMatch(/radar rebase .*\[--source github\|delta\]/);
+    }
+    await harness.dispose();
+  });
+});

@@ -95,12 +95,15 @@ shows whatever is current.
 - **Configurable**: edit, reorder, collapse, or remove lanes in the panel, or use
   `bb radar …` (see `skills/radar/SKILL.md`).
 
-Persisted state is configuration only: the lane list, the Focus filter, seen-item keys and
-item → review-thread links live in plugin kv. The cached label list and the hidden items
-can be too big for kv's 256KB value cap, so they live in the plugin database
-(`label_index`; `hidden_items`, one row per item: lowercased key → JSON
+Persisted state: the lane list, the Focus filter, seen-item keys and item → review-thread
+links are small and live in plugin kv. Anything that can outgrow kv's 256KB value cap lives
+in the plugin database: the cached label list (`label_index`), hidden items (`hidden_items`,
+one row per item: lowercased key → JSON
 `{ key, source, kind, repo, number, title, url, hiddenAt, lastSeenAt }`, validated on load,
-bad rows dropped).
+bad rows dropped), mention-acknowledgement tracking (`mention_accounts`, `mention_items`,
+`mention_candidates`) and the last refresh's results (`results_cache`, one row per lane, and
+`results_meta`), so a restart shows what Radar last knew. Older kv copies of the mention
+state and results cache are moved into the database on load and their kv keys deleted.
 
 AI execution uses a BB build exposing `experimental_ai.complete`. On other hosts, the AI fallback (`aiBaseUrl` https only, `aiKeyEnv`, `aiModel`; all three required) sends the key from that bb server environment variable to that endpoint; with neither, Radar reports that AI is unavailable, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced. Focus also falls back to name matching after a provider error.
 
