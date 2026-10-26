@@ -186,6 +186,44 @@ export function gitPushArgs(headRef: string, newOid: string, expectedOid: string
   const branch = `refs/heads/${assertBranch(headRef)}`;
   return ["push", "--porcelain", "--no-follow-tags", `--force-with-lease=${branch}:${assertOid(expectedOid)}`, "origin", `${assertOid(newOid)}:${branch}`];
 }
+/** Every ref under refs/radar/rebase/, one per line. */
+export function gitListRadarRefsArgs(): string[] {
+  return ["for-each-ref", "--format=%(refname)", "refs/radar/rebase/"];
+}
+/** Radar rebase refs left behind (e.g. by a reload mid-rebase), except those of rebases still running. */
+export function staleRadarRefs(stdout: string, running: ReadonlySet<number>): string[] {
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((ref) => {
+      const match = /^refs\/radar\/rebase\/(\d+)\/(?:base|head)$/.exec(ref);
+      return match !== null && !running.has(Number(match[1]));
+    });
+}
+
+/**
+ * How a failed git/gh run during a rebase is reported. A shutdown abort (ABORT_ERR, or the
+ * signal already aborted) and a timeout may have happened mid-push, so they say the rebase
+ * may still have landed; any other exit returns its output for classification.
+ */
+export function captureFailure(
+  error: unknown,
+  aborted: boolean,
+  label: string,
+  bin: string,
+): { kind: "throw"; message: string } | { kind: "output"; stdout: string; output: string } {
+  const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown } | null;
+  if (failure?.code === "ABORT_ERR" || aborted) {
+    return { kind: "throw", message: `${label} was cancelled by a plugin reload; the rebase may still have landed. Refresh to check.` };
+  }
+  if (failure?.code === "ENOENT") return { kind: "throw", message: `${label}: "${bin}" is not on PATH. Set the path in Radar settings.` };
+  if (failure?.killed === true || failure?.code === "ETIMEDOUT") {
+    return { kind: "throw", message: `${label} timed out; the rebase may still have landed. Refresh to check.` };
+  }
+  const stdout = typeof failure?.stdout === "string" ? failure.stdout : "";
+  const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
+  return { kind: "output", stdout, output: `${stderr}\n${stdout}` };
+}
 export function gitDeleteRefArgs(ref: string): string[] {
   if (!/^refs\/radar\/rebase\/\d+\/(base|head)$/.test(ref)) throw new Error("Invalid ref.");
   return ["update-ref", "-d", ref];

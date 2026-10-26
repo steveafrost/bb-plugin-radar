@@ -18,6 +18,9 @@ import {
   originMatches,
   gitPushUrlsArgs,
   pushUrlsMatch,
+  captureFailure,
+  gitListRadarRefsArgs,
+  staleRadarRefs,
   parseRebaseTarget,
   REBASE_SOURCES,
   replayedHead,
@@ -232,5 +235,57 @@ describe("Delta push URL check (audit)", () => {
     git("config", "--unset", "remote.origin.pushurl");
     git("config", "url.https://evil.example.com/.pushInsteadOf", "https://delta.example.com/");
     expect(pushUrlsMatch(git(...gitPushUrlsArgs()), host, repo)).toBe(false);
+  });
+});
+
+describe("rebase on shutdown (audit)", () => {
+  const runAborted = async (abortFirst: boolean) => {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const controller = new AbortController();
+    if (abortFirst) controller.abort();
+    const pending = promisify(execFile)("sleep", ["5"], { signal: controller.signal, killSignal: "SIGKILL" });
+    if (!abortFirst) setTimeout(() => controller.abort(), 50);
+    try {
+      await pending;
+      return null;
+    } catch (error) {
+      return captureFailure(error, controller.signal.aborted, "git push", "git");
+    }
+  };
+
+  it("a reload mid-run (ABORT_ERR) says the rebase may have landed", async () => {
+    for (const abortFirst of [false, true]) {
+      expect(await runAborted(abortFirst)).toEqual({
+        kind: "throw",
+        message: "git push was cancelled by a plugin reload; the rebase may still have landed. Refresh to check.",
+      });
+    }
+  });
+
+  it("an ordinary failure still returns its output for classification", () => {
+    expect(captureFailure({ code: 1, stdout: "out", stderr: "err" }, false, "git push", "git")).toEqual({ kind: "output", stdout: "out", output: "err\nout" });
+    expect(captureFailure({ code: "ENOENT" }, false, "git push", "git")).toMatchObject({ kind: "throw", message: expect.stringContaining("not on PATH") });
+  });
+
+  it("finds stale refs/radar/rebase refs, sparing rebases still running", () => {
+    const listed = "refs/radar/rebase/5/base\nrefs/radar/rebase/5/head\nrefs/radar/rebase/7/head\nrefs/radar/other\n";
+    expect(staleRadarRefs(listed, new Set([7]))).toEqual(["refs/radar/rebase/5/base", "refs/radar/rebase/5/head"]);
+    expect(staleRadarRefs("", new Set())).toEqual([]);
+  });
+
+  it("sweeps leaked refs in a real repo", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "radar-sweep-"));
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env });
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "init");
+    for (const ref of ["refs/radar/rebase/5/base", "refs/radar/rebase/5/head", "refs/radar/rebase/7/head"]) git("update-ref", ref, "HEAD");
+    for (const ref of staleRadarRefs(git(...gitListRadarRefsArgs()), new Set([7]))) git(...gitDeleteRefArgs(ref));
+    expect(git(...gitListRadarRefsArgs()).trim()).toBe("refs/radar/rebase/7/head");
   });
 });

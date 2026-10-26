@@ -111,8 +111,11 @@ import {
   deltaMeArgs,
   deltaPrArgs,
   deltaPrincipal,
+  captureFailure,
   gitDeleteRefArgs,
   gitFetchArgs,
+  gitListRadarRefsArgs,
+  staleRadarRefs,
   gitIsAncestorArgs,
   gitMergesArgs,
   gitOriginArgs,
@@ -1567,12 +1570,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- rebase ---------------------------------------------------------------
 
-  /** Like `tool`, but a non-zero exit returns stdout+stderr for classification instead of throwing. */
+  /**
+   * Like `tool`, but a non-zero exit returns stdout+stderr for classification instead of throwing.
+   * `detached` runs without the shutdown signal (cleanup that must still happen during a reload).
+   */
   async function capture(
     bin: string,
     args: string[],
     label: string,
-    options: { cwd?: string; timeoutMs?: number } = {},
+    options: { cwd?: string; timeoutMs?: number; detached?: boolean } = {},
   ): Promise<{ ok: boolean; stdout: string; output: string }> {
     try {
       const { stdout } = await run(bin, args, {
@@ -1582,19 +1588,14 @@ export default async function plugin(bb: BbPluginApi) {
         maxBuffer: MAX_OUTPUT_BYTES,
         // A rebase replays commits; give it more room than a read.
         timeout: options.timeoutMs ?? TOOL_TIMEOUT_MS * 3,
-        signal: controller.signal,
+        ...(options.detached === true ? {} : { signal: controller.signal }),
         killSignal: "SIGKILL",
       });
       return { ok: true, stdout, output: stdout };
     } catch (error) {
-      const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown } | null;
-      if (failure?.code === "ENOENT") throw new UserError(`${label}: "${bin}" is not on PATH. Set the path in Radar settings.`);
-      if (failure?.killed === true || failure?.code === "ETIMEDOUT") {
-        throw new UserError(`${label} timed out; the rebase may still have landed. Refresh to check.`);
-      }
-      const stdout = typeof failure?.stdout === "string" ? failure.stdout : "";
-      const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
-      return { ok: false, stdout, output: `${stderr}\n${stdout}` };
+      const failure = captureFailure(error, options.detached !== true && controller.signal.aborted, label, bin);
+      if (failure.kind === "throw") throw new UserError(failure.message);
+      return { ok: false, stdout: failure.stdout, output: failure.output };
     }
   }
 
@@ -1662,6 +1663,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (pushUrls === null || !pushUrls.ok || !pushUrlsMatch(pushUrls.stdout, delta.host, delta.repo)) {
       throw new UserError(`The rebase checkout's origin is not https://${delta.host}/${delta.repo}. Fix the checkout path in Radar settings.`);
     }
+    // Sweep refs a reload left mid-rebase (not those of other rebases still running here).
+    const running = new Set([...rebasing].flatMap((key) => {
+      const match = /^delta:.*#(\d+)$/.exec(key);
+      return match !== null && Number(match[1]) !== target.number ? [Number(match[1])] : [];
+    }));
+    await sweepRadarRefs(cwd, running);
     const me = await resolveDeltaMe();
     const pr = parseJson(await tool(config.dtPath, deltaPrArgs(delta.host, target.repo, target.number), SOURCE_LABEL.delta), SOURCE_LABEL.delta);
     const verified = verifyDeltaPr(pr, me, target.repo);
@@ -1694,11 +1701,22 @@ export default async function plugin(bb: BbPluginApi) {
       if (!pushed.ok) throw new UserError(gitFailure(pushed.output, "git push failed."));
       return { status: "rebased", message: "Rebased onto the latest base.", headSha: next };
     } finally {
-      for (const ref of [refs.base, refs.head]) await git(gitDeleteRefArgs(ref), "git update-ref").catch(() => undefined);
+      // Not through the shutdown signal: a reload mid-rebase must still clean up.
+      for (const ref of [refs.base, refs.head]) {
+        await capture("git", gitDeleteRefArgs(ref), "git update-ref", { cwd, timeoutMs: 10_000, detached: true }).catch(() => undefined);
+      }
     }
   }
 
   const rebasing = new Set<string>();
+
+  async function sweepRadarRefs(cwd: string, running: ReadonlySet<number>): Promise<void> {
+    const listed = await capture("git", gitListRadarRefsArgs(), "git for-each-ref", { cwd, timeoutMs: 10_000 });
+    if (!listed.ok) return;
+    for (const ref of staleRadarRefs(listed.stdout, running)) {
+      await capture("git", gitDeleteRefArgs(ref), "git update-ref", { cwd, timeoutMs: 10_000 }).catch(() => undefined);
+    }
+  }
 
   async function rebase(target: RebaseTarget): Promise<RebaseResult> {
     if (!REBASE_SOURCES.has(target.source)) {
