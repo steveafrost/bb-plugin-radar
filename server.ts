@@ -754,18 +754,27 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /**
+   * The board: lane results minus acknowledged mentions and items hidden one by one. The panel,
+   * the badge and every CLI read (status, list, scopes, item and rebase lookups) use this view;
+   * unhiding and hidden-item pruning work on the full `results`.
+   */
+  function boardResults(): Record<string, LaneResult> {
+    return withoutHidden(Object.fromEntries(Object.entries(results).map(([id, result]) => {
+      const lane = lanes.find(l => l.id === id);
+      if (!lane || !isMentionLane(lane)) return [id, result];
+      return [id, { ...result,
+        error: [result.error, mentions.error ? `Mention sync: ${mentions.error}` : ""].filter(Boolean).join(" · "),
+        items: result.items.filter(item => item.source !== "github" || mentions.metadata(item.key).generation === 0 || mentions.metadata(item.key).canAck)
+          .map(item => ({ ...item, canAcknowledge: item.source === "github" && mentions.metadata(item.key).canAck })),
+      }];
+    })), hiddenKeys);
+  }
+
   function snapshot(): RadarSnapshot {
     return {
       lanes,
-      results: withoutHidden(Object.fromEntries(Object.entries(results).map(([id, result]) => {
-        const lane = lanes.find(l => l.id === id);
-        if (!lane || !isMentionLane(lane)) return [id, result];
-        return [id, { ...result,
-          error: [result.error, mentions.error ? `Mention sync: ${mentions.error}` : ""].filter(Boolean).join(" · "),
-          items: result.items.filter(item => item.source !== "github" || mentions.metadata(item.key).generation === 0 || mentions.metadata(item.key).canAck)
-            .map(item => ({ ...item, canAcknowledge: item.source === "github" && mentions.metadata(item.key).canAck })),
-        }];
-      })), hiddenKeys),
+      results: boardResults(),
       fetchedAt,
       refreshing,
       githubLogin,
@@ -1251,7 +1260,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function hideItem(key: string): Promise<RadarSnapshot> {
-    const item = allItems().find((candidate) => normKey(candidate.key) === normKey(key));
+    const item = shownItems().find((candidate) => normKey(candidate.key) === normKey(key));
     if (item === undefined) {
       if (hiddenKeys.has(normKey(key))) return snapshot();
       throw new UserError("That item is no longer in any lane; refresh and try again.");
@@ -1287,7 +1296,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Unique new items across lanes (an item can sit in several lanes), focus filter applied. */
   function newCount(): number {
     const keys = new Set<string>();
-    for (const result of Object.values(snapshot().results)) {
+    for (const result of Object.values(boardResults())) {
       for (const item of result.items) if (item.isNew && visible(item)) keys.add(item.key);
     }
     return keys.size;
@@ -1297,9 +1306,9 @@ export default async function plugin(bb: BbPluginApi) {
     return Object.values(results).flatMap((result) => result.items);
   }
 
-  /** Lane items minus ones hidden one by one: what every count and scope list is built from. */
+  /** Board items (no hidden items, no acknowledged mentions): what every count and scope list is built from. */
   function shownItems(): RadarItem[] {
-    return allItems().filter((item) => !isHidden(item));
+    return Object.values(boardResults()).flatMap((result) => result.items);
   }
 
   function catalog(): ScopeEntry[] {
@@ -1669,7 +1678,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (parsed.source !== null && flagged !== undefined && parsed.source !== flagged) throw new UserError("--source does not match the URL.");
     let source = parsed.source ?? flagged;
     if (source === undefined) {
-      const sources = [...new Set(allItems().filter((item) => item.kind === "pr" && item.repo.toLowerCase() === parsed.repo.toLowerCase() && item.number === parsed.number).map((item) => item.source))];
+      const sources = [...new Set(shownItems().filter((item) => item.kind === "pr" && item.repo.toLowerCase() === parsed.repo.toLowerCase() && item.number === parsed.number).map((item) => item.source))];
       if (sources.length > 1) throw new UserError(`${parsed.repo}#${parsed.number} is on ${sources.join(" and ")}; pass --source.`);
       const { gitstream, delta } = hosts();
       const elsewhere = [delta, gitstream].filter((host) => host !== null && host.repo.toLowerCase() === parsed.repo.toLowerCase());
@@ -1854,7 +1863,8 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: `Refreshed ${lanes.length} lanes.` };
           case "status": {
             if (fetchedAt === "") await refreshAll();
-            const focusHidden = new Set(allItems().filter((item) => !visible(item) && !isHidden(item)).map((item) => item.key));
+            const board = boardResults();
+            const focusHidden = new Set(Object.values(board).flatMap((result) => result.items).filter((item) => !visible(item)).map((item) => item.key));
             if (json) {
               return {
                 exitCode: 0,
@@ -1862,8 +1872,8 @@ export default async function plugin(bb: BbPluginApi) {
               };
             }
             const lines = lanes.map((lane) => {
-              const result = results[lane.id];
-              const mine = result?.items.filter((item) => !isHidden(item)) ?? [];
+              const result = board[lane.id];
+              const mine = result?.items ?? [];
               const shown = mine.filter(visible);
               const hidden = mine.length - shown.length;
               const fresh = shown.filter((item) => item.isNew).length;
@@ -1897,11 +1907,12 @@ export default async function plugin(bb: BbPluginApi) {
             const view = (viewArg ?? "all") as View;
             const onlyNew = rest.includes("--new");
             const everything = rest.includes("--all");
+            const board = boardResults();
             const rows = lanes
               .filter((lane) => (laneId === undefined || lane.id === laneId) && laneInView(lane, view))
               .flatMap((lane) =>
-                (results[lane.id]?.items ?? [])
-                  .filter((item) => !isHidden(item) && itemInView(item, view) && (!onlyNew || item.isNew) && (everything || visible(item)))
+                (board[lane.id]?.items ?? [])
+                  .filter((item) => itemInView(item, view) && (!onlyNew || item.isNew) && (everything || visible(item)))
                   .map((item) => ({ lane: lane.id, ...item })),
               );
             if (json) return { exitCode: 0, stdout: JSON.stringify(rows) };
@@ -2025,7 +2036,8 @@ export default async function plugin(bb: BbPluginApi) {
           case "hide-item": {
             if (rest.length !== 1) return { exitCode: 1, stderr: "Usage: bb radar hide-item <url|key|owner/repo#n>" };
             if (fetchedAt === "") await refreshAll();
-            const key = cliItemKey(rest[0]!, allItems());
+            // Board items, plus hidden ones so re-hiding says "Already hidden".
+            const key = cliItemKey(rest[0]!, [...shownItems(), ...hiddenItems]);
             const already = hiddenKeys.has(normKey(key));
             await hideItem(key);
             const entry = hiddenItems.find((candidate) => normKey(candidate.key) === normKey(key));

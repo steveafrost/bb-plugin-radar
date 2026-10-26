@@ -144,7 +144,7 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F4 CLI list/status show acknowledged mentions that the panel and badge hide", async () => {
+  it("F4 CLI list/status/scopes/hide-item agree with the panel: acknowledged mentions are gone", async () => {
     const ml = lane("mentions", "is:open mentions:@me");
     setState({ login: "steve", issueBody: "hey @steve please look", searches: [{ match: "mentions:@me", nodes: [node("o/r", 1, { __typename: "Issue" })] }] });
     const { harness } = await boot({}, [ml]);
@@ -154,10 +154,12 @@ describe("audit: integration", () => {
     const snap = (await harness.callRpc("radar_snapshot", null)) as { results: Record<string, { items: unknown[] }> };
     const cli = JSON.parse((await harness.runCli(["list", "--lane", "mentions", "--json"])).stdout);
     const status = (await harness.runCli(["status"])).stdout;
-    console.log("F4 panel items:", snap.results.mentions!.items.length, "CLI list items:", cli.length, "| status:", status.split("\n").at(-1));
     expect(snap.results.mentions!.items).toHaveLength(0);
-    expect(cli).toHaveLength(1);
-    expect(status).toMatch(/\s1\s+mentions \[mentions\]/);
+    expect(cli).toHaveLength(0);
+    expect(status).toMatch(/\s0\s+mentions \[mentions\]/);
+    const scopes = JSON.parse((await harness.runCli(["scopes", "--json"])).stdout) as { scopes: { key: string }[] };
+    expect(scopes.scopes.map((entry) => entry.key)).not.toContain("o/r");
+    expect((await harness.runCli(["hide-item", "github:o/r#1"])).exitCode).toBe(1);
     await harness.dispose();
   });
 
