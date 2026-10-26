@@ -454,7 +454,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure((context) => ({ tools: [], skills: selectedSkills(context.pluginMetadata) }));
 
   // Anything that can grow past kv's 256KB value cap lives in the plugin database: the label
-  // index (~5k names, ~300KB), per-item hides and the mention tracker.
+  // index (~5k names, ~300KB), per-item hides, the mention tracker and the results cache.
   const db = bb.storage.database();
   bb.storage.migrate(db, [
     "CREATE TABLE label_index (name TEXT PRIMARY KEY) WITHOUT ROWID",
@@ -466,6 +466,9 @@ export default async function plugin(bb: BbPluginApi) {
     "CREATE TABLE mention_items (account TEXT NOT NULL, key TEXT NOT NULL, entry TEXT NOT NULL, PRIMARY KEY (account, key)) WITHOUT ROWID",
     // Mention candidates: key = item key, candidate = { key, repo, number, kind, updatedAt } as JSON.
     "CREATE TABLE mention_candidates (key TEXT PRIMARY KEY, candidate TEXT NOT NULL) WITHOUT ROWID",
+    // Last refresh's lane results (result = LaneResult as JSON), so a restart shows what Radar knew.
+    "CREATE TABLE results_cache (lane_id TEXT PRIMARY KEY, query_key TEXT NOT NULL, result TEXT NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE results_meta (id INTEGER PRIMARY KEY CHECK (id = 1), fetched_at TEXT NOT NULL)",
   ]);
   const parseRow = (value: unknown): unknown => {
     try {
@@ -633,24 +636,43 @@ export default async function plugin(bb: BbPluginApi) {
   const results: Record<string, LaneResult> = {};
   let fetchedAt = "";
   // Last refresh's results, so a restart or reload shows what we knew instead of blank lanes.
-  const storedResults = resultsCacheSchema.safeParse(await bb.storage.kv.get<unknown>("resultsCache"));
-  if (storedResults.success) {
-    for (const lane of lanes) {
-      const cached = storedResults.data.lanes[lane.id];
-      if (cached !== undefined && cached.queryKey === laneQueryKey(lane)) results[lane.id] = { ...cached.result, loading: false };
+  type CachedLane = { laneId: string; queryKey: string; result: LaneResult };
+  const saveResultsRows = db.transaction((at: string, rows: CachedLane[]) => {
+    db.prepare("DELETE FROM results_cache").run();
+    const insert = db.prepare("INSERT INTO results_cache (lane_id, query_key, result) VALUES (?, ?, ?)");
+    for (const row of rows) insert.run(row.laneId, row.queryKey, JSON.stringify(row.result));
+    db.prepare("INSERT INTO results_meta (id, fetched_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET fetched_at = excluded.fetched_at").run(at);
+  });
+  // One-time move from kv, where it outgrew the 256KB value cap at about 650 items.
+  const kvResults = await bb.storage.kv.get<unknown>("resultsCache");
+  if (kvResults !== undefined) {
+    const parsed = resultsCacheSchema.safeParse(kvResults);
+    const empty = db.prepare("SELECT 1 FROM results_meta WHERE id = 1").get() === undefined;
+    if (parsed.success && empty) {
+      saveResultsRows(parsed.data.fetchedAt, Object.entries(parsed.data.lanes).map(([laneId, cached]) => ({ laneId, ...cached })));
     }
-    fetchedAt = storedResults.data.fetchedAt;
+    await bb.storage.kv.delete("resultsCache");
   }
-  const persistResults = () =>
-    bb.storage.kv.set("resultsCache", {
+  {
+    const meta = db.prepare("SELECT fetched_at FROM results_meta WHERE id = 1").get() as { fetched_at: string } | undefined;
+    const rows = db.prepare("SELECT lane_id, query_key, result FROM results_cache").all() as { lane_id: string; query_key: string; result: unknown }[];
+    const cached = new Map(rows.map((row) => [row.lane_id, row]));
+    for (const lane of lanes) {
+      const row = cached.get(lane.id);
+      if (row === undefined || row.query_key !== laneQueryKey(lane)) continue;
+      const result = laneResultSchema.safeParse(parseRow(row.result));
+      if (result.success) results[lane.id] = { ...result.data, loading: false };
+    }
+    if (meta !== undefined) fetchedAt = meta.fetched_at;
+  }
+  const persistResults = async () =>
+    saveResultsRows(
       fetchedAt,
-      lanes: Object.fromEntries(
-        lanes.flatMap((lane) => {
-          const result = results[lane.id];
-          return result === undefined || result.fetchedAt === "" ? [] : [[lane.id, { queryKey: laneQueryKey(lane), result: { ...result, loading: false } }]];
-        }),
-      ),
-    });
+      lanes.flatMap((lane) => {
+        const result = results[lane.id];
+        return result === undefined || result.fetchedAt === "" ? [] : [{ laneId: lane.id, queryKey: laneQueryKey(lane), result: { ...result, loading: false } }];
+      }),
+    );
   let refreshing = false;
   let githubLogin = "";
   /** The user's Gitstream principal (email) as `gs` resolved it. The REST API does not resolve @me. */

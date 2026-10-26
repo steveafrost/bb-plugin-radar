@@ -1,3 +1,6 @@
+import { copyFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { boot, calls, clearCalls, deltaRow, node, setState } from "./harness";
 
@@ -10,6 +13,17 @@ async function trackedKeys(bb: Bb): Promise<Record<string, unknown>> {
   const rows = db(bb).prepare("SELECT key, candidate FROM mention_candidates").all() as { key: string; candidate: string }[];
   return Object.fromEntries(rows.map((row) => [row.key, JSON.parse(row.candidate)]));
 }
+const here = new URL("./", import.meta.url).pathname;
+/** Boots Radar on a fresh fake host whose database is a copy of `file` (a restart). */
+async function restartOn(file: string, settings: Record<string, unknown>, lanes: unknown) {
+  const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
+  const host = createFakePluginHost({ pluginId: "radar", settings: { ghPath: join(here, "gh"), dtPath: join(here, "dt"), ...settings } as never });
+  const handle = host.bb.storage.database();
+  const target = handle.name;
+  handle.close();
+  copyFileSync(file, target);
+  return boot({}, lanes, { host });
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("audit: integration", () => {
@@ -21,7 +35,7 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F1 resultsCache exceeds the 256KB kv cap with 7 full lanes and is silently not written", async () => {
+  it("F1 a large results cache is kept in SQLite and shown again after a restart", async () => {
     const labels = { nodes: ["//areas/platform/payments", "Slice: billing", "ZoneID: 12", "#gsd:1234", "needs-review"].map((name) => ({ name })) };
     const searches = Array.from({ length: 7 }, (_, l) => ({
       match: `lane${l}`,
@@ -31,11 +45,36 @@ describe("audit: integration", () => {
     const lanes = searches.map((s, l) => lane(`l${l}`, `is:open ${s.match}`, { limit: 100 }));
     const { bb, harness } = await boot({ maxAgeDays: 0 }, lanes);
     expect((await harness.runCli(["refresh"])).exitCode).toBe(0);
-    const status = await harness.runCli(["status"]);
-    expect(status.stdout).toContain("100  l6");
+    expect((await harness.runCli(["status"])).stdout).toContain("100  l6");
     expect(await bb.storage.kv.get("resultsCache")).toBeUndefined();
-    expect(harness.logEntries.some((e) => e.level === "warn" && /results cache write failed.*256KB/.test(e.message))).toBe(true);
-    console.log("F1 warn:", harness.logEntries.find((e) => /results cache/.test(e.message))?.message.slice(0, 160));
+    expect(harness.logEntries.some((e) => /results cache write failed/.test(e.message))).toBe(false);
+    const fetchedAt = ((await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string }).fetchedAt;
+    // Restart: a fresh host on a copy of the same database, with every host call failing.
+    const file = join(mkdtempSync(join(tmpdir(), "radar-restart-")), "data.db");
+    await db(bb).backup(file);
+    await harness.dispose();
+    setState({ searches: [] });
+    const second = await restartOn(file, { maxAgeDays: 0 }, lanes);
+    const snap = (await second.harness.callRpc("radar_snapshot", null)) as { fetchedAt: string; results: Record<string, { items: unknown[] }> };
+    expect(snap.fetchedAt).toBe(fetchedAt);
+    expect(lanes.map((l) => snap.results[l.id]?.items.length)).toEqual([100, 100, 100, 100, 100, 100, 100]);
+    await second.harness.dispose();
+  });
+
+  it("F1b a kv resultsCache moves to SQLite on load", async () => {
+    const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
+    const host = createFakePluginHost({ pluginId: "radar", settings: { ghPath: join(here, "gh"), dtPath: join(here, "dt") } as never });
+    const a = lane("a", "is:open alpha");
+    const { laneQueryKey } = await import("../../lanes");
+    const result = { laneId: "a", items: [{ key: "github:o/r#1", source: "github", kind: "pr", repo: "o/r", number: 1, title: "t", url: "https://github.com/o/r/pull/1", author: "x", draft: false, state: "OPEN", labels: [], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", isNew: false }], fetched: 1, error: "", fetchedAt: "2026-01-01T00:00:00Z", loading: false };
+    await host.bb.storage.kv.set("resultsCache", { fetchedAt: "2026-01-01T00:00:01Z", lanes: { a: { queryKey: laneQueryKey(a as never), result } } });
+    setState({ searches: [] });
+    const { bb, harness } = await boot({}, [a], { host });
+    expect(await bb.storage.kv.get("resultsCache")).toBeUndefined();
+    const snap = (await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string; results: Record<string, { items: unknown[] }> };
+    expect(snap.fetchedAt).toBe("2026-01-01T00:00:01Z");
+    expect(snap.results.a!.items).toHaveLength(1);
+    expect((db(bb).prepare("SELECT COUNT(*) AS n FROM results_cache").get() as { n: number }).n).toBe(1);
     await harness.dispose();
   });
 
@@ -130,8 +169,6 @@ describe("audit: integration", () => {
 
   it("F5c mention state and candidates in kv move to SQLite on load", async () => {
     const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
-    const { join } = await import("node:path");
-    const here = new URL("./", import.meta.url).pathname;
     const host = createFakePluginHost({ pluginId: "radar", settings: { ghPath: join(here, "gh"), dtPath: join(here, "dt") } as never });
     const entry = { generation: 2, acknowledged: 1, content: { body: { fingerprint: "f", mentioned: true } }, pending: null, readBarrier: false };
     await host.bb.storage.kv.set("mentions", { version: 1, accounts: { '["github.com","steve"]': { scope: "github.com", login: "steve", error: null, items: { "github:o/r#1": entry } } } });
