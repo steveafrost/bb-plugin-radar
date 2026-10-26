@@ -4,7 +4,7 @@ Radar is a live panel of the pull requests and issues that need you, on **GitHub
 
 A lane is a saved query that can hit several hosts at once. The defaults cover reviews requested from you, mentions, assigned items and your own open PRs. Results merge by last update, with unseen items marked and an unseen count on Radar's rail icon.
 
-- **Describe what to track** in plain words ("PRs from my team that touch billing, not drafts") and an OpenAI-compatible model drafts a lane for you.
+- **Describe what to track** in plain words ("PRs from my team that touch billing, not drafts") and bb's configured AI drafts a lane for you.
 - **Edit a lane** in a form with per-host sections, a live summary, chip inputs, and server-side filters for Gitstream history lanes.
 - **All**, **Issues**, **Pull requests** and **Reviews** views, switched from the panel title bar. Each lane has a category, inferred from its query or picked in the editor, that decides its view; All shows every lane.
 
@@ -34,4 +34,4 @@ Radar threads get skills attached:
 ## Requirements
 
 - `gh` signed in to GitHub. For Delta, `dt` signed in plus the host and repo in settings (and a checkout path for Rebase); for Gitstream history, `gs` plus the history toggle. Lanes skip sources that are not set up.
-- An OpenAI-compatible API key in the bb server environment (`OPENAI_API_KEY` by default; base URL, key variable and model are settings) for drafting lanes and focus.
+- For drafting lanes and focus: a bb build with configured-provider AI, or the optional OpenAI-compatible fallback (base URL, the name of a bb server env var holding the key, and model, all in settings). Without either, Focus still matches repo and area names.

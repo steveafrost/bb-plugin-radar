@@ -2,14 +2,14 @@
 
 A live bb panel of the pull requests and issues that need you, on GitHub and a
 Delta repo (the primary host for repos that moved off GitHub/Gitstream), plus
-optional read-only Gitstream history. No backing site or database: every
+optional read-only Gitstream history. No backing site or remote database: every
 lane is a saved query that the bb server re-runs on an interval, and the panel
 shows whatever is current.
 
 - **Lanes**: each lane reads one or more hosts and merges the results:
   - Delta: the GitHub-syntax query via `dt api search/issues` (`author:@me` and
     `review-requested:@me` resolve server-side; `archived:` is stripped; Delta
-    rejects `mentions:` and `involves:`). Radar never uses `dt pr list --author`.
+    has pull requests only, rejecting `is:issue`, `mentions:` and `involves:`). Radar never uses `dt pr list --author`.
   - GitHub: search query via `gh api graphql`.
   - Gitstream history (off by default): `gs api repos/<repo>/pulls` reads only.
     Gitstream no longer accepts PR writes, so it is labelled "<name> history",
@@ -78,9 +78,9 @@ shows whatever is current.
   (areas come from its `//<group>/<name>` path labels; items without one fall in
   "<repo> (no area)"), and every lane,
   every view, the view counts and the rail badge drop the rest. Hidden items do not
-  count as new and stay unseen. While Focus is on, a banner names the focus and how
-  many items it hides; "Turn off" restores the normal board and keeps the focus to
-  resume. The Focus popover also lists the repos/areas in the view with counts to
+  count as new and stay unseen. While Focus is on, the Filter button shows a dot and its
+  menu names the focus and how many items it filters out; "Turn off" restores the
+  normal board and keeps the focus to resume. The Focus popover also lists the repos/areas in the view with counts to
   hide (eye) or "Only" one by hand. Without AI it matches repo/area names.
 - **Hide one item**: the eye-off row action ("Hide from Radar") takes one PR or
   issue off every lane, view, view count and the rail badge at once (optimistic),
@@ -102,7 +102,7 @@ can be too big for kv's 256KB value cap, so they live in the plugin database
 `{ key, source, kind, repo, number, title, url, hiddenAt, lastSeenAt }`, validated on load,
 bad rows dropped).
 
-AI execution requires a BB development build exposing `experimental_ai.complete`. On older hosts Radar reports that the API is unsupported, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced; there is no credential fallback. Focus also falls back to name matching after a provider error.
+AI execution uses a BB build exposing `experimental_ai.complete`. On other hosts, the AI fallback (`aiBaseUrl` https only, `aiKeyEnv`, `aiModel`; all three required) sends the key from that bb server environment variable to that endpoint; with neither, Radar reports that AI is unavailable, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced. Focus also falls back to name matching after a provider error.
 
 Settings use an **AI & focus** section for model selection and label prefixes for **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**. The current SDK has neither grouped nor provider/model setting descriptors. Its picker currently requires a concrete value, so Radar wraps it in an optional, explicitly saved override editor rather than passing `null` to the host component.
 

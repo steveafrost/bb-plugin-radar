@@ -98,6 +98,22 @@ export function laneInView(lane: { category: Category }, view: View): boolean {
 }
 
 /**
+ * Lane ids after moving `id` one place up (-1) or down (+1) among the lanes this view shows.
+ * Lanes from other categories keep their slots, so All's order only changes between the two
+ * lanes that swapped. null when the lane is already first/last in the view.
+ */
+export function moveInView<L extends { id: string; category: Category }>(lanes: readonly L[], id: string, delta: -1 | 1, view: View): string[] | null {
+  const index = lanes.findIndex((lane) => lane.id === id);
+  if (index < 0) return null;
+  let target = index + delta;
+  while (target >= 0 && target < lanes.length && !laneInView(lanes[target]!, view)) target += delta;
+  if (target < 0 || target >= lanes.length) return null;
+  const ids = lanes.map((lane) => lane.id);
+  [ids[index], ids[target]] = [ids[target]!, ids[index]!];
+  return ids;
+}
+
+/**
  * Items inside a lane: the Pull requests and Issues views keep only that kind, so a
  * mixed lane moved there by hand reads as its name says. Reviews and All show
  * everything the lane returns.
@@ -228,6 +244,22 @@ export const lanesSchema = z
       seen.add(lane.id);
     });
   });
+
+/** Default lanes the board doesn't already have, by id or by the same query on the same hosts. */
+export function missingDefaults(lanes: readonly Lane[]): Lane[] {
+  const norm = (query: string | undefined) => (query ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return DEFAULT_LANES.filter(
+    (lane) =>
+      !lanes.some(
+        (have) =>
+          have.id === lane.id ||
+          (norm(have.query) !== "" && norm(have.query) === norm(lane.query) && lane.sources.every((source) => have.sources.includes(source))),
+      ),
+  );
+}
+
+/** Qualifiers Delta's search rejects (it only has pull requests); a lane using one can't read Delta. */
+export const DELTA_UNSUPPORTED = /(^|\s)(-?is:issue|type:issue|-is:pr|-type:pr|mentions:|involves:)/i;
 
 export const DEFAULT_LANES: Lane[] = [
   {
@@ -602,7 +634,7 @@ export function draftPrompt(
       ? `- One lane can read several hosts. Personal queues ("my PRs", "reviews requested") should use every live source: ${JSON.stringify(live)}.`
       : "",
     delta !== null
-      ? `- ${dt} is the primary, live host for ${delta.repo}. It runs "query" too, supporting is:pr, is:open, review-requested:, author:, reviewed-by:, assignee:, label:"x", -is:draft. It rejects mentions:, involves: (so leave delta out of those lanes); archived: is stripped automatically.
+      ? `- ${dt} is the primary, live host for ${delta.repo}. It runs "query" too, supporting is:pr, is:open, review-requested:, author:, reviewed-by:, assignee:, label:"x", -is:draft. It has pull requests only and rejects is:issue, mentions:, involves: (so leave delta out of issue and mention lanes); archived: is stripped automatically.
   The repo can be busy, so narrow other people's PRs there with label:"<exact name>" and/or a distinctive word; filter.* is only for small refinements.
   ${labels}`
       : "",
@@ -656,6 +688,8 @@ Existing lanes (avoid duplicating them): ${JSON.stringify(context.existing.map((
   return { system, user: description };
 }
 
+const DRAFT_KEYS = new Set(["id", "title", "sources", "query", "gitstream", "filter", "limit", "category", "collapsed"]);
+
 /** The model's raw text → a lane missing only its id. Throws with a user-facing message. */
 export function parseDraft(text: string): Omit<Lane, "id"> {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -669,11 +703,34 @@ export function parseDraft(text: string): Omit<Lane, "id"> {
   } catch {
     throw new Error("The model returned malformed JSON. Try again.");
   }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("The model did not return a lane. Try rephrasing.");
   const candidate: Record<string, unknown> = { ...(raw as Record<string, unknown>), id: "draft" };
   // Drop the field that does not apply to the chosen source rather than reject it.
   if (typeof candidate.source === "string" && candidate.sources === undefined) candidate.sources = [candidate.source];
   delete candidate.source;
-  const sources = Array.isArray(candidate.sources) ? candidate.sources : [];
+  // Models often add commentary keys or null optional fields; neither makes the lane wrong.
+  for (const key of Object.keys(candidate)) if (!DRAFT_KEYS.has(key)) delete candidate[key];
+  for (const key of ["query", "gitstream", "filter", "limit", "category"]) if (candidate[key] === null) delete candidate[key];
+  for (const nested of ["filter", "gitstream"]) {
+    const value = candidate[nested];
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      candidate[nested] = Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== null));
+    }
+  }
+  if (typeof candidate.limit === "number" && Number.isFinite(candidate.limit)) {
+    candidate.limit = Math.min(100, Math.max(1, Math.round(candidate.limit)));
+  }
+  const enabled = enabledSources();
+  let sources = Array.isArray(candidate.sources) ? candidate.sources.filter((source): source is Source => typeof source === "string" && (enabled as string[]).includes(source)) : [];
+  if (Array.isArray(candidate.sources) && candidate.sources.length > 0 && sources.length === 0) {
+    throw new Error(`The drafted lane used a host that isn't set up (${candidate.sources.join(", ")}). Try rephrasing.`);
+  }
+  // Delta has pull requests only and rejects issue/mention qualifiers: keep the lane on the other hosts.
+  if (sources.includes("delta") && DELTA_UNSUPPORTED.test(String(candidate.query ?? ""))) {
+    sources = sources.filter((source) => source !== "delta");
+    if (sources.length === 0) throw new Error("Delta has pull requests only and can't search issues, mentions: or involves:. Try rephrasing.");
+  }
+  candidate.sources = sources;
   if (!sources.includes("gitstream")) delete candidate.gitstream;
   if (!sources.includes("github") && !sources.includes("delta")) delete candidate.query;
   // The model's category is validated here; missing or invalid falls back to inference.
@@ -717,7 +774,7 @@ export function reviewPrompt(item: Item): string {
     item.source === "gitstream"
       ? "the `gs` CLI, read-only (this is Gitstream history: it no longer accepts PR writes, so nothing can be posted there; if the work moved, look for the matching Delta PR)"
       : item.source === "delta"
-        ? `the \`dt\` CLI (\`dt --host ${hosts().delta?.host ?? "<host>"} -R ${repo} pr view ${item.number}\`, \`pr diff\`, \`pr checks\`)`
+        ? `the \`dt\` CLI (\`dt --host ${hosts().delta?.host ?? "<host>"} -R ${repo} pr view ${item.number} --comments\`, \`pr diff ${item.number}\`, \`pr checks ${item.number}\`)`
         : "the `gh` CLI";
   const ref = `${repo}#${item.number}`;
   const tag = item.kind === "pr" ? "pull_request_data" : "issue_data";

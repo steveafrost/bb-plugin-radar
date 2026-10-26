@@ -8,7 +8,7 @@ description: How to triage an issue opened from the Radar panel (GitHub or Delta
 The opening message names the issue (`owner/repo#number`) and its URL.
 
 - GitHub: `gh issue view N -R owner/repo --comments`
-- Delta: `dt --host <host> -R owner/repo issue view N --comments` (the host is in the issue URL)
+- Delta has pull requests only, so Radar never opens Delta issues; for a Delta PR use the radar-review skill.
 
 ## Steps
 

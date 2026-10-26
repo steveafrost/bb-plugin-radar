@@ -14,7 +14,7 @@ import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin
 import { mountRailBadge } from "./badge";
 import type { AiOverride } from "./ai";
 import type { ExperimentalProviderModelPickerValue } from "@get-bb/plugin-sdk/app";
-import { CATEGORY_LABEL, enabledSources, itemInView, laneInView, SOURCE_LABEL, SOURCES, viewFrom, VIEWS, type Category, type Source, type View } from "./lanes";
+import { CATEGORY_LABEL, enabledSources, itemInView, laneInView, moveInView, SOURCE_LABEL, SOURCES, viewFrom, VIEWS, type Category, type Source, type View } from "./lanes";
 
 const sourceHint = (source: Source): string => {
   const { gitstream, delta } = hosts();
@@ -35,7 +35,25 @@ import { DEFAULT_SKILL_SETTINGS, threadSkills, type SkillSettings } from "./revi
 import { summarizeLane } from "./lane-summary";
 import { draftCategory, draftInferredCategory, fromDraft, gitstreamScoped, pickCategory, toDraft, type Draft, type ListKey } from "./lane-draft";
 import { applyPending, type PendingOp } from "./optimistic";
+import { createEscapeStack } from "./escape";
 import "./app.css";
+
+const escapes = createEscapeStack();
+const onEscapeKey = (event: KeyboardEvent) => void escapes.handle(event);
+/** While `active`, Escape runs `handler` if this is the most recently opened Radar surface. */
+function useEscape(active: boolean, handler: () => void) {
+  const latest = useRef(handler);
+  latest.current = handler;
+  useEffect(() => {
+    if (!active) return;
+    const off = escapes.push(() => latest.current());
+    if (escapes.size === 1) window.addEventListener("keydown", onEscapeKey);
+    return () => {
+      off();
+      if (escapes.size === 0) window.removeEventListener("keydown", onEscapeKey);
+    };
+  }, [active]);
+}
 
 const LANE_PREVIEW = 8;
 
@@ -228,10 +246,11 @@ function ItemRow({ item }: { item: RadarItem }) {
   const showRebase = actions !== null && canRebase(item, actions.viewer);
   return (
     <li className="radar-item" data-new={item.isNew || undefined}>
-      <span className="radar-item__dot" aria-label={item.isNew ? "new" : undefined} />
+      <span className="radar-item__dot" aria-hidden="true" />
       <Glyph name={item.kind === "pr" ? "pr" : "issue"} className="radar-item__kind" />
       <div className="radar-item__main">
         <UrlLink className="radar-item__title" href={item.url}>
+          {item.isNew ? <span className="radar-sr">New: </span> : null}
           {item.title}
         </UrlLink>
         <div className="radar-item__meta">
@@ -251,7 +270,7 @@ function ItemRow({ item }: { item: RadarItem }) {
       {actions !== null ? (
         <span className="radar-item__actions" data-active={rebaseActive || undefined}>
           <ActionIcon icon="eyeOff" label="Hide from Radar" tip="Hide from Radar" onClick={() => actions.hide(item)} />
-          {item.canAcknowledge ? <button type="button" className="radar-act radar-act--acknowledge" title="Clear this mention and mark its GitHub notification read" onClick={() => actions.acknowledge(item)}>Acknowledge</button> : null}
+          {item.canAcknowledge ? <ActionIcon icon="check" label="Acknowledge" tip="Clear this mention and mark its GitHub notification read" onClick={() => actions.acknowledge(item)} /> : null}
           {showRebase ? <RebaseAction item={item} rebase={actions.rebase} onActive={setRebaseActive} /> : null}
           {threadId !== undefined ? (
             <ActionIcon icon="external" label="Open thread" tip="Open the bb thread started for this" onClick={() => actions.open(threadId)} />
@@ -382,26 +401,21 @@ function FocusControl({
   useEffect(() => {
     if (!menuOpen) return;
     const close = () => { setMenuOpen(false); setOpen(false); };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (open) {
-        setOpen(false);
-        requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".radar-filter__zen")?.focus());
-      } else {
-        close();
-        document.querySelector<HTMLButtonElement>(".radar-filter__trigger")?.focus();
-      }
-    };
     const onDown = (event: MouseEvent) => {
       if (!(event.target as Element | null)?.closest?.(".radar-filter")) close();
     };
-    window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onDown);
-    };
-  }, [menuOpen, open]);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+  useEscape(menuOpen, () => {
+    if (open) {
+      setOpen(false);
+      requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".radar-filter__zen")?.focus());
+    } else {
+      setMenuOpen(false);
+      document.querySelector<HTMLButtonElement>(".radar-filter__trigger")?.focus();
+    }
+  });
   const submit = () => {
     if (text.trim().length < 2 || busy) return;
     setBusy(true);
@@ -561,12 +575,15 @@ function RadarHeader() {
 
 function HiddenControl({
   count,
+  revision,
   load,
   onUnhide,
 }: {
   count: number;
+  /** Changes when a hide settles on the server, so one that lands after opening shows up. */
+  revision: number;
   load: () => Promise<HiddenEntry[] | null>;
-  onUnhide: (key: string | "all") => Promise<void>;
+  onUnhide: (key: string | "all") => Promise<boolean>;
 }) {
   const [open, setOpen] = useState(false);
   const [entries, setEntries] = useState<HiddenEntry[] | null>(null);
@@ -575,30 +592,27 @@ function HiddenControl({
     let active = true;
     void load().then((list) => { if (active && list !== null) setEntries(list); });
     return () => { active = false; };
-  }, [open, count, load]);
+  }, [open, count, revision, load]);
   useEffect(() => {
     if (!open) return;
-    const close = () => setOpen(false);
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      close();
-      document.querySelector<HTMLButtonElement>(".radar-hidden__trigger")?.focus();
-    };
     const onDown = (event: MouseEvent) => {
-      if (!(event.target as Element | null)?.closest?.(".radar-hidden")) close();
+      if (!(event.target as Element | null)?.closest?.(".radar-hidden")) setOpen(false);
     };
-    window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onDown);
-    };
+    return () => window.removeEventListener("mousedown", onDown);
   }, [open]);
+  useEscape(open, () => {
+    setOpen(false);
+    document.querySelector<HTMLButtonElement>(".radar-hidden__trigger")?.focus();
+  });
   useEffect(() => { if (count === 0) setOpen(false); }, [count]);
   if (count === 0 && !open) return null;
   const unhide = (key: string | "all") => {
     setEntries((list) => (list === null ? list : key === "all" ? [] : list.filter((entry) => entry.key !== key)));
-    void onUnhide(key);
+    // A failed unhide leaves the count unchanged, so the effect above won't reload; do it here.
+    void onUnhide(key).then((ok) => {
+      if (!ok) void load().then((list) => { if (list !== null) setEntries(list); });
+    });
   };
   const tip = `${count} item${count === 1 ? "" : "s"} hidden from Radar`;
   return (
@@ -682,7 +696,7 @@ function LaneCard({
   onToggle: () => void;
   onEdit: () => void;
   onDelete: () => void;
-  onMove: (delta: number) => void;
+  onMove: (delta: -1 | 1) => void;
   onSeen: () => void;
   onRefresh: () => void;
 }) {
@@ -702,7 +716,14 @@ function LaneCard({
   return (
     <section className="radar-lane" data-collapsed={collapsed || undefined}>
       <header className="radar-lane__head">
-        <button type="button" className="radar-lane__toggle" onClick={onToggle}>
+        <button
+          type="button"
+          className="radar-lane__toggle"
+          aria-expanded={!collapsed}
+          disabled={query !== ""}
+          title={`${items.length} item${items.length === 1 ? "" : "s"}${fresh > 0 ? ` · ${fresh} new` : ""}`}
+          onClick={onToggle}
+        >
           <Glyph name={collapsed ? "chevronRight" : "chevronDown"} className="radar-icon" />
           <span className="radar-lane__title">{lane.title}</span>
           {result?.loading ? <Glyph name="spinner" className="radar-icon radar-spin" /> : null}
@@ -1095,11 +1116,9 @@ function TrackBox({
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && !busy && trackBox.set(false);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [busy]);
+  useEscape(true, () => {
+    if (!busy) trackBox.set(false);
+  });
   const submit = () => {
     if (text.trim().length < 3 || busy) return;
     setBusy(true);
@@ -1201,16 +1220,34 @@ function ReviewSheet({
   onSubmit: NewThreadComposerProps["onSubmit"];
   onClose: () => void;
 }) {
+  useEscape(true, onClose);
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+    // Give focus back to the row's action when the sheet closes.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (opener?.isConnected) opener.focus();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
+  /** Keep Tab inside the sheet; the board behind it is only dimmed. */
+  const trapTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => element.offsetParent !== null);
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (first === undefined || last === undefined) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
   return (
-    <div className="radar-sheet" role="dialog" aria-label={context.title} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="radar-sheet__panel">
+    <div className="radar-sheet" role="dialog" aria-modal="true" aria-label={context.title} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="radar-sheet__panel" onKeyDown={trapTab}>
         <header className="radar-sheet__head">
           <div className="radar-sheet__title">
             <strong>{item.kind === "pr" ? "Review" : "Triage"}</strong>
@@ -1246,6 +1283,8 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const [undo, setUndo] = useState<{ key: string; title: string } | null>(null);
   /** In-flight hides, so an Undo can't reach the server before its hide. */
   const hiding = useRef(new Map<string, Promise<unknown>>());
+  /** Bumped when a hide settles on the server, so an open Hidden list refetches. */
+  const [hiddenRevision, setHiddenRevision] = useState(0);
   useEffect(() => {
     if (undo === null) return;
     const timer = setTimeout(() => setUndo(null), 6000);
@@ -1254,7 +1293,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const unhide = useCallback(
     async (key: string | "all") => {
       await Promise.all(key === "all" ? [...hiding.current.values()] : [hiding.current.get(key)]);
-      await mutate(rpc.call("radar_unhide_item", key === "all" ? { all: true } : { key }));
+      return (await mutate(rpc.call("radar_unhide_item", key === "all" ? { all: true } : { key }))) !== null;
     },
     [mutate, rpc],
   );
@@ -1278,7 +1317,10 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
           if (next === null) setUndo((current) => (current?.key === item.key ? null : current));
         });
         hiding.current.set(item.key, done);
-        void done.finally(() => { if (hiding.current.get(item.key) === done) hiding.current.delete(item.key); });
+        void done.finally(() => {
+          if (hiding.current.get(item.key) === done) hiding.current.delete(item.key);
+          setHiddenRevision((value) => value + 1);
+        });
       },
       acknowledge: (item: RadarItem) => { void optimistic({ kind: "acknowledge", key: item.key }, rpc.call("radar_acknowledge", { key: item.key })); },
       open: (threadId: string) => navigate.toThread(threadId),
@@ -1323,12 +1365,9 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
     }
     return next !== null;
   };
-  const move = (index: number, delta: number) => {
-    const ids = lanes.map((lane) => lane.id);
-    const target = index + delta;
-    if (target < 0 || target >= ids.length) return;
-    [ids[index], ids[target]] = [ids[target]!, ids[index]!];
-    void mutate(rpc.call("radar_lanes_reorder", { ids }));
+  const move = (id: string, delta: -1 | 1) => {
+    const ids = moveInView(lanes, id, delta, view);
+    if (ids !== null) void mutate(rpc.call("radar_lanes_reorder", { ids }));
   };
 
   const visibleLanes = lanes
@@ -1384,7 +1423,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
               </svg>
             </button>
             <span className="radar-toolbar-sep" aria-hidden="true" />
-            <HiddenControl count={snapshot?.hiddenCount ?? 0} load={loadHidden} onUnhide={unhide} />
+            <HiddenControl count={snapshot?.hiddenCount ?? 0} revision={hiddenRevision} load={loadHidden} onUnhide={unhide} />
             <button
               type="button"
               className="radar-icon-btn"
@@ -1472,7 +1511,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
             onDelete={() => {
               if (window.confirm(`Remove the “${lane.title}” lane?`)) void mutate(rpc.call("radar_lane_delete", { laneId: lane.id }));
             }}
-            onMove={(delta) => move(lanes.indexOf(lane), delta)}
+            onMove={(delta) => move(lane.id, delta)}
             onSeen={() => void optimistic({ kind: "seen", laneId: lane.id, view }, rpc.call("radar_mark_seen", { laneId: lane.id, view }))}
             onRefresh={() => void mutate(rpc.call("radar_refresh", { laneId: lane.id }))}
           />

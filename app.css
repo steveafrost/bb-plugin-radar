@@ -89,20 +89,18 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   height: 36px;
   font-size: 14px;
 }
-.radar-bar .radar-view-select,
+
 .radar-bar .radar-focus {
   border: 0;
   background: transparent;
   color: var(--r-muted);
 }
-.radar-bar .radar-view-select:hover,
+
 .radar-bar .radar-focus:hover {
   background: var(--r-fill);
   color: var(--r-text);
 }
-.radar-bar .radar-view-select:focus:not(:focus-visible) {
-  outline: none;
-}
+
 .radar-bar .radar-focus[data-on] {
   background: transparent;
   color: var(--r-accent);
@@ -111,21 +109,15 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   width: 36px;
   height: 36px;
 }
-.radar-bar .radar-icon,
-.radar-bar .radar-views__icon {
+.radar-bar .radar-icon {
   width: 20px;
   height: 20px;
 }
-.radar-bar button:focus-visible,
-.radar-bar .radar-view-select:focus-visible {
+.radar-bar button:focus-visible {
   outline: 2px solid var(--r-accent);
   outline-offset: 2px;
 }
-.radar-view-select {
-  width: auto;
-  max-width: 130px;
-  flex: none;
-}
+
 .radar-toolbar-sep {
   height: 16px;
   width: 1px;
@@ -150,20 +142,7 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
 @media (prefers-reduced-motion: reduce) {
   .radar-icon--spinning { animation: none; }
 }
-.radar-pill {
-  border: 1px solid var(--r-line);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--r-muted);
-  padding: 2px 10px;
-  cursor: pointer;
-  font: inherit;
-}
-.radar-pill[aria-pressed="true"] {
-  border-color: var(--r-accent);
-  color: var(--r-text);
-  background: color-mix(in oklab, var(--r-accent) 14%, transparent);
-}
+
 .radar-search {
   flex: 1;
   min-width: 0;
@@ -322,21 +301,6 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
 .radar-lane__tools:focus-within {
   opacity: 1;
 }
-.radar-count {
-  min-width: 20px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--r-fill);
-  color: var(--r-muted);
-  font-size: var(--text-xs, 0.75rem);
-  text-align: center;
-  line-height: 18px;
-}
-.radar-count--new {
-  background: color-mix(in oklab, var(--r-accent) 18%, transparent);
-  color: var(--r-accent);
-  font-weight: 600;
-}
 
 /* items */
 .radar-items {
@@ -400,10 +364,13 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   color: var(--r-faint);
   font-size: var(--text-xs, 0.75rem);
 }
+/* Fixed-width age keeps the action icons in one column across cards. */
 .radar-item__age {
+  min-width: 4ch;
+  padding-top: 2px;
   color: var(--r-faint);
   font-size: var(--text-xs, 0.75rem);
-  padding-top: 2px;
+  text-align: right;
 }
 .radar-chip {
   display: inline-block;
@@ -732,11 +699,11 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
 
 .radar-item__actions {
   display: flex;
-  gap: 4px;
+  gap: 2px;
+  margin-right: -4px;
   align-self: center;
 }
-.radar-item__review,
-.radar-item__thread,
+
 .radar-item__rebase {
   border: 1px solid var(--r-line);
   border-radius: 6px;
@@ -747,11 +714,7 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   padding: 2px 8px;
   cursor: pointer;
 }
-.radar-item__thread {
-  color: var(--r-muted);
-}
-.radar-item__review:hover,
-.radar-item__thread:hover,
+
 .radar-item__rebase:hover:not(:disabled) {
   background: var(--r-fill);
 }
@@ -850,56 +813,12 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
 }
 
 /* bb's "Close pane" × has no use on Radar's single-pane board and the SDK has no
-   opt-out, so hide it only in the title bar that holds Radar's header content. */
-:has(> * > .radar-views) > button[aria-label="Close pane"] {
+   opt-out, so hide it only in the title bar that holds Radar's header content
+   (.radar-header-anchor, rendered through navPanel.headerContent). */
+header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   display: none;
 }
 
-/* Title-bar view toggle (navPanel headerContent): icon tabs, then Focus. */
-.radar.radar-views {
-  display: inline-flex;
-  align-items: center;
-  flex: none;
-  height: auto;
-  overflow: visible;
-  gap: 4px;
-  background: transparent;
-}
-.radar-views__tab:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.radar-views__tabs {
-  display: inline-flex;
-  gap: 2px;
-}
-.radar-views__tab {
-  position: relative;
-  display: inline-grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--r-radius-sm);
-  background: transparent;
-  color: var(--r-muted);
-  cursor: pointer;
-}
-.radar-views__tab:hover {
-  background: color-mix(in oklab, var(--r-fill) 60%, transparent);
-  color: var(--r-text);
-}
-.radar-views__tab[aria-selected="true"],
-.radar-views__tab[aria-expanded="true"],
-.radar-views__tab[aria-pressed="true"] {
-  background: var(--r-fill);
-  color: var(--r-text);
-}
-.radar-views__icon {
-  width: 18px;
-  height: 18px;
-}
 .radar-views__dot {
   position: absolute;
   top: 6px;
@@ -910,12 +829,7 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   background: var(--r-accent);
   box-shadow: 0 0 0 2px var(--canvas, var(--background));
 }
-.radar-views__sep {
-  width: 1px;
-  height: 18px;
-  margin: 0 4px;
-  background: var(--r-line);
-}
+
 .radar-focus[data-on] {
   color: var(--r-accent);
   background: color-mix(in oklab, var(--r-accent) 14%, transparent);
@@ -924,19 +838,12 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   color: var(--r-accent);
   background: color-mix(in oklab, var(--r-accent) 22%, transparent);
 }
-.radar-chip--source + .radar-chip--source {
-  margin-left: 4px;
-}
 
 /* Focus: hide repos / area-repo areas across every lane. */
 .radar-scope {
   position: relative;
 }
-.radar-count--warn {
-  background: color-mix(in oklab, var(--r-accent) 18%, transparent);
-  color: var(--r-accent);
-  font-weight: 600;
-}
+
 .radar-scope__pop {
   position: absolute;
   z-index: 30;
@@ -1198,9 +1105,7 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.radar-scope__owner {
-  color: var(--r-faint);
-}
+
 .radar-scope__row[data-off] .radar-scope__toggle,
 .radar-scope__row[data-off] .radar-scope__counts {
   opacity: 0.45;
@@ -1306,11 +1211,6 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
 
 /* Row actions appear only while that row is hovered or focused; a rebase in progress
    (confirm, busy, result) stays visible. */
-.radar-item__actions {
-  gap: 2px;
-  margin-right: -4px;
-  opacity: 1;
-}
 .radar-item .radar-item__actions > * {
   opacity: 0;
   transition: opacity 120ms;
@@ -1331,12 +1231,7 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   color: var(--r-muted);
   cursor: pointer;
 }
-.radar-act--acknowledge {
-  width: auto;
-  padding-inline: 8px;
-  font-size: 12px;
-  white-space: nowrap;
-}
+
 .radar-act:hover {
   background: var(--r-fill);
   color: var(--r-text);
@@ -1377,11 +1272,6 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   .radar-act[data-tip]::after {
     transition: none;
   }
-}
-/* Fixed-width age keeps the action icons in one column across cards. */
-.radar-item__age {
-  min-width: 4ch;
-  text-align: right;
 }
 /* Icons sit on the timestamp's line (the title's first line), not the card's middle:
    pull the 24px buttons up so their centre meets the age text's centre. */
@@ -1478,4 +1368,15 @@ header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
   white-space: nowrap;
   color: var(--r-faint);
   font-size: 11px;
+}
+
+/* Text for screen readers only (e.g. "New:" before an unseen item's title). */
+.radar-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }

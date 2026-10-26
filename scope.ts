@@ -331,16 +331,30 @@ export function parseFocusReply(text: string, known: string[]): FocusChoice {
 const NEGATION = /\b(no|not|don'?t|dont|without|hide|hiding|except|exclude|excluding|minus|skip|ignore|less)\b/i;
 
 /**
- * Offline fallback when no AI is configured: scopes whose last path segment
- * appears in the text, hidden if the text negates, else focused.
+ * Offline fallback when no AI is configured: scopes whose last path segment appears in the
+ * text. Each clause ("only mobile, no billing") decides on its own: a negation in that
+ * clause hides its hits, otherwise they're focused.
  */
 export function heuristicFocus(description: string, known: string[]): FocusChoice {
-  const text = ` ${description.toLowerCase().replace(/[^a-z0-9/_.-]+/g, " ")} `;
-  const hits = [...new Set(known)].filter((key) => {
-    const tail = lower(key === NO_AREA ? "no-area" : key.split("/").filter(Boolean).pop() ?? key);
-    return tail.length >= 4 && (text.includes(` ${tail} `) || text.includes(` ${lower(key)} `));
-  });
-  if (hits.length === 0) throw new Error("That did not match any repository or area on the board.");
-  const choice = NEGATION.test(description) ? { focus: [], hidden: hits } : { focus: hits, hidden: [] };
+  const unique = [...new Set(known)];
+  const tailOf = (key: string) => lower(key === NO_AREA ? "no-area" : key.split("/").filter(Boolean).pop() ?? key);
+  const focus: string[] = [];
+  const hidden: string[] = [];
+  for (const clause of description.toLowerCase().split(/[,;.]|\bbut\b|\band\b/)) {
+    const text = ` ${clause.replace(/[^a-z0-9/_.-]+/g, " ")} `;
+    const hits = unique.filter((key) => {
+      const tail = tailOf(key);
+      return tail.length >= 4 && (text.includes(` ${tail} `) || text.includes(` ${lower(key)} `));
+    });
+    if (hits.length === 0) continue;
+    // "no-area" is a name, not a negation.
+    const negated = NEGATION.test(clause.replace(/no-area/g, " "));
+    for (const key of hits) {
+      const target = negated ? hidden : focus;
+      if (!focus.includes(key) && !hidden.includes(key)) target.push(key);
+    }
+  }
+  if (focus.length === 0 && hidden.length === 0) throw new Error("That did not match any repository or area on the board.");
+  const choice = { focus, hidden };
   return { ...choice, summary: describeScope(choice) };
 }

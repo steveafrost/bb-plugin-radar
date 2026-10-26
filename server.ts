@@ -27,6 +27,7 @@ import {
   findSection,
   threadsToSection,
   DEFAULT_LANES,
+  missingDefaults,
   draftPrompt,
   fromGithubNode,
   GITHUB_SEARCH_GRAPHQL,
@@ -138,6 +139,9 @@ const AI_TIMEOUT_MS = 45_000;
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const LANE_CONCURRENCY = 3;
 const CLI_ROW_LIMIT = 80;
+/** Lane and focus descriptions: the same cap as the RPCs and the stored schemas. */
+const MAX_DESCRIPTION = 600;
+const DESCRIPTION_TOO_LONG = `Keep the description under ${MAX_DESCRIPTION} characters.`;
 
 /** The bb server may start with a GUI-app PATH; add the usual dev toolchain dirs. */
 const EXTRA_PATH = [
@@ -1182,7 +1186,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function saveFocus(next: FocusState): Promise<RadarSnapshot> {
     const parsed = focusStateSchema.safeParse(next);
-    if (!parsed.success) throw new UserError("Too many repos or areas in the focus.");
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new UserError(issue?.path[0] === "description" ? DESCRIPTION_TOO_LONG : "Too many repos or areas in the focus.");
+    }
     focusState = parsed.data;
     scope = effectiveScope(focusState);
     visible = scopePredicate(scope);
@@ -1240,6 +1247,8 @@ export default async function plugin(bb: BbPluginApi) {
     // "clear" is Focus off; the last focus is kept so it can be resumed.
     if (op === "clear") return setFocusEnabled(false);
     const knownAreas = [...new Set(allItems().flatMap(itemAreas))];
+    // Showing something while Focus is off changes nothing; keep the saved focus for --on.
+    if (!focusState.enabled && op === "show") return snapshot();
     // Picking scopes while Focus is off starts a fresh, hand-picked focus.
     const base = focusState.enabled ? focusState : FOCUS_OFF;
     const next = applyScopeOp(base, op, keys, knownAreas);
@@ -1751,6 +1760,12 @@ export default async function plugin(bb: BbPluginApi) {
             const laneId = laneIndex >= 0 ? rest[laneIndex + 1] : undefined;
             const viewIndex = rest.indexOf("--view");
             const viewArg = viewIndex >= 0 ? rest[viewIndex + 1] : undefined;
+            if ((laneIndex >= 0 && laneId === undefined) || (viewIndex >= 0 && viewArg === undefined)) {
+              return { exitCode: 1, stderr: "Usage: bb radar list [--lane <id>] [--view <view>] [--new] [--all] [--json]" };
+            }
+            if (laneId !== undefined && !lanes.some((lane) => lane.id === laneId)) {
+              return { exitCode: 1, stderr: `No lane "${laneId}". Run bb radar lanes.` };
+            }
             if (viewArg !== undefined && !(CATEGORIES as readonly string[]).includes(viewArg)) {
               return { exitCode: 1, stderr: `--view must be one of ${CATEGORIES.join(", ")}.` };
             }
@@ -1774,8 +1789,7 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: shown.join("\n") };
           }
           case "defaults": {
-            const have = new Set(lanes.map((lane) => lane.id));
-            const missing = DEFAULT_LANES.filter((lane) => !have.has(lane.id));
+            const missing = missingDefaults(lanes);
             if (missing.length === 0) return { exitCode: 0, stdout: "All default lanes are present." };
             await saveLanes([...lanes, ...missing.map((lane) => ({ ...lane }))]);
             publish();
@@ -1791,6 +1805,7 @@ export default async function plugin(bb: BbPluginApi) {
             const dryRun = rest.includes("--dry-run");
             const description = rest.filter((arg) => arg !== "--dry-run").join(" ").trim();
             if (description.length < 3) return { exitCode: 1, stderr: "Describe what to track." };
+            if (description.length > MAX_DESCRIPTION) return { exitCode: 1, stderr: DESCRIPTION_TOO_LONG };
             const draft = await draftLane(description);
             if (!dryRun) await upsertLane(draft.lane);
             const preview = draft.preview.error
@@ -1828,6 +1843,9 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: `Removed ${id}.` };
           }
           case "seen":
+            if (rest[0] !== undefined && !lanes.some((lane) => lane.id === rest[0])) {
+              return { exitCode: 1, stderr: `No lane "${rest[0]}". Run bb radar lanes.` };
+            }
             await markSeen(rest[0]);
             return { exitCode: 0, stdout: "Marked seen." };
           case "scopes": {
@@ -1864,6 +1882,7 @@ export default async function plugin(bb: BbPluginApi) {
                 keys = null;
               }
               if (keys !== null) await editScope("focus", keys);
+              else if (names.join(" ").length > MAX_DESCRIPTION) return { exitCode: 1, stderr: DESCRIPTION_TOO_LONG };
               else await describeFocus(names.join(" "));
             } else {
               await editScope(command === "focus" ? "add-focus" : (command as ScopeOp), resolveScopes(names));

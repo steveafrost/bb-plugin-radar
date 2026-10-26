@@ -6,8 +6,7 @@ description: Read or configure the Radar panel — live queues of pull requests 
 # Radar
 
 Radar polls a list of *lanes* (saved queries) and shows the current results in a
-bb panel. Nothing is stored except the lane list and which items were already
-seen; every refresh is a live read from `gh api graphql` search (GitHub; GraphQL budget, not the 30/min REST search limit) and, when set up in settings, `dt api search/issues` (Delta, the primary host for repos like shop/world; `author:@me` resolves server-side) and, only when the history toggle is on, `gs api repos/<repo>/pulls` (read-only Gitstream history). Delta labels are indexed weekly so the LLM picks exact label names. Lanes skip sources that are not set up.
+bb panel. Radar stores only its own state in bb (lanes, focus, seen keys, review-thread links, single-item hides and a cache of the last results); every refresh is a live read from `gh api graphql` search (GitHub; GraphQL budget, not the 30/min REST search limit) and, when set up in settings, `dt api search/issues` (Delta, the primary host for repos like shop/world; `author:@me` resolves server-side) and, only when the history toggle is on, `gs api repos/<repo>/pulls` (read-only Gitstream history). Delta labels are indexed weekly so the LLM picks exact label names. Lanes skip sources that are not set up.
 
 ## Commands
 
@@ -48,21 +47,21 @@ runs it once, and prints how many items match. Use `--dry-run` to preview first.
 
 - `sources`: any of `"delta"`, `"github"`, `"gitstream"` (Delta and Gitstream only once set up); results are merged into one lane. Personal queues (reviews, my PRs) should use `["delta", "github"]`; add `"gitstream"` only for an explicit read-only history lane. Legacy `source: "x"` is read as `sources: ["x"]`.
 - `gitstream: { reviewRequested, author, excludeAuthor, assignee, reviewedBy, everyone, labels, excludeLabels, query, draft, hasApproval, base, head, state }` — read-only history: server-side filters on Gitstream `GET /repos/<gitstreamRepo>/pulls` via `gs api` (principals are `@me` or an email; labels are exact names, all required). Without a principal it defaults to your PRs unless `everyone: true`. The Gitstream repo only. Used when `sources` has `gitstream`.
-- `query` — GitHub search syntax, run on GitHub and on Delta (`is:pr` / `is:issue` narrow it). Required when `sources` has `github` or `delta`. Delta strips `archived:` and rejects `mentions:` / `involves:`, so leave Delta out of those lanes.
+- `query` — GitHub search syntax, run on GitHub and on Delta. Required when `sources` has `github` or `delta`. Delta has pull requests only: it strips `archived:` and rejects `is:issue`, `mentions:` and `involves:`, so leave Delta out of issue and mention lanes (AI drafts drop it automatically).
 - `category`: `"reviews" | "prs" | "issues" | "all"`, the panel view the lane shows in (All shows every lane). Omit it and Radar infers it from the query: review-requested:/reviewed-by:/user-review-requested: or Gitstream `reviewRequested`/`reviewedBy` → reviews; `is:pr` or Gitstream-only → prs; `is:issue` → issues; mixed or unclear → all. An explicit category that differs from the inferred one is pinned (`categoryPinned: true`) and survives query edits; `categoryPinned: false` goes back to inference.
 - Optional `filter: { titleIncludes, labelsAny, excludeAuthors, excludeDrafts, updatedWithinDays }` applied client-side; `limit` 1–100 (default 30) caps the merged lane: each host fetches up to it and the newest across hosts are kept.
 
 ## Panel-only actions
 
-- The title bar has icon tabs for the **All**, **Issues**, **Pull requests** and **Reviews** views, then Track something new (sparkle) and Focus (meditating figure). A lane shows in its category's view and in All; the Pull requests and Issues views keep only that kind of item. The lane editor's View picker sets the category.
+- The title bar's **Filter** menu switches between the **All**, **Issues**, **Pull requests** and **Reviews** views and holds Zen (Focus). A lane shows in its category's view and in All; the Pull requests and Issues views keep only that kind of item. The lane editor's View picker sets the category.
 - **Review / Triage** on a row opens bb's new-thread composer seeded with a review prompt (read-only: it tells the agent not to post) and the project whose git remote matches the repo. The thread is created in the bb thread section named by `reviewSection` (default `Reviews`, created if missing; `bb thread section list`). The row keeps a **Thread** link until that thread is archived or deleted. The thread also gets Radar's `radar-review`/`radar-triage` skill, and the opening message invokes the configured host skill, if any (`reviewSkill`, `gitstreamReviewSkill`, `triageSkill`).
 - The Radar nav-rail icon shows the unseen-item count.
 
 ## Settings
 
-Under **AI & focus** in Radar’s plugin settings, **Use BB default** leaves the provider/model override unset (`null`). Choose an override with BB’s native picker and explicitly save it, or reset to the default. The override is stored durably by typed `radar_ai_get` / `radar_ai_set` RPC, not a CLI config setting. Radar never reads AI credentials or calls a separate endpoint. Legacy `aiBaseUrl`, `aiKeyEnv`, and `aiModel` values are ignored.
+Under **AI & focus** in Radar’s plugin settings, **Use BB default** leaves the provider/model override unset (`null`). Choose an override with BB’s native picker and explicitly save it, or reset to the default. The override is stored durably by typed `radar_ai_get` / `radar_ai_set` RPC, not a CLI config setting. On hosts without `experimental_ai`, an optional OpenAI-compatible fallback is used when `aiBaseUrl` (https only), `aiKeyEnv` (the name of a bb server environment variable) and `aiModel` are all set: the key from that variable is sent to that endpoint. BB's configured providers always win when available; with any of the three unset, nothing is sent.
 
-A BB development build exposing `experimental_ai.complete` is required for AI execution. API availability does not guarantee the chosen model supports text completion; provider failures are surfaced without credential fallback. On older hosts drafting is unavailable with an explicit explanation. Focus retains repo/area name matching and all manual controls, including when AI execution fails. Settings labels distinguish **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**; this SDK has no grouped setting descriptors.
+AI execution uses a BB build exposing `experimental_ai.complete`, or the fallback above. API availability does not guarantee the chosen model supports text completion; provider failures are surfaced. With neither, drafting is unavailable with an explicit explanation. Focus retains repo/area name matching and all manual controls, including when AI execution fails. Settings labels distinguish **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**; this SDK has no grouped setting descriptors.
 
 `bb plugin config radar set <key> <value>`: `refreshSeconds` (min 30, default 90),
 `maxAgeDays` (default 60, 0 = no limit), `ghPath`;

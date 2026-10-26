@@ -11,8 +11,8 @@ for its host:
 | Host | CLI |
 | --- | --- |
 | GitHub | `gh pr view N -R owner/repo`, `gh pr diff`, `gh pr checks`, `gh api .../comments` |
-| Delta | `dt --host <host> -R owner/repo pr view N`, `pr diff`, `pr checks` (the host is in the message) |
-| Gitstream history | `gs` reads only. Gitstream no longer accepts PR writes; if the work moved to Delta, find the matching Delta PR (`dt pr list --head <branch>`) and review that |
+| Delta | `dt --host <host> -R owner/repo pr view N --comments` (includes conversation and inline review comments), `pr diff N`, `pr checks N` (the host is in the message) |
+| Gitstream history | `gs` reads only. Gitstream no longer accepts PR writes; if the work moved to Delta, find the matching Delta PR (`dt --host <host> -R owner/repo pr list --head <branch> --state all`) and review that |
 
 ## Steps
 
