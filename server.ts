@@ -482,24 +482,48 @@ export default async function plugin(bb: BbPluginApi) {
     return output.trim() ? parseJson(output, "GitHub notifications") : null;
   }, "github.com", async () => { await bb.storage.kv.set("mentions", mentions.state); });
   const persistMentions = () => bb.storage.kv.set("mentions", mentions.state);
-  const trackedSchema = z.record(z.string(), z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]) }));
+  // Candidates last scanned: updatedAt is the item's when it was last scanned successfully ("" = due).
+  const trackedSchema = z.record(z.string(), z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]), updatedAt: z.string().default("") }));
   const storedTracked = trackedSchema.safeParse(await bb.storage.kv.get<unknown>("mentionCandidates"));
-  const trackedMentions = storedTracked.success ? storedTracked.data : {};
+  let trackedMentions: z.infer<typeof trackedSchema> = storedTracked.success ? storedTracked.data : {};
   const isMentionLane = (lane: Lane) => lane.sources.includes("github") && /(?:^|\s)mentions:@me(?:\s|$)/i.test(lane.query ?? "");
   let mentionSync: Promise<void> = Promise.resolve();
+  /**
+   * Candidates are exactly the GitHub items in the current Mentions-lane results: anything
+   * else is pruned from the tracked list and the tracker. Only items whose updatedAt moved
+   * since their last successful scan are re-scanned; every current item stays visible.
+   */
   function syncMentions(): Promise<void> {
     mentionSync = mentionSync.catch(() => {}).then(async () => {
       if (!githubLogin) return;
-      const candidates = new Map(Object.entries(trackedMentions));
-      for (const lane of lanes.filter(isMentionLane)) {
-        for (const item of results[lane.id]?.items ?? []) if (item.source === "github") candidates.set(item.key, item);
+      const mentionLanes = lanes.filter(isMentionLane);
+      const current = new Map<string, RadarItem>();
+      for (const lane of mentionLanes) {
+        for (const item of results[lane.id]?.items ?? []) if (item.source === "github") current.set(item.key, item);
       }
-      if (!candidates.size) return;
-      for (const [key, item] of candidates) trackedMentions[key] = { key, repo: item.repo, number: item.number, kind: item.kind };
-      await bb.storage.kv.set("mentionCandidates", trackedMentions);
-      const generations = new Map([...candidates.keys()].map(key => [key, mentions.metadata(key).generation]));
-      await mentions.reconcile([...candidates.values()], githubLogin);
-      for (const lane of lanes.filter(isMentionLane)) {
+      const prunedTracker = mentions.prune(new Set(current.keys()));
+      const next: typeof trackedMentions = {};
+      for (const [key, item] of current) {
+        next[key] = { key, repo: item.repo, number: item.number, kind: item.kind, updatedAt: trackedMentions[key]?.updatedAt ?? "" };
+      }
+      const due = [...current.values()].filter((item) => next[item.key]!.updatedAt !== item.updatedAt);
+      const trackedChanged = JSON.stringify(Object.keys(next).sort()) !== JSON.stringify(Object.keys(trackedMentions).sort());
+      trackedMentions = next;
+      if (current.size === 0) {
+        // No Mentions lane (or nothing in it): nothing to scan, just drop what was tracked.
+        if (trackedChanged) await persistTracked();
+        if (prunedTracker) await persistMentions();
+        if (trackedChanged || prunedTracker) publish();
+        return;
+      }
+      const generations = new Map([...current.keys()].map(key => [key, mentions.metadata(key).generation]));
+      const { scannedKeys } = await mentions.reconcile([...current.values()], githubLogin, due);
+      for (const key of scannedKeys) {
+        const item = current.get(key);
+        if (item !== undefined && trackedMentions[key] !== undefined) trackedMentions[key]!.updatedAt = item.updatedAt;
+      }
+      await persistTracked();
+      for (const lane of mentionLanes) {
         for (const item of results[lane.id]?.items ?? []) {
           if (item.source === "github" && (generations.get(item.key) ?? 0) > 0 && mentions.metadata(item.key).generation > (generations.get(item.key) ?? 0)) {
             seen[lane.id] = (seen[lane.id] ?? []).filter(key => key !== item.key);
@@ -513,6 +537,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     return mentionSync;
   }
+  const persistTracked = () => bb.storage.kv.set("mentionCandidates", trackedMentions);
 
   let lanes = await loadLanes();
 
