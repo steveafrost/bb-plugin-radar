@@ -1,5 +1,5 @@
 // bb-plugin-radar — panel frontend. Compiled by `bb plugin build`.
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   definePluginApp,
   experimental_NewThreadComposer as NewThreadComposer,
@@ -374,6 +374,7 @@ function ScopeRow({
 function FocusControl({
   view,
   onView,
+  counts,
   entries,
   state,
   hidden,
@@ -384,6 +385,8 @@ function FocusControl({
 }: {
   view: View;
   onView: (view: View) => void;
+  /** Per-view counts for the view tooltips; undefined until the first snapshot. */
+  counts: Record<View, { items: number; fresh: number }> | undefined;
   entries: ScopeEntry[];
   state: FocusState | undefined;
   hidden: number;
@@ -448,6 +451,7 @@ function FocusControl({
           <div className="radar-scope__section radar-filter__views">
             {(["all", "prs", "issues", "reviews"] as View[]).map((value) => (
               <button key={value} type="button" className="radar-scope__item" aria-pressed={view === value}
+                title={counts === undefined ? undefined : `${counts[value].items} item${counts[value].items === 1 ? "" : "s"}${counts[value].fresh > 0 ? ` · ${counts[value].fresh} new` : ""}`}
                 onClick={() => { onView(value); setMenuOpen(false); setOpen(false); }}>
                 <span className="radar-scope__name">{CATEGORY_LABEL[value]}</span>
                 <span className="radar-filter__check" aria-hidden="true">{view === value ? "✓" : ""}</span>
@@ -700,18 +704,22 @@ function LaneCard({
   onSeen: () => void;
   onRefresh: () => void;
 }) {
-  const items = (result?.items ?? []).filter(
-    (item) =>
-      query === "" ||
-      `${item.title} ${item.repo} ${item.number} ${item.author} ${item.labels.join(" ")}`
-        .toLowerCase()
-        .includes(query),
+  const items = useMemo(
+    () =>
+      (result?.items ?? []).filter(
+        (item) =>
+          query === "" ||
+          `${item.title} ${item.repo} ${item.number} ${item.author} ${item.labels.join(" ")}`
+            .toLowerCase()
+            .includes(query),
+      ),
+    [result, query],
   );
   const fresh = items.filter((item) => item.isNew).length;
   const collapsed = lane.collapsed === true && query === "";
   const [expanded, setExpanded] = useState(false);
   // New items first so a capped lane never hides an arrival.
-  const ordered = [...items.filter((item) => item.isNew), ...items.filter((item) => !item.isNew)];
+  const ordered = useMemo(() => [...items.filter((item) => item.isNew), ...items.filter((item) => !item.isNew)], [items]);
   const shown = expanded || query !== "" ? ordered : ordered.slice(0, LANE_PREVIEW);
   return (
     <section className="radar-lane" data-collapsed={collapsed || undefined}>
@@ -1341,14 +1349,16 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [editing, setEditing] = useState<Draft | null>(null);
   const [search, setSearch] = useState("");
-  const query = search.trim().toLowerCase();
+  // Typing stays responsive on big boards: lanes filter against a deferred copy of the search.
+  const query = useDeferredValue(search).trim().toLowerCase();
   const tracking = useTrackBoxOpen();
 
   const lanes = snapshot?.lanes ?? [];
   const scope = scopeOf(snapshot);
   const inScope = useMemo(() => scopePredicate(scope), [scope]);
   const entries = useMemo(() => scopeCatalog(viewItems(snapshot, view), scope), [snapshot, view, scope]);
-  const totals = useMemo(() => viewTotals(snapshot)[view], [snapshot, view]);
+  const allTotals = useMemo(() => viewTotals(snapshot), [snapshot]);
+  const totals = allTotals[view];
   const refreshLabel = snapshot?.refreshing ? "Refreshing…" : snapshot?.fetchedAt
     ? `Refresh — updated ${relative(snapshot.fetchedAt) === "now" ? "just now" : `${relative(snapshot.fetchedAt)} ago`}`
     : "Refresh";
@@ -1400,6 +1410,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
             <FocusControl
               view={view}
               onView={(value) => navigate.toPluginPanel("board", { subPath: value, replace: true })}
+              counts={snapshot === null ? undefined : allTotals}
               entries={entries}
               state={snapshot?.focus}
               hidden={totals.hidden}
