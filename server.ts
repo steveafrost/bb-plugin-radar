@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { MentionTracker, mentionStoreSchema, createMentionStore } from "./mentions";
+import { MentionTracker, mentionStoreSchema, createMentionStore, type MentionStore } from "./mentions";
 
 import { aiBackend, aiDetail, aiOverrideSchema, complete, fallbackBaseUrl, type AiFallback, type AiOverride } from "./ai";
 import {
@@ -453,6 +453,28 @@ export default async function plugin(bb: BbPluginApi) {
   // any skill filters this plugin's roots to the selection, so `radar` is always included.
   bb.agents.configure((context) => ({ tools: [], skills: selectedSkills(context.pluginMetadata) }));
 
+  // Anything that can grow past kv's 256KB value cap lives in the plugin database: the label
+  // index (~5k names, ~300KB), per-item hides and the mention tracker.
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [
+    "CREATE TABLE label_index (name TEXT PRIMARY KEY) WITHOUT ROWID",
+    "CREATE TABLE label_index_meta (id INTEGER PRIMARY KEY CHECK (id = 1), indexed_at TEXT NOT NULL)",
+    // Per-item hides: id = lowercased item key, entry = the validated HiddenEntry as JSON.
+    "CREATE TABLE hidden_items (id TEXT PRIMARY KEY, entry TEXT NOT NULL) WITHOUT ROWID",
+    // Mention tracker: one row per account, one per tracked item (entry = the item's state as JSON).
+    "CREATE TABLE mention_accounts (account TEXT PRIMARY KEY, scope TEXT NOT NULL, login TEXT NOT NULL, error TEXT) WITHOUT ROWID",
+    "CREATE TABLE mention_items (account TEXT NOT NULL, key TEXT NOT NULL, entry TEXT NOT NULL, PRIMARY KEY (account, key)) WITHOUT ROWID",
+    // Mention candidates: key = item key, candidate = { key, repo, number, kind, updatedAt } as JSON.
+    "CREATE TABLE mention_candidates (key TEXT PRIMARY KEY, candidate TEXT NOT NULL) WITHOUT ROWID",
+  ]);
+  const parseRow = (value: unknown): unknown => {
+    try {
+      return typeof value === "string" ? (JSON.parse(value) as unknown) : null;
+    } catch {
+      return null;
+    }
+  };
+
   // ---- persisted configuration -------------------------------------------
 
   async function loadLanes(): Promise<Lane[]> {
@@ -476,16 +498,71 @@ export default async function plugin(bb: BbPluginApi) {
   type SeenMap = Record<string, string[]>;
   let seen: SeenMap = (await bb.storage.kv.get<SeenMap>("seen")) ?? {};
   const persistSeen = () => bb.storage.kv.set("seen", seen);
-  const storedMentions = mentionStoreSchema.safeParse(await bb.storage.kv.get<unknown>("mentions"));
-  const mentions = new MentionTracker(storedMentions.success ? storedMentions.data : createMentionStore(), async (path, method = "GET") => {
+  const saveMentionRows = db.transaction((store: MentionStore) => {
+    db.prepare("DELETE FROM mention_items").run();
+    db.prepare("DELETE FROM mention_accounts").run();
+    const account = db.prepare("INSERT INTO mention_accounts (account, scope, login, error) VALUES (?, ?, ?, ?)");
+    const item = db.prepare("INSERT INTO mention_items (account, key, entry) VALUES (?, ?, ?)");
+    for (const [id, value] of Object.entries(store.accounts)) {
+      account.run(id, value.scope, value.login, value.error);
+      for (const [key, entry] of Object.entries(value.items)) item.run(id, key, JSON.stringify(entry));
+    }
+  });
+  /** The tracker store from SQLite; an unreadable store starts over (mentions are re-scanned). */
+  function loadMentionStore(): MentionStore {
+    const accounts = db.prepare("SELECT account, scope, login, error FROM mention_accounts").all() as { account: string; scope: string; login: string; error: string | null }[];
+    const items = db.prepare("SELECT account, key, entry FROM mention_items").all() as { account: string; key: string; entry: unknown }[];
+    const store: MentionStore = createMentionStore();
+    for (const row of accounts) store.accounts[row.account] = { scope: row.scope, login: row.login, error: row.error, items: {} };
+    for (const row of items) {
+      const account = store.accounts[row.account];
+      if (account !== undefined) (account.items as Record<string, unknown>)[row.key] = parseRow(row.entry);
+    }
+    const parsed = mentionStoreSchema.safeParse(store);
+    if (parsed.success) return parsed.data;
+    bb.log.warn("stored mention state was invalid; starting over");
+    saveMentionRows(createMentionStore());
+    return createMentionStore();
+  }
+  // One-time move from kv (where it could outgrow the 256KB value cap) into SQLite.
+  const kvMentions = await bb.storage.kv.get<unknown>("mentions");
+  if (kvMentions !== undefined) {
+    const parsed = mentionStoreSchema.safeParse(kvMentions);
+    const empty = (db.prepare("SELECT COUNT(*) AS n FROM mention_accounts").get() as { n: number }).n === 0;
+    if (parsed.success && empty) saveMentionRows(parsed.data);
+    await bb.storage.kv.delete("mentions");
+  }
+  const mentions = new MentionTracker(loadMentionStore(), async (path, method = "GET") => {
     const output = await tool(config.ghPath, ["api", "--method", method, path], "GitHub notifications");
     return output.trim() ? parseJson(output, "GitHub notifications") : null;
-  }, "github.com", async () => { await bb.storage.kv.set("mentions", mentions.state); });
-  const persistMentions = () => bb.storage.kv.set("mentions", mentions.state);
+  }, "github.com", async () => { saveMentionRows(mentions.state); });
+  const persistMentions = async () => { saveMentionRows(mentions.state); };
   // Candidates last scanned: updatedAt is the item's when it was last scanned successfully ("" = due).
-  const trackedSchema = z.record(z.string(), z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]), updatedAt: z.string().default("") }));
-  const storedTracked = trackedSchema.safeParse(await bb.storage.kv.get<unknown>("mentionCandidates"));
-  let trackedMentions: z.infer<typeof trackedSchema> = storedTracked.success ? storedTracked.data : {};
+  const candidateSchema = z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]), updatedAt: z.string().default("") });
+  type Candidate = z.infer<typeof candidateSchema>;
+  const saveCandidateRows = db.transaction((candidates: Record<string, Candidate>) => {
+    db.prepare("DELETE FROM mention_candidates").run();
+    const insert = db.prepare("INSERT INTO mention_candidates (key, candidate) VALUES (?, ?)");
+    for (const candidate of Object.values(candidates)) insert.run(candidate.key, JSON.stringify(candidate));
+  });
+  function loadCandidates(): Record<string, Candidate> {
+    const rows = db.prepare("SELECT key, candidate FROM mention_candidates").all() as { key: string; candidate: unknown }[];
+    const out: Record<string, Candidate> = {};
+    for (const row of rows) {
+      const parsed = candidateSchema.safeParse(parseRow(row.candidate));
+      if (parsed.success && parsed.data.key === row.key) out[row.key] = parsed.data;
+    }
+    return out;
+  }
+  const kvCandidates = await bb.storage.kv.get<unknown>("mentionCandidates");
+  if (kvCandidates !== undefined) {
+    const parsed = z.record(z.string(), candidateSchema).safeParse(kvCandidates);
+    const empty = (db.prepare("SELECT COUNT(*) AS n FROM mention_candidates").get() as { n: number }).n === 0;
+    if (parsed.success && empty) saveCandidateRows(parsed.data);
+    await bb.storage.kv.delete("mentionCandidates");
+  }
+  let trackedMentions: Record<string, Candidate> = loadCandidates();
+  const persistTracked = async () => { saveCandidateRows(trackedMentions); };
   const isMentionLane = (lane: Lane) => lane.sources.includes("github") && /(?:^|\s)mentions:@me(?:\s|$)/i.test(lane.query ?? "");
   let mentionSync: Promise<void> = Promise.resolve();
   /**
@@ -537,7 +614,6 @@ export default async function plugin(bb: BbPluginApi) {
     });
     return mentionSync;
   }
-  const persistTracked = () => bb.storage.kv.set("mentionCandidates", trackedMentions);
 
   let lanes = await loadLanes();
 
@@ -583,14 +659,6 @@ export default async function plugin(bb: BbPluginApi) {
   let deltaMe = "";
   /** Label names (Delta, else Gitstream history), for steering the LLM to exact spellings. Rebuilt weekly from Delta, daily from Gitstream. */
   type LabelIndex = { at: string; names: string[] };
-  // The index (~5k names, ~300KB) is over kv's 256KB value cap, so it lives in the plugin database.
-  const db = bb.storage.database();
-  bb.storage.migrate(db, [
-    "CREATE TABLE label_index (name TEXT PRIMARY KEY) WITHOUT ROWID",
-    "CREATE TABLE label_index_meta (id INTEGER PRIMARY KEY CHECK (id = 1), indexed_at TEXT NOT NULL)",
-    // Per-item hides: id = lowercased item key, entry = the validated HiddenEntry as JSON.
-    "CREATE TABLE hidden_items (id TEXT PRIMARY KEY, entry TEXT NOT NULL) WITHOUT ROWID",
-  ]);
   const putHiddenRows = db.transaction((entries: HiddenEntry[]) => {
     const upsert = db.prepare("INSERT INTO hidden_items (id, entry) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET entry = excluded.entry");
     for (const entry of entries) upsert.run(normKey(entry.key), JSON.stringify(entry));
@@ -966,7 +1034,8 @@ export default async function plugin(bb: BbPluginApi) {
         // The panel needs your Delta identity to offer Rebase; one cached read per session.
         if (deltaMe === "" && hosts().delta !== null && config.deltaCheckout !== "") await resolveDeltaMe().catch(() => "");
         await pool([...lanes], refreshLane);
-        await syncMentions();
+        // Mention acknowledgement is optional: its failure must never stop the board updating.
+        await syncMentions().catch((error: unknown) => bb.log.warn(`mention sync failed: ${String(error)}`));
         fetchedAt = new Date().toISOString();
         reconcileHiddenItems();
         // Drop results and seen sets for lanes that no longer exist.
@@ -1596,7 +1665,10 @@ export default async function plugin(bb: BbPluginApi) {
     },
     radar_refresh: async (input) => {
       const lane = input?.laneId === undefined ? undefined : lanes.find((candidate) => candidate.id === input.laneId);
-      if (lane !== undefined) { await refreshLane(lane); if (isMentionLane(lane)) await syncMentions(); }
+      if (lane !== undefined) {
+        await refreshLane(lane);
+        if (isMentionLane(lane)) await syncMentions().catch((error: unknown) => bb.log.warn(`mention sync failed: ${String(error)}`));
+      }
       else await refreshAll();
       return snapshot();
     },

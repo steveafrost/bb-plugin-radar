@@ -3,9 +3,12 @@ import { boot, calls, clearCalls, deltaRow, node, setState } from "./harness";
 
 const lane = (id: string, query: string, extra: Record<string, unknown> = {}) => ({ id, title: id, sources: ["github"], query, category: "all", ...extra });
 const DELTA = { deltaHost: "delta.example.com", deltaRepo: "acme/mono" };
-// Tracked mention candidates, wherever Radar keeps them.
-async function trackedKeys(bb: { storage: { kv: { get: (key: string) => Promise<unknown> } } }): Promise<Record<string, unknown>> {
-  return ((await bb.storage.kv.get("mentionCandidates")) ?? {}) as Record<string, unknown>;
+type Bb = Awaited<ReturnType<typeof boot>>["bb"];
+const db = (bb: Bb) => bb.storage.database();
+// Tracked mention candidates (SQLite since 0.4.10).
+async function trackedKeys(bb: Bb): Promise<Record<string, unknown>> {
+  const rows = db(bb).prepare("SELECT key, candidate FROM mention_candidates").all() as { key: string; candidate: string }[];
+  return Object.fromEntries(rows.map((row) => [row.key, JSON.parse(row.candidate)]));
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -100,19 +103,46 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F5 a kv overflow inside syncMentions rejects refreshAll: fetchedAt, hidden reconcile and the results cache stop updating", async () => {
+  it("F5 large mention state lives in SQLite, and a failing mention sync does not stop the board", async () => {
     const ml = lane("mentions", "is:open mentions:@me");
     setState({ login: "steve", comments: 950, searches: [{ match: "mentions:@me", nodes: [1, 2, 3].map((n) => node("o/r", n, { __typename: "Issue" })) }] });
     const { bb, harness } = await boot({}, [ml]);
     const r = await harness.runCli(["refresh"]);
-    console.log("F5 refresh:", r.exitCode, (r.stderr ?? "").slice(0, 140));
-    expect(r.exitCode).toBe(1);
-    expect(await bb.storage.kv.get("resultsCache")).toBeUndefined();
-    const status = await harness.runCli(["status"]);
-    console.log("F5 status:", status.exitCode, (status.stderr ?? "").slice(0, 80));
-    expect(status.exitCode).toBe(1); // status/list/scopes re-run refreshAll while fetchedAt is "" and fail the same way
-    const snap = (await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string };
-    expect(snap.fetchedAt).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(await bb.storage.kv.get("mentions")).toBeUndefined();
+    expect(await bb.storage.kv.get("mentionCandidates")).toBeUndefined();
+    const rows = db(bb).prepare("SELECT COUNT(*) AS n FROM mention_items").get() as { n: number };
+    expect(rows.n).toBe(3);
+    expect(((await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string }).fetchedAt).not.toBe("");
+    // Break mention storage: the sync fails, the refresh still lands and the CLI keeps working.
+    db(bb).exec("DROP TABLE mention_candidates");
+    setState({ login: "steve", searches: [{ match: "mentions:@me", nodes: [4].map((n) => node("o/r", n, { __typename: "Issue" })) }] });
+    const before = ((await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string }).fetchedAt;
+    await sleep(5);
+    expect((await harness.runCli(["refresh"])).exitCode).toBe(0);
+    const snap = (await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string; results: Record<string, { items: { number: number }[] }> };
+    expect(snap.fetchedAt > before).toBe(true);
+    expect(snap.results.mentions!.items.map((i) => i.number)).toEqual([4]);
+    expect(harness.logEntries.some((e) => e.level === "warn" && /mention sync failed/.test(e.message))).toBe(true);
+    expect((await harness.runCli(["status"])).exitCode).toBe(0);
+    await harness.dispose();
+  });
+
+  it("F5c mention state and candidates in kv move to SQLite on load", async () => {
+    const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
+    const { join } = await import("node:path");
+    const here = new URL("./", import.meta.url).pathname;
+    const host = createFakePluginHost({ pluginId: "radar", settings: { ghPath: join(here, "gh"), dtPath: join(here, "dt") } as never });
+    const entry = { generation: 2, acknowledged: 1, content: { body: { fingerprint: "f", mentioned: true } }, pending: null, readBarrier: false };
+    await host.bb.storage.kv.set("mentions", { version: 1, accounts: { '["github.com","steve"]': { scope: "github.com", login: "steve", error: null, items: { "github:o/r#1": entry } } } });
+    await host.bb.storage.kv.set("mentionCandidates", { "github:o/r#1": { key: "github:o/r#1", repo: "o/r", number: 1, kind: "issue" } });
+    setState({ searches: [] });
+    const { bb, harness } = await boot({}, [lane("a", "is:open alpha")], { host });
+    expect(await bb.storage.kv.get("mentions")).toBeUndefined();
+    expect(await bb.storage.kv.get("mentionCandidates")).toBeUndefined();
+    const item = db(bb).prepare("SELECT entry FROM mention_items WHERE key = ?").get("github:o/r#1") as { entry: string };
+    expect(JSON.parse(item.entry)).toEqual(entry);
+    expect(await trackedKeys(bb)).toEqual({ "github:o/r#1": { key: "github:o/r#1", repo: "o/r", number: 1, kind: "issue", updatedAt: "" } });
     await harness.dispose();
   });
 
@@ -160,13 +190,17 @@ describe("audit: integration", () => {
 });
 
 describe("audit: poll service", () => {
-  it("F5b the poll service's start() rejects (crash → restart with backoff) once syncMentions overflows kv", async () => {
-    setState({ login: "steve", comments: 950, searches: [{ match: "mentions:@me", nodes: [1, 2, 3].map((n) => node("o/r", n, { __typename: "Issue" })) }] });
-    const { harness } = await boot({}, [{ id: "mentions", title: "m", sources: ["github"], query: "is:open mentions:@me", category: "all" }]);
+  it("F5b the poll service keeps running when mention sync fails", async () => {
+    setState({ login: "steve", searches: [{ match: "mentions:@me", nodes: [1].map((n) => node("o/r", n, { __typename: "Issue" })) }] });
+    const { bb, harness } = await boot({}, [{ id: "mentions", title: "m", sources: ["github"], query: "is:open mentions:@me", category: "all" }]);
+    db(bb).exec("DROP TABLE mention_candidates");
     const run = harness.runService("poll");
-    const outcome = await Promise.race([run.done.then(() => "resolved", (e: unknown) => `rejected: ${String(e).slice(0, 90)}`), sleep(8000).then(() => "still running")]);
-    console.log("F5b poll service:", outcome);
-    expect(outcome).toMatch(/^rejected: .*mentions/);
+    let outcome = "still running";
+    run.done.then(() => { outcome = "resolved"; }, (e: unknown) => { outcome = `rejected: ${String(e).slice(0, 90)}`; });
+    for (let i = 0; i < 100 && ((await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string }).fetchedAt === ""; i++) await sleep(50);
+    await sleep(100);
+    expect(((await harness.callRpc("radar_snapshot", null)) as { fetchedAt: string }).fetchedAt).not.toBe("");
+    expect(outcome).toBe("still running");
     run.controller.abort();
     await harness.dispose();
   }, 15000);
