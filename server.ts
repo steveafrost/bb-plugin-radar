@@ -1041,7 +1041,23 @@ export default async function plugin(bb: BbPluginApi) {
     return current !== undefined && laneQueryKey(current) === laneQueryKey(lane);
   }
 
-  async function refreshLane(lane: Lane) {
+  /** In-flight lane refreshes by lane id, so concurrent refreshes of the same query share one fetch. */
+  const laneFetches = new Map<string, { queryKey: string; promise: Promise<void> }>();
+
+  function refreshLane(lane: Lane): Promise<void> {
+    // A lane deleted or edited since `lane` was read: its own refresh covers it.
+    if (disposed || !stillCurrent(lane)) return Promise.resolve();
+    const queryKey = laneQueryKey(lane);
+    const running = laneFetches.get(lane.id);
+    if (running !== undefined && running.queryKey === queryKey) return running.promise;
+    const promise = fetchIntoLane(lane).finally(() => {
+      if (laneFetches.get(lane.id)?.promise === promise) laneFetches.delete(lane.id);
+    });
+    laneFetches.set(lane.id, { queryKey, promise });
+    return promise;
+  }
+
+  async function fetchIntoLane(lane: Lane) {
     const previous = results[lane.id];
     results[lane.id] = {
       laneId: lane.id,
@@ -1096,7 +1112,11 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // The panel needs your Delta identity to offer Rebase; one cached read per session.
         if (deltaMe === "" && hosts().delta !== null && config.deltaCheckout !== "") await resolveDeltaMe().catch(() => "");
-        await pool([...lanes], refreshLane);
+        // By id, re-read when its turn comes: a lane edited while queued runs its current query.
+        await pool(lanes.map((lane) => lane.id), async (id) => {
+          const lane = lanes.find((candidate) => candidate.id === id);
+          if (lane !== undefined) await refreshLane(lane);
+        });
         // Mention acknowledgement is optional: its failure must never stop the board updating.
         await syncMentions().catch((error: unknown) => bb.log.warn(`mention sync failed: ${String(error)}`));
         fetchedAt = new Date().toISOString();

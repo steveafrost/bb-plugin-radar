@@ -221,7 +221,7 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F7 editing a lane while refreshAll is queued leaves it stuck loading:true until the next cycle", async () => {
+  it("F7 editing a lane while refreshAll is queued does not leave it loading, nor fetch the old query", async () => {
     setState({ searches: [
       { match: "slow0", delayMs: 600, nodes: [node("o/r", 1)] },
       { match: "slow1", delayMs: 600, nodes: [node("o/r", 2)] },
@@ -236,9 +236,20 @@ describe("audit: integration", () => {
     await all;
     await sleep(200);
     const snap = (await harness.callRpc("radar_snapshot", null)) as { refreshing: boolean; results: Record<string, { loading: boolean; items: { number: number }[] }> };
-    console.log("F7 refreshing:", snap.refreshing, "lane d:", JSON.stringify({ loading: snap.results.d!.loading, items: snap.results.d!.items.map((i) => i.number) }));
     expect(snap.refreshing).toBe(false);
-    expect(snap.results.d!.loading).toBe(true);
+    expect(snap.results.d!.loading).toBe(false);
+    expect(snap.results.d!.items.map((i) => i.number)).toEqual([5]);
+    const queried = (match: string) => calls().filter((c) => c.argv[1] === "graphql" && c.argv.some((a) => a.startsWith("q=") && a.includes(match))).length;
+    expect(queried("old-d")).toBe(0);
+    await harness.dispose();
+  });
+
+  it("F7b concurrent refreshes of the same lane share one fetch", async () => {
+    setState({ searches: [{ match: "once", delayMs: 300, nodes: [node("o/r", 1)] }] });
+    const { harness } = await boot({}, [lane("a", "is:open once")]);
+    clearCalls();
+    await Promise.all([harness.callRpc("radar_refresh", { laneId: "a" }), harness.callRpc("radar_refresh", { laneId: "a" }), harness.runCli(["refresh"])]);
+    expect(calls().filter((c) => c.argv[1] === "graphql")).toHaveLength(1);
     await harness.dispose();
   });
 
