@@ -204,13 +204,20 @@ describe("audit: integration", () => {
     await harness.dispose();
   });
 
-  it("F6 one GraphQL partial error (e.g. a SAML-protected node) drops every GitHub item of the lane", async () => {
+  it("F6 a GraphQL partial error (e.g. a SAML-protected node) keeps the readable items with a non-fatal error", async () => {
     setState({ partialError: true, searches: [{ match: "alpha", nodes: [node("o/r", 1), node("o/r", 2)] }] });
     const { harness } = await boot({}, [lane("a", "is:open alpha")]);
     await harness.runCli(["refresh"]);
     const status = (await harness.runCli(["status"])).stdout;
-    console.log("F6 status:", status.split("\n").at(-1));
-    expect(status).toMatch(/0\s+a \[a\]\s+ERROR: GitHub: gh: Resource protected/);
+    expect(status).toMatch(/2\s+a \[a\]\s+ERROR: GitHub: 1 result\(s\) not accessible \(SAML\/permissions\)$/m);
+    await harness.dispose();
+  });
+
+  it("F6b a failing tool's own \"dt:\" / \"gh:\" prefix is not repeated after the host name", async () => {
+    setState({ deltaFail: true });
+    const { harness } = await boot(DELTA, [{ ...lane("d", "is:open x"), sources: ["delta"] }]);
+    await harness.runCli(["refresh"]);
+    expect((await harness.runCli(["status"])).stdout).toMatch(/ERROR: Delta: 503 service unavailable$/m);
     await harness.dispose();
   });
 

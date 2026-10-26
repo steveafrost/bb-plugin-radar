@@ -801,7 +801,12 @@ export default async function plugin(bb: BbPluginApi) {
     }, 50);
   }
 
-  async function tool(bin: string, args: string[], label: string): Promise<string> {
+  /**
+   * Runs a host CLI. A non-zero exit comes back as `error` with whatever it printed on stdout
+   * (gh exits 1 on a GraphQL partial error but still prints the readable data); a missing
+   * binary, a timeout or a shutdown still throw.
+   */
+  async function toolOutput(bin: string, args: string[], label: string): Promise<{ stdout: string; error: UserError | null }> {
     try {
       const { stdout } = await run(bin, args, {
         cwd: homedir(),
@@ -811,22 +816,30 @@ export default async function plugin(bb: BbPluginApi) {
         signal: controller.signal,
         killSignal: "SIGKILL",
       });
-      return stdout;
+      return { stdout, error: null };
     } catch (error) {
-      const failure = error as { code?: unknown; stderr?: unknown; killed?: unknown } | null;
+      const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown } | null;
       // Shutdown aborts in-flight tools; that is a cancellation, not a tool failure.
       if (failure?.code === "ABORT_ERR" || controller.signal.aborted) throw new ToolAborted(label);
       const stderr = typeof failure?.stderr === "string" ? failure.stderr : "";
+      const stdout = typeof failure?.stdout === "string" ? failure.stdout : "";
       if (failure?.code === "ENOENT") throw new UserError(`${label}: "${bin}" is not on PATH. Set the path in Radar settings.`);
       if (failure?.killed === true || failure?.code === "ETIMEDOUT") throw new UserError(`${label} timed out.`);
       const kind = classifyToolError(stderr);
-      if (kind === "rate-limit") throw new UserError(`${label}: rate limit hit; it will retry next cycle.`);
-      if (kind === "auth") throw new UserError(`${label}: not authenticated (${stderr.trim().split("\n")[0]?.slice(0, 160)}).`);
+      if (kind === "rate-limit") return { stdout, error: new UserError(`${label}: rate limit hit; it will retry next cycle.`) };
+      if (kind === "auth") return { stdout, error: new UserError(`${label}: not authenticated (${stderr.trim().split("\n")[0]?.slice(0, 160)}).`) };
       const first =
         stderr.trim().split("\n").find((line) => line.trim() !== "") ??
         `command failed${typeof failure?.code === "number" ? ` (exit ${failure.code})` : ""}`;
-      throw new UserError(`${label}: ${first.slice(0, 200)}`);
+      // The label already names the host; drop the CLI's own "gh: " / "dt: " prefix.
+      return { stdout, error: new UserError(`${label}: ${first.replace(/^(?:gh|dt|gs):\s*/i, "").slice(0, 200)}`) };
     }
+  }
+
+  async function tool(bin: string, args: string[], label: string): Promise<string> {
+    const { stdout, error } = await toolOutput(bin, args, label);
+    if (error !== null) throw error;
+    return stdout;
   }
 
   function parseJson(stdout: string, label: string): unknown {
@@ -940,33 +953,47 @@ export default async function plugin(bb: BbPluginApi) {
     return scored.slice(0, 40).map((entry) => entry.name);
   }
 
-  async function fetchSource(lane: Lane, source: Source): Promise<Item[]> {
+  /** One host's items for a lane; `warning` is a non-fatal problem shown on the lane (e.g. unreadable results). */
+  async function fetchSource(lane: Lane, source: Source): Promise<{ items: Item[]; warning: string }> {
     if (source === "gitstream") {
       const me = await resolveGitstreamMe();
       const data = parseJson(await tool(config.gsPath, gitstreamArgs(lane, me, Date.now(), config.maxAgeDays), SOURCE_LABEL.gitstream), SOURCE_LABEL.gitstream);
       if (!Array.isArray(data)) throw new UserError(`${SOURCE_LABEL.gitstream} did not return a JSON array.`);
-      return data.map(fromGitstream).filter((item): item is Item => item !== null);
+      return { items: data.map(fromGitstream).filter((item): item is Item => item !== null), warning: "" };
     }
     if (source === "delta") {
       const data = parseJson(await tool(config.dtPath, deltaArgs(lane, Date.now(), config.maxAgeDays), SOURCE_LABEL.delta), SOURCE_LABEL.delta) as { items?: unknown };
       if (!Array.isArray(data.items)) throw new UserError(`${SOURCE_LABEL.delta} search did not return items.`);
-      return data.items.map(fromDelta).filter((item): item is Item => item !== null);
+      return { items: data.items.map(fromDelta).filter((item): item is Item => item !== null), warning: "" };
     }
-    const data = parseJson(
-      await tool(
-        config.ghPath,
-        [
-          "api", "graphql",
-          "-f", `query=${GITHUB_SEARCH_GRAPHQL}`,
-          "-f", `q=${githubSearchQuery(withWindow(lane.query ?? "", lane.filter, Date.now(), config.maxAgeDays))}`,
-          "-F", `n=${lane.limit ?? 30}`,
-        ],
-        "GitHub",
-      ),
+    const { stdout, error } = await toolOutput(
+      config.ghPath,
+      [
+        "api", "graphql",
+        "-f", `query=${GITHUB_SEARCH_GRAPHQL}`,
+        "-f", `q=${githubSearchQuery(withWindow(lane.query ?? "", lane.filter, Date.now(), config.maxAgeDays))}`,
+        "-F", `n=${lane.limit ?? 30}`,
+      ],
       "GitHub",
-    ) as { data?: { search?: { nodes?: unknown[] } }; errors?: { message?: string }[] };
-    if (data.errors?.length) throw new UserError(`GitHub: ${data.errors[0]?.message ?? "query error"}`);
-    return (data.data?.search?.nodes ?? []).map(fromGithubNode).filter((item): item is Item => item !== null);
+    );
+    let data: { data?: { search?: { nodes?: unknown } | null } | null; errors?: { message?: unknown }[] } | null;
+    try {
+      data = JSON.parse(stdout) as typeof data;
+    } catch {
+      throw error ?? new UserError("GitHub returned invalid JSON.");
+    }
+    const nodes = data?.data?.search?.nodes;
+    const errors = Array.isArray(data?.errors) ? data.errors : [];
+    if (!Array.isArray(nodes)) {
+      if (error !== null) throw error;
+      if (errors.length > 0) throw new UserError(`GitHub: ${typeof errors[0]?.message === "string" ? errors[0].message.slice(0, 200) : "query error"}`);
+      return { items: [], warning: "" };
+    }
+    // A partial error (nodes behind SAML or an IP allowlist come back null): keep what is readable.
+    if (errors.length === 0 && error !== null) throw error;
+    const items = nodes.map(fromGithubNode).filter((item): item is Item => item !== null);
+    const unreadable = nodes.filter((node) => node === null).length || errors.length;
+    return { items, warning: errors.length > 0 ? `GitHub: ${unreadable} result(s) not accessible (SAML/permissions)` : "" };
   }
 
   /** Every source in parallel; a failing host is reported without hiding the others' items. */
@@ -980,9 +1007,12 @@ export default async function plugin(bb: BbPluginApi) {
     const settled = await Promise.allSettled(sources.map((source) => fetchSource(lane, source)));
     const raw: Item[] = [];
     const errors: string[] = [];
+    const warnings: string[] = [];
     settled.forEach((outcome, index) => {
-      if (outcome.status === "fulfilled") raw.push(...outcome.value);
-      else {
+      if (outcome.status === "fulfilled") {
+        raw.push(...outcome.value.items);
+        if (outcome.value.warning !== "") warnings.push(outcome.value.warning);
+      } else {
         const error = outcome.reason;
         if (!(error instanceof UserError)) bb.log.warn(`lane ${lane.id} ${sources[index]} failed: ${String(error)}`);
         errors.push(error instanceof UserError ? error.message : `${SOURCE_LABEL[sources[index]!]}: could not be read.`);
@@ -993,7 +1023,7 @@ export default async function plugin(bb: BbPluginApi) {
     const sorted = applyFilter(raw, lane.filter, Date.now(), config.maxAgeDays)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, lane.limit ?? 30);
-    return { items: sorted, fetched: raw.length, error: errors.join(" · ") };
+    return { items: sorted, fetched: raw.length, error: [...errors, ...warnings].join(" · ") };
   }
 
   function withNew(laneId: string, items: Item[], complete: boolean): RadarItem[] {
