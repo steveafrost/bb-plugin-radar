@@ -29,9 +29,9 @@ Radar threads get skills attached:
 
 ## Slack context
 
-Point Radar at a Slack MCP endpoint and it follows public Slack threads that link your open GitHub issues. Each sweep checks a few issues (least recently checked first), keeps only messages by people that link the exact issue, and when a thread has something new, bb's AI drafts a short "Slack context" summary: decisions, owners, open questions, next steps.
+Point Radar at a Slack MCP endpoint and it follows public Slack threads that link your open GitHub issues and PRs and your open Delta PRs (whatever Focus shows). Each sweep checks a few issues (least recently checked first), keeps only messages by people that link that exact issue or PR, and when a thread has something new, bb's AI drafts a short "Slack context" summary: decisions, owners, open questions, next steps.
 
-Nothing is posted on its own. A marked Slack icon on the issue row opens the draft. Edit it, then post it, or dismiss it. Radar keeps one comment per issue, with links to the threads, and later approvals edit that comment in place. Private channels and DMs are never searched.
+Nothing is posted on its own. A marked Slack icon on the row opens the draft. Edit it, then post it, or dismiss it. Radar keeps one comment per issue or PR, with links to the threads, and later approvals edit that comment in place. Private channels and DMs are never searched.
 
 ## CLI and agent skill
 

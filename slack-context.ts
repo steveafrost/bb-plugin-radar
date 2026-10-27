@@ -1,5 +1,5 @@
 /**
- * Slack context for GitHub issues: pure helpers (no clock, no disk, network only through an
+ * Slack context for issues and PRs (GitHub and Delta): pure helpers (no clock, no disk, network only through an
  * injected fetch). Radar finds public Slack messages that link an issue by URL, follows their
  * threads, and has the AI draft a short "Slack context" summary. Nothing is posted until you
  * approve the draft; then Radar keeps one marked comment per issue and edits it in place.
@@ -33,14 +33,25 @@ export type SlackThreadRead = {
 
 export type SlackSource = { channelName: string; permalink: string };
 
-/** Search phrase for an issue: the URL path, which Slack tokenises without the scheme. */
-export function issuePath(repo: string, number: number): string {
-  return `github.com/${repo}/issues/${number}`;
+/**
+ * Search phrase for an issue or PR: its web URL without the scheme, which is how Slack tokenises
+ * links (`github.com/o/r/issues/12`, `github.com/o/r/pull/7`, `delta.shopify.io/o/r/pull/9`).
+ * "" when the URL is not a plain https issue or PR page.
+ */
+export function itemPath(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "";
+  }
+  const path = parsed.pathname.replace(/\/+$/, "");
+  if (parsed.protocol !== "https:" || !/^\/[^/]+\/[^/]+\/(issues|pull)\/\d+$/.test(path)) return "";
+  return `${parsed.host.toLowerCase()}${path}`;
 }
 
 /** Arguments for slack_search_public. Public channels only, so nothing private can reach an issue. */
-export function searchArguments(repo: string, number: number, afterUnix: number | null): Record<string, unknown> {
-  const path = issuePath(repo, number);
+export function searchArguments(path: string, afterUnix: number | null): Record<string, unknown> {
   return {
     query: path,
     keywords: [`"${path}"`],
@@ -56,9 +67,9 @@ export function searchArguments(repo: string, number: number, afterUnix: number 
 
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** Exact link check: issue 12 must not match issues/123, and owner/repo must match exactly. */
-export function linksIssue(text: string, repo: string, number: number): boolean {
-  return new RegExp(`github\\.com/${escapeRegex(repo)}/issues/${number}(?![0-9])`, "i").test(text.replace(/\\\//g, "/"));
+/** Exact link check: issues/12 must not match issues/123, and host and owner/repo must match exactly. */
+export function linksItem(text: string, path: string): boolean {
+  return new RegExp(`(?<![\\w.-])${escapeRegex(path)}(?![0-9])`, "i").test(text.replace(/\\\//g, "/"));
 }
 
 const TS = /^\d{6,}\.\d{1,6}$/;
@@ -68,7 +79,7 @@ const TS = /^\d{6,}\.\d{1,6}$/;
  * people (a `From:` with an email; integration posts such as the GitHub app echoing the issue
  * have none) that really link this issue. Hits are de-duplicated by thread.
  */
-export function parseSearchResults(markdown: string, repo: string, number: number): SlackHit[] {
+export function parseSearchResults(markdown: string, path: string): SlackHit[] {
   const hits = new Map<string, SlackHit>();
   for (const block of markdown.replace(/\\\//g, "/").split(/^### Result \d+ of \d+\s*$/m).slice(1)) {
     const channel = /^Channel:\s*#?(.*?)\s*\(ID:\s*([A-Z0-9]+)\)/m.exec(block);
@@ -77,7 +88,7 @@ export function parseSearchResults(markdown: string, repo: string, number: numbe
     const permalink = /^Permalink:\s*\[[^\]]*\]\((https:\/\/[^)\s]+)\)/m.exec(block)?.[1] ?? "";
     const text = block.split(/^Text:\s*$/m)[1] ?? block;
     if (channel === null || !TS.test(messageTs) || !/<[^>\s]+@[^>\s]+>/.test(from)) continue;
-    if (!linksIssue(text, repo, number)) continue;
+    if (!linksItem(text, path)) continue;
     let threadTs = messageTs;
     try {
       const fromLink = permalink ? new URL(permalink).searchParams.get("thread_ts") : null;
@@ -171,8 +182,8 @@ export function extractSummary(body: string): string {
 // ---- the AI draft ------------------------------------------------------------
 
 export const SUMMARY_SYSTEM = [
-  "You maintain a short \"Slack context\" section on a GitHub issue, written from public Slack threads that link the issue.",
-  "Readers are engineers who did not see the Slack conversation. Capture what changes their understanding of the issue:",
+  "You maintain a short \"Slack context\" comment on an issue or pull request, written from public Slack threads that link it.",
+  "Readers are engineers who did not see the Slack conversation. Capture what changes their understanding of the work:",
   "decisions, agreed scope, open questions, blockers, owners and next steps. Leave out greetings, thanks and chatter.",
   "Write GitHub markdown: at most 6 short bullets, under 150 words. Name people only by the names shown. Never invent facts.",
   "Do not copy secrets, tokens, customer or merchant data, or anything that reads as personal.",
@@ -183,7 +194,7 @@ export const SUMMARY_SYSTEM = [
 
 export type ThreadText = { channelName: string; text: string };
 
-export function summaryPrompt(issue: { repo: string; number: number; title: string }, current: string, threads: ThreadText[]): string {
+export function summaryPrompt(issue: { kind: "issue" | "pr"; repo: string; number: number; title: string }, current: string, threads: ThreadText[]): string {
   let budget = TOTAL_CHARS;
   const parts = threads.map((thread) => {
     const text = thread.text.trim().slice(0, Math.min(THREAD_CHARS, Math.max(0, budget)));
@@ -191,7 +202,7 @@ export function summaryPrompt(issue: { repo: string; number: number; title: stri
     return `--- #${thread.channelName} ---\n${text}`;
   }).filter((part) => !part.endsWith("---\n"));
   return [
-    `Issue: ${issue.repo}#${issue.number} — ${issue.title}`,
+    `${issue.kind === "pr" ? "Pull request" : "Issue"}: ${issue.repo}#${issue.number} — ${issue.title}`,
     "",
     "Current summary:",
     current.trim() === "" ? "(none yet)" : current.trim(),

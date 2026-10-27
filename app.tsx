@@ -242,7 +242,7 @@ function RebaseAction({ item, rebase, onActive }: { item: RadarItem; rebase: (it
   }
 }
 
-/** Slack context on a GitHub issue row: a marked icon when a draft waits, else "check now". */
+/** Slack context on an issue or PR row: a marked icon when a draft waits, else "check now". */
 function SlackAction({ item }: { item: RadarItem }) {
   const actions = useContext(ReviewActions);
   const [busy, setBusy] = useState(false);
@@ -262,8 +262,8 @@ function SlackAction({ item }: { item: RadarItem }) {
   ) : (
     <ActionIcon
       icon="slack"
-      label="Check Slack for this issue"
-      tip="Check public Slack threads that link this issue (drafts only; nothing posts)"
+      label={`Check Slack for this ${item.kind === "pr" ? "PR" : "issue"}`}
+      tip={`Check public Slack threads that link this ${item.kind === "pr" ? "PR" : "issue"} (drafts only; nothing posts)`}
       onClick={() => {
         setBusy(true);
         void actions.checkSlack(item).finally(() => setBusy(false));
@@ -1298,6 +1298,7 @@ function SlackSheet({
   const [summary, setSummary] = useState(draft.summary);
   const [busy, setBusy] = useState<"" | "post" | "dismiss">("");
   const [failure, setFailure] = useState("");
+  const noun = /\/pull\/\d+/.test(draft.url) ? "PR" : "issue";
   useEscape(busy === "", onClose);
   useReturnFocus();
   const act = (kind: "post" | "dismiss", work: () => Promise<void>) => {
@@ -1326,7 +1327,7 @@ function SlackSheet({
         <div className="radar-slack">
           <p className="radar-slack__hint">
             Drafted from {draft.sources.length} public Slack thread{draft.sources.length === 1 ? "" : "s"}. Edit it, then{" "}
-            {draft.current ? "update Radar's comment on the issue" : "post it as a comment on the issue"}. Nothing has been posted yet.
+            {draft.current ? `update Radar's comment on the ${noun}` : `post it as a comment on the ${noun}`}. Nothing has been posted yet.
           </p>
           <textarea
             className="radar-input radar-slack__text"
@@ -1348,7 +1349,7 @@ function SlackSheet({
           </div>
           {draft.current ? (
             <details className="radar-slack__current">
-              <summary>On the issue now</summary>
+              <summary>On the {noun} now</summary>
               <pre>{draft.current}</pre>
             </details>
           ) : null}
@@ -1477,7 +1478,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       rebase: (item: RadarItem) =>
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
       slack: (item: RadarItem) =>
-        snapshot?.slack?.enabled !== true || item.source !== "github" || item.kind !== "issue"
+        snapshot?.slack?.enabled !== true || (item.source !== "github" && item.source !== "delta") || item.state.toLowerCase() !== "open"
           ? "off"
           : snapshot.slack.drafts[item.key] !== undefined
             ? "draft"

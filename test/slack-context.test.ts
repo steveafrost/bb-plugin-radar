@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   compareTs,
   extractSummary,
-  linksIssue,
+  itemPath,
+  linksItem,
   mcpTool,
   parseRpcBody,
   parseSearchResults,
@@ -66,30 +67,53 @@ See https://github.com/acme/issues/issues/123 instead
 ---
 `;
 
+const ISSUE = "github.com/acme/issues/issues/12";
+
+describe("itemPath", () => {
+  it("takes host and path from issue and PR URLs on any host", () => {
+    expect(itemPath("https://github.com/acme/issues/issues/12")).toBe(ISSUE);
+    expect(itemPath("https://github.com/acme/app/pull/7/")).toBe("github.com/acme/app/pull/7");
+    expect(itemPath("https://Delta.Shopify.io/shop/world/pull/2318320")).toBe("delta.shopify.io/shop/world/pull/2318320");
+  });
+  it("refuses anything else", () => {
+    expect(itemPath("http://github.com/acme/app/pull/7")).toBe("");
+    expect(itemPath("https://github.com/acme/app/pull/7/files")).toBe("");
+    expect(itemPath("https://github.com/acme/app")).toBe("");
+    expect(itemPath("not a url")).toBe("");
+  });
+});
+
 describe("searchArguments", () => {
-  it("searches the exact issue path in public channels, people only", () => {
-    expect(searchArguments("acme/issues", 12, null)).toMatchObject({
+  it("searches the exact path in public channels, people only", () => {
+    expect(searchArguments(ISSUE, null)).toMatchObject({
       keywords: ['"github.com/acme/issues/issues/12"'],
       include_bots: false,
       response_format: "detailed",
     });
-    expect(searchArguments("acme/issues", 12, null)).not.toHaveProperty("after");
-    expect(searchArguments("acme/issues", 12, 1700000000.9)).toMatchObject({ after: "1700000000" });
+    expect(searchArguments(ISSUE, null)).not.toHaveProperty("after");
+    expect(searchArguments(ISSUE, 1700000000.9)).toMatchObject({ after: "1700000000" });
   });
 });
 
-describe("linksIssue", () => {
-  it("matches the exact issue, not a longer number or another repo", () => {
-    expect(linksIssue("<https://github.com/acme/issues/issues/12|x>", "acme/issues", 12)).toBe(true);
-    expect(linksIssue("https://github.com/acme/issues/issues/12#issuecomment-1", "acme/issues", 12)).toBe(true);
-    expect(linksIssue("https://github.com/acme/issues/issues/123", "acme/issues", 12)).toBe(false);
-    expect(linksIssue("https://github.com/acme/issuesX/issues/12", "acme/issues", 12)).toBe(false);
-    expect(linksIssue("https:\\/\\/github.com\\/acme\\/issues\\/issues\\/12", "acme/issues", 12)).toBe(true);
+describe("linksItem", () => {
+  it("matches the exact item, not a longer number, another repo or another host", () => {
+    expect(linksItem("<https://github.com/acme/issues/issues/12|x>", ISSUE)).toBe(true);
+    expect(linksItem("https://github.com/acme/issues/issues/12#issuecomment-1", ISSUE)).toBe(true);
+    expect(linksItem("https://github.com/acme/issues/issues/123", ISSUE)).toBe(false);
+    expect(linksItem("https://github.com/acme/issuesX/issues/12", ISSUE)).toBe(false);
+    expect(linksItem("https://notgithub.com/acme/issues/issues/12", ISSUE)).toBe(false);
+    expect(linksItem("https:\\/\\/github.com\\/acme\\/issues\\/issues\\/12", ISSUE)).toBe(true);
+  });
+  it("tells a PR from an issue with the same number", () => {
+    const pr = "delta.shopify.io/shop/world/pull/9";
+    expect(linksItem("<https://delta.shopify.io/shop/world/pull/9/files|diff>", pr)).toBe(true);
+    expect(linksItem("https://github.com/shop/world/pull/9", pr)).toBe(false);
+    expect(linksItem("https://delta.shopify.io/shop/world/issues/9", pr)).toBe(false);
   });
 });
 
 describe("parseSearchResults", () => {
-  const hits = parseSearchResults(SEARCH, "acme/issues", 12);
+  const hits = parseSearchResults(SEARCH, ISSUE);
   it("keeps people's messages that link this issue, one per thread", () => {
     expect(hits).toEqual([
       {
@@ -111,7 +135,7 @@ describe("parseSearchResults", () => {
     expect(hits.some((hit) => hit.threadTs === "1787000001.000200")).toBe(false);
   });
   it("returns nothing for an empty or unrelated answer", () => {
-    expect(parseSearchResults("No results found.", "acme/issues", 12)).toEqual([]);
+    expect(parseSearchResults("No results found.", ISSUE)).toEqual([]);
   });
 });
 
@@ -163,7 +187,7 @@ describe("renderComment / extractSummary", () => {
 
 describe("summaryPrompt", () => {
   it("includes the current summary and caps thread text", () => {
-    const prompt = summaryPrompt({ repo: "acme/issues", number: 12, title: "Thing" }, "", [
+    const prompt = summaryPrompt({ kind: "issue", repo: "acme/issues", number: 12, title: "Thing" }, "", [
       { channelName: "team-dev", text: "x".repeat(10_000) },
       { channelName: "help", text: "short" },
     ]);
@@ -171,6 +195,9 @@ describe("summaryPrompt", () => {
     expect(prompt).toContain("(none yet)");
     expect(prompt).toContain("--- #help ---\nshort");
     expect(prompt.length).toBeLessThan(7_000);
+  });
+  it("names a pull request as one", () => {
+    expect(summaryPrompt({ kind: "pr", repo: "shop/world", number: 9, title: "Fix" }, "", [])).toContain("Pull request: shop/world#9 — Fix");
   });
 });
 

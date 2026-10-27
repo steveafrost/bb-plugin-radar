@@ -146,6 +146,7 @@ import {
   parseSummaryReply,
   parseThreadJson,
   renderComment,
+  itemPath,
   searchArguments,
   SlackAuthError,
   SlackRateLimited,
@@ -1911,11 +1912,17 @@ export default async function plugin(bb: BbPluginApi) {
     return drafts;
   }
 
-  /** Open GitHub issues on the board (hidden items excluded); Slack context only touches these. */
+  /**
+   * Open GitHub issues and PRs, and open Delta PRs, on the board and in Focus (hidden items and
+   * hidden repos/areas excluded); Slack context only touches these. Gitstream history is
+   * read-only, so it never gets a comment.
+   */
   function slackCandidates(): RadarItem[] {
     const unique = new Map<string, RadarItem>();
     for (const item of shownItems()) {
-      if (item.source === "github" && item.kind === "issue" && item.state.toLowerCase() !== "closed") unique.set(item.key, item);
+      if (visible(item) && (item.source === "github" || (item.source === "delta" && hosts().delta !== null)) && item.state.toLowerCase() === "open" && itemPath(item.url) !== "") {
+        unique.set(item.key, item);
+      }
     }
     return [...unique.values()];
   }
@@ -1964,15 +1971,53 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** Radar's own Slack-context comment on the issue (yours, carrying the marker), newest wins. */
-  async function slackComment(repo: string, number: number): Promise<{ id: number; url: string; body: string } | null> {
+  type SlackTarget = { source: Source; repo: string; number: number };
+  const slackCommentSchema = z.object({ id: z.number(), html_url: z.string(), body: z.string().nullish(), user: z.object({ login: z.string() }).nullish() });
+  const SLACK_DELTA_COMMENT_PAGES = 10;
+
+  /** `dt api` for the configured Delta repo; Delta's comments API matches GitHub's REST shape. */
+  function deltaApi(args: string[], label: string): Promise<string> {
+    const delta = hosts().delta;
+    if (delta === null) throw new UserError("Delta is not configured.");
+    return tool(config.dtPath, ["--host", delta.host, "-R", delta.repo, "api", ...args], label);
+  }
+
+  /** Radar's own Slack-context comment on the issue or PR (yours, carrying the marker), newest wins. */
+  async function slackComment(target: SlackTarget): Promise<{ id: number; url: string; body: string } | null> {
+    if (target.source === "delta") {
+      const me = (await resolveDeltaMe()).toLowerCase();
+      let found: { id: number; url: string; body: string } | null = null;
+      for (let page = 1; page <= SLACK_DELTA_COMMENT_PAGES; page += 1) {
+        const rows = parseJson(await deltaApi([`repos/${target.repo}/issues/${target.number}/comments?per_page=100&page=${page}`], "Delta comments"), "Delta comments");
+        if (!Array.isArray(rows)) throw new UserError("Delta returned no comment list.");
+        for (const row of rows) {
+          const parsed = slackCommentSchema.safeParse(row);
+          if (!parsed.success || (parsed.data.user?.login ?? "").toLowerCase() !== me || !(parsed.data.body ?? "").includes(SLACK_MARK)) continue;
+          found = { id: parsed.data.id, url: parsed.data.html_url, body: parsed.data.body ?? "" };
+        }
+        if (rows.length < 100) break;
+      }
+      return found;
+    }
     if (githubLogin === "") throw new UserError("GitHub login unknown; is gh signed in?");
     const filter = `.[] | select(.user.login == ${JSON.stringify(githubLogin)} and (.body | contains(${JSON.stringify(SLACK_MARK)}))) | {id, url: .html_url, body}`;
-    const out = await tool(config.ghPath, ["api", `repos/${repo}/issues/${number}/comments?per_page=100`, "--paginate", "--jq", filter], "GitHub comments");
+    const out = await tool(config.ghPath, ["api", `repos/${target.repo}/issues/${target.number}/comments?per_page=100`, "--paginate", "--jq", filter], "GitHub comments");
     const last = out.trim().split("\n").filter(Boolean).pop();
     if (last === undefined) return null;
     const parsed = z.object({ id: z.number(), url: z.string(), body: z.string() }).safeParse(parseRow(last));
     return parsed.success ? parsed.data : null;
+  }
+
+  /** Creates or edits the marked comment; returns its web URL. Issue comments cover PRs on both hosts. */
+  async function writeSlackComment(target: SlackTarget, existingId: number | null, body: string): Promise<string> {
+    const endpoint = existingId !== null ? `repos/${target.repo}/issues/comments/${existingId}` : `repos/${target.repo}/issues/${target.number}/comments`;
+    const method = existingId !== null ? "PATCH" : "POST";
+    const label = existingId !== null ? "Updating the Slack context comment" : "Posting the Slack context comment";
+    if (target.source === "delta") {
+      const parsed = slackCommentSchema.safeParse(parseJson(await deltaApi(["-X", method, endpoint, "-f", `body=${body}`], label), label));
+      return parsed.success ? parsed.data.html_url : "";
+    }
+    return (await tool(config.ghPath, ["api", "-X", method, endpoint, "-f", `body=${body}`, "--jq", ".html_url"], label)).trim();
   }
 
   function markSynced(key: string, marks: Record<string, string>) {
@@ -2000,10 +2045,10 @@ export default async function plugin(bb: BbPluginApi) {
       // Overlap two days so a message indexed late is still found.
       const after = checked ? Date.parse(checked.checked_at) / 1000 - 2 * 86_400 : null;
       const startedAt = new Date().toISOString();
+      const path = itemPath(item.url);
       const found = parseSearchResults(
-        unwrapText(await slackCall("slack_search_public", searchArguments(item.repo, item.number, Number.isFinite(after) ? after : null)), "results"),
-        item.repo,
-        item.number,
+        unwrapText(await slackCall("slack_search_public", searchArguments(path, Number.isFinite(after) ? after : null)), "results"),
+        path,
       );
       const upsert = db.prepare(
         "INSERT INTO slack_threads (issue_key, channel_id, thread_ts, channel_name, permalink, latest_ts, synced_ts) VALUES (?, ?, ?, ?, ?, '', '') " +
@@ -2029,7 +2074,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (existing !== null && unsynced.every((thread) => compareTs(existing.marks[threadKey(thread)] ?? "", thread.latest_ts) >= 0)) return true;
       if (aiBackend(bb, aiFallback()) === null) throw new UserError("Slack context needs AI to draft summaries; set up AI in Radar settings.");
 
-      const comment = await slackComment(item.repo, item.number);
+      const comment = await slackComment(item);
       const current = comment ? extractSummary(comment.body) : "";
       const texts = [];
       for (const thread of threads.filter((row) => row.latest_ts !== "")) {
@@ -2085,7 +2130,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function slackItem(key: string): RadarItem {
     const item = slackCandidates().find((candidate) => candidate.key === key);
-    if (item === undefined) throw new UserError("Slack context works on open GitHub issues on your board.");
+    if (item === undefined) throw new UserError("Slack context works on open GitHub issues and PRs, and open Delta PRs, on your board.");
     return item;
   }
 
@@ -2103,11 +2148,9 @@ export default async function plugin(bb: BbPluginApi) {
       const view = slackDraftView(key);
       const draft = slackDraft(key)!;
       const body = renderComment(summary, view.sources, new Date().toISOString().slice(0, 10));
-      const existing = await slackComment(view.repo, view.number);
-      const args = existing !== null
-        ? ["api", "-X", "PATCH", `repos/${view.repo}/issues/comments/${existing.id}`, "-f", `body=${body}`, "--jq", ".html_url"]
-        : ["api", "-X", "POST", `repos/${view.repo}/issues/${view.number}/comments`, "-f", `body=${body}`, "--jq", ".html_url"];
-      const url = (await tool(config.ghPath, args, existing !== null ? "Updating the Slack context comment" : "Posting the Slack context comment")).trim();
+      const target: SlackTarget = { source: key.startsWith("delta:") ? "delta" : "github", repo: view.repo, number: view.number };
+      const existing = await slackComment(target);
+      const url = await writeSlackComment(target, existing?.id ?? null, body);
       markSynced(key, draft.marks);
       db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(key);
       publish();
