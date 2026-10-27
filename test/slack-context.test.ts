@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   compareTs,
-  extractSummary,
   itemPath,
   linksItem,
   mcpTool,
@@ -11,7 +10,7 @@ import {
   parseThreadJson,
   renderComment,
   searchArguments,
-  SLACK_MARKER,
+  SLACK_HEADING,
   SlackAuthError,
   SlackRateLimited,
   summaryPrompt,
@@ -168,20 +167,16 @@ describe("compareTs", () => {
   });
 });
 
-describe("renderComment / extractSummary", () => {
-  it("round-trips the approved summary and links the threads", () => {
+describe("renderComment", () => {
+  it("puts the text under the heading and links the threads", () => {
     const body = renderComment("- Decided to ship behind a flag\n- Owner: Ada", [
       { channelName: "team-dev", permalink: "https://acme.slack.com/archives/C1/p1" },
       { channelName: "help", permalink: "" },
     ], "2026-10-27");
-    expect(body.startsWith(SLACK_MARKER)).toBe(true);
+    expect(body.startsWith(`${SLACK_HEADING}\n\n- Decided to ship behind a flag\n- Owner: Ada\n`)).toBe(true);
     expect(body).toContain("[#team-dev](https://acme.slack.com/archives/C1/p1)");
     expect(body).not.toContain("#help");
-    expect(body).toContain("Updated 2026-10-27 with Radar.");
-    expect(extractSummary(body)).toBe("- Decided to ship behind a flag\n- Owner: Ada");
-  });
-  it("ignores comments without the marker", () => {
-    expect(extractSummary("### Slack context\nsomeone else's")).toBe("");
+    expect(body).toContain("as of 2026-10-27.");
   });
 });
 

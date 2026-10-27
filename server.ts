@@ -138,7 +138,6 @@ import {
 } from "./rebase";
 import {
   compareTs,
-  extractSummary,
   MAX_SUMMARY,
   MAX_THREADS_PER_ISSUE,
   mcpTool,
@@ -254,12 +253,12 @@ const snapshotSchema = z.object({
   skills: z.object({ reviewSkill: z.string(), gitstreamReviewSkill: z.string(), triageSkill: z.string() }),
   /** Items hidden one by one (radar_hidden_items lists them); already removed from `results`. */
   hiddenCount: z.number(),
-  /** Slack context: drafts waiting for your approval, by item key. */
+  /** Slack context: board items that public Slack threads link, by item key. */
   slack: z.object({
     enabled: z.boolean(),
     error: z.string(),
     sweptAt: z.string(),
-    drafts: z.record(z.string(), z.object({ at: z.string(), threads: z.number() })),
+    items: z.record(z.string(), z.object({ threads: z.number(), isNew: z.boolean() })),
   }),
 });
 
@@ -268,18 +267,23 @@ export type ReviewContext = { title: string; prompt: string; defaultProjectId: s
 export type LaneResult = z.infer<typeof laneResultSchema>;
 export type RadarSnapshot = Omit<z.infer<typeof snapshotSchema>, "lanes"> & { lanes: Lane[] };
 export type { FocusState, HiddenEntry, Lane, RebaseResult, ScopeEntry, ScopeFilter };
-export type SlackDraftView = {
+export type SlackContextView = {
   key: string;
+  kind: "pr" | "issue";
   repo: string;
   number: number;
   title: string;
   url: string;
-  /** The AI's proposed summary; you can edit it before posting. */
+  /** Radar's AI summary of the linked threads ("" when AI is off or has not run yet). */
   summary: string;
-  /** The summary in the comment on the issue now ("" if Radar has not posted one). */
-  current: string;
+  summaryError: string;
+  summarizedAt: string;
+  checkedAt: string;
+  /** Linked threads with human messages, newest first. */
   sources: SlackSource[];
-  at: string;
+  /** Your last "Post to issue/PR", if any. */
+  posted: { url: string; at: string } | null;
+  isNew: boolean;
 };
 
 export const rpcContract = defineRpcContract({
@@ -330,16 +334,14 @@ export const rpcContract = defineRpcContract({
     output: z.any(),
   },
   /** Server-side rebase of one of your open PRs; authorship and state are re-checked on the host. */
-  /** The pending Slack-context draft for one GitHub issue. */
-  radar_slack_draft: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
-  /** Posts (or edits Radar's existing) Slack-context comment with your approved summary. */
-  radar_slack_publish: {
+  /** Slack context for one item (opening it clears its "new" mark). */
+  radar_slack_context: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
+  /** "Post to issue/PR": a new comment with your text and the thread links. Panel only. */
+  radar_slack_post: {
     input: z.object({ key: z.string().min(1).max(300), summary: z.string().trim().min(1).max(MAX_SUMMARY) }),
     output: z.object({ url: z.string() }),
   },
-  /** Drops the draft and marks the threads read, so only newer Slack messages draft again. */
-  radar_slack_dismiss: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
-  /** Checks one issue against Slack now instead of waiting for its turn. */
+  /** Checks one item against Slack now instead of waiting for its turn; returns its context. */
   radar_slack_check: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
   radar_rebase: {
     input: z.object({
@@ -554,11 +556,14 @@ export default async function plugin(bb: BbPluginApi) {
     // Last refresh's lane results (result = LaneResult as JSON), so a restart shows what Radar knew.
     "CREATE TABLE results_cache (lane_id TEXT PRIMARY KEY, query_key TEXT NOT NULL, result TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE results_meta (id INTEGER PRIMARY KEY CHECK (id = 1), fetched_at TEXT NOT NULL)",
-    // Slack context: threads that link an issue (latest_ts = newest human message seen, synced_ts =
-    // newest one already summarised or dismissed), when each issue was last searched, and drafts.
+    // Slack context: threads that link an item (latest_ts = newest human message seen; synced_ts is
+    // unused since the summary records what it covers), when each item was last searched, and
+    // Radar's context per item (context = summary, coverage, seen and posted marks as JSON).
     "CREATE TABLE slack_threads (issue_key TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL, channel_name TEXT NOT NULL, permalink TEXT NOT NULL, latest_ts TEXT NOT NULL, synced_ts TEXT NOT NULL, PRIMARY KEY (issue_key, channel_id, thread_ts)) WITHOUT ROWID",
     "CREATE TABLE slack_issues (issue_key TEXT PRIMARY KEY, checked_at TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE slack_drafts (issue_key TEXT PRIMARY KEY, draft TEXT NOT NULL) WITHOUT ROWID",
+    "DROP TABLE slack_drafts",
+    "CREATE TABLE slack_context (issue_key TEXT PRIMARY KEY, context TEXT NOT NULL) WITHOUT ROWID",
   ]);
   const parseRow = (value: unknown): unknown => {
     try {
@@ -1853,14 +1858,13 @@ export default async function plugin(bb: BbPluginApi) {
   // ---- Slack context ------------------------------------------------------
   //
   // A slow background sweep (its own service, so the board's 90s poll never waits on Slack):
-  // a few open GitHub issues per sweep, least recently checked first, are searched for public
-  // Slack messages that link them. Their threads are followed; when a thread has human
-  // messages newer than the last summary, the AI drafts an update. Drafts wait for approval.
-
+  // a few open issues and PRs per sweep, least recently checked first, are searched for public
+  // Slack messages that link them. Their threads are followed; when a thread has human messages
+  // newer than the summary, the AI refreshes Radar's own summary. The board shows it; nothing is
+  // written to GitHub or Delta unless you choose "Post to issue/PR".
   const SLACK_ISSUES_PER_SWEEP = 8;
   const SLACK_CALL_GAP_MS = 1_200;
   const SLACK_TOKEN_TTL_MS = 20 * 60_000;
-  const SLACK_MARK = "radar:slack-context";
   type SlackThreadRow = {
     issue_key: string;
     channel_id: string;
@@ -1870,18 +1874,22 @@ export default async function plugin(bb: BbPluginApi) {
     latest_ts: string;
     synced_ts: string;
   };
-  const slackDraftSchema = z.object({
-    repo: z.string(),
-    number: z.number(),
-    title: z.string(),
-    url: z.string(),
+  const slackContextSchema = z.object({
+    /** Radar's AI summary of the linked threads ("" when AI is off or has not run yet). */
     summary: z.string(),
-    current: z.string(),
-    at: z.string(),
-    /** thread key (channel:ts) → the latest_ts the draft covers; approving marks exactly these read. */
+    summaryError: z.string(),
+    summarizedAt: z.string(),
+    /** thread key (channel:ts) → the latest_ts the summary covers. */
     marks: z.record(z.string(), z.string()),
+    /** When the context last gained something (a new thread or a changed summary)… */
+    updatedAt: z.string(),
+    /** …and when you last opened it; newer updatedAt shows as new on the row. */
+    seenAt: z.string(),
+    /** Your last "Post to issue/PR", if any. */
+    posted: z.object({ url: z.string(), at: z.string() }).nullable(),
   });
-  type SlackDraft = z.infer<typeof slackDraftSchema>;
+  type SlackContext = z.infer<typeof slackContextSchema>;
+  const EMPTY_CONTEXT: SlackContext = { summary: "", summaryError: "", summarizedAt: "", marks: {}, updatedAt: "", seenAt: "", posted: null };
   let slackError = "";
   let slackSweptAt = "";
   let slackToken: { value: string; at: number } | null = null;
@@ -1897,25 +1905,23 @@ export default async function plugin(bb: BbPluginApi) {
   function slackThreads(key: string): SlackThreadRow[] {
     return db.prepare("SELECT * FROM slack_threads WHERE issue_key = ? ORDER BY CAST(thread_ts AS REAL) DESC").all(key) as SlackThreadRow[];
   }
-  function slackDraft(key: string): SlackDraft | null {
-    const row = db.prepare("SELECT draft FROM slack_drafts WHERE issue_key = ?").get(key) as { draft: string } | undefined;
-    const parsed = slackDraftSchema.safeParse(parseRow(row?.draft));
-    return parsed.success ? parsed.data : null;
+  function slackContext(key: string): SlackContext {
+    const row = db.prepare("SELECT context FROM slack_context WHERE issue_key = ?").get(key) as { context: string } | undefined;
+    const parsed = slackContextSchema.safeParse(parseRow(row?.context));
+    return parsed.success ? parsed.data : { ...EMPTY_CONTEXT };
   }
-  function slackDrafts(): Map<string, SlackDraft> {
-    const rows = db.prepare("SELECT issue_key, draft FROM slack_drafts").all() as { issue_key: string; draft: string }[];
-    const drafts = new Map<string, SlackDraft>();
-    for (const row of rows) {
-      const parsed = slackDraftSchema.safeParse(parseRow(row.draft));
-      if (parsed.success) drafts.set(row.issue_key, parsed.data);
-    }
-    return drafts;
+  function saveSlackContext(key: string, context: SlackContext) {
+    db.prepare("INSERT INTO slack_context (issue_key, context) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET context = excluded.context").run(key, JSON.stringify(context));
+  }
+  /** Linked threads with at least one human message: what the board counts and the sheet lists. */
+  function liveThreads(key: string): SlackThreadRow[] {
+    return slackThreads(key).filter((thread) => thread.latest_ts !== "");
   }
 
   /**
    * Open GitHub issues and PRs, and open Delta PRs, on the board and in Focus (hidden items and
-   * hidden repos/areas excluded); Slack context only touches these. Gitstream history is
-   * read-only, so it never gets a comment.
+   * hidden repos/areas excluded); Slack context only looks at these. Gitstream history is
+   * read-only, so it has nowhere to post.
    */
   function slackCandidates(): RadarItem[] {
     const unique = new Map<string, RadarItem>();
@@ -1928,10 +1934,14 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function slackState() {
-    const board = new Set(slackCandidates().map((item) => item.key));
-    const drafts: Record<string, { at: string; threads: number }> = {};
-    for (const [key, draft] of slackDrafts()) if (board.has(key)) drafts[key] = { at: draft.at, threads: Object.keys(draft.marks).length };
-    return { enabled: slackEnabled(), error: slackEnabled() ? slackError : "", sweptAt: slackSweptAt, drafts };
+    const items: Record<string, { threads: number; isNew: boolean }> = {};
+    for (const item of slackCandidates()) {
+      const threads = liveThreads(item.key).length;
+      if (threads === 0) continue;
+      const context = slackContext(item.key);
+      items[item.key] = { threads, isNew: context.updatedAt !== "" && context.updatedAt > context.seenAt };
+    }
+    return { enabled: slackEnabled(), error: slackEnabled() ? slackError : "", sweptAt: slackSweptAt, items };
   }
 
   function slackSleep(ms: number): Promise<void> {
@@ -1972,8 +1982,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   type SlackTarget = { source: Source; repo: string; number: number };
-  const slackCommentSchema = z.object({ id: z.number(), html_url: z.string(), body: z.string().nullish(), user: z.object({ login: z.string() }).nullish() });
-  const SLACK_DELTA_COMMENT_PAGES = 10;
+  const slackCommentSchema = z.object({ html_url: z.string() });
 
   /** `dt api` for the configured Delta repo; Delta's comments API matches GitHub's REST shape. */
   function deltaApi(args: string[], label: string): Promise<string> {
@@ -1982,52 +1991,16 @@ export default async function plugin(bb: BbPluginApi) {
     return tool(config.dtPath, ["--host", delta.host, "-R", delta.repo, "api", ...args], label);
   }
 
-  /** Radar's own Slack-context comment on the issue or PR (yours, carrying the marker), newest wins. */
-  async function slackComment(target: SlackTarget): Promise<{ id: number; url: string; body: string } | null> {
+  /** Posts a new comment (issue comments cover PRs on both hosts); returns its web URL. */
+  async function postComment(target: SlackTarget, body: string): Promise<string> {
+    const endpoint = `repos/${target.repo}/issues/${target.number}/comments`;
+    const label = "Posting the Slack context comment";
     if (target.source === "delta") {
-      const me = (await resolveDeltaMe()).toLowerCase();
-      let found: { id: number; url: string; body: string } | null = null;
-      for (let page = 1; page <= SLACK_DELTA_COMMENT_PAGES; page += 1) {
-        const rows = parseJson(await deltaApi([`repos/${target.repo}/issues/${target.number}/comments?per_page=100&page=${page}`], "Delta comments"), "Delta comments");
-        if (!Array.isArray(rows)) throw new UserError("Delta returned no comment list.");
-        for (const row of rows) {
-          const parsed = slackCommentSchema.safeParse(row);
-          if (!parsed.success || (parsed.data.user?.login ?? "").toLowerCase() !== me || !(parsed.data.body ?? "").includes(SLACK_MARK)) continue;
-          found = { id: parsed.data.id, url: parsed.data.html_url, body: parsed.data.body ?? "" };
-        }
-        if (rows.length < 100) break;
-      }
-      return found;
-    }
-    if (githubLogin === "") throw new UserError("GitHub login unknown; is gh signed in?");
-    const filter = `.[] | select(.user.login == ${JSON.stringify(githubLogin)} and (.body | contains(${JSON.stringify(SLACK_MARK)}))) | {id, url: .html_url, body}`;
-    const out = await tool(config.ghPath, ["api", `repos/${target.repo}/issues/${target.number}/comments?per_page=100`, "--paginate", "--jq", filter], "GitHub comments");
-    const last = out.trim().split("\n").filter(Boolean).pop();
-    if (last === undefined) return null;
-    const parsed = z.object({ id: z.number(), url: z.string(), body: z.string() }).safeParse(parseRow(last));
-    return parsed.success ? parsed.data : null;
-  }
-
-  /** Creates or edits the marked comment; returns its web URL. Issue comments cover PRs on both hosts. */
-  async function writeSlackComment(target: SlackTarget, existingId: number | null, body: string): Promise<string> {
-    const endpoint = existingId !== null ? `repos/${target.repo}/issues/comments/${existingId}` : `repos/${target.repo}/issues/${target.number}/comments`;
-    const method = existingId !== null ? "PATCH" : "POST";
-    const label = existingId !== null ? "Updating the Slack context comment" : "Posting the Slack context comment";
-    if (target.source === "delta") {
-      const parsed = slackCommentSchema.safeParse(parseJson(await deltaApi(["-X", method, endpoint, "-f", `body=${body}`], label), label));
+      const parsed = slackCommentSchema.safeParse(parseJson(await deltaApi(["-X", "POST", endpoint, "-f", `body=${body}`], label), label));
       return parsed.success ? parsed.data.html_url : "";
     }
-    return (await tool(config.ghPath, ["api", "-X", method, endpoint, "-f", `body=${body}`, "--jq", ".html_url"], label)).trim();
+    return (await tool(config.ghPath, ["api", "-X", "POST", endpoint, "-f", `body=${body}`, "--jq", ".html_url"], label)).trim();
   }
-
-  function markSynced(key: string, marks: Record<string, string>) {
-    const update = db.prepare("UPDATE slack_threads SET synced_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
-    for (const [thread, ts] of Object.entries(marks)) {
-      const [channel, threadTs] = thread.split(":");
-      if (channel !== undefined && threadTs !== undefined) update.run(ts, key, channel, threadTs);
-    }
-  }
-
   function slackLocked<T>(key: string, work: () => Promise<T>): Promise<T> {
     const previous = slackBusy.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(work);
@@ -2038,8 +2011,8 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
-  /** Search, follow threads, and draft when there is something new. Returns whether a draft is waiting. */
-  function checkSlackIssue(item: RadarItem): Promise<boolean> {
+  /** Search, follow threads, and refresh Radar's summary when there is something new. */
+  function checkSlackIssue(item: RadarItem): Promise<void> {
     return slackLocked(item.key, async () => {
       const checked = db.prepare("SELECT checked_at FROM slack_issues WHERE issue_key = ?").get(item.key) as { checked_at: string } | undefined;
       // Overlap two days so a message indexed late is still found.
@@ -2067,34 +2040,39 @@ export default async function plugin(bb: BbPluginApi) {
       }
       db.prepare("INSERT INTO slack_issues (issue_key, checked_at) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET checked_at = excluded.checked_at").run(item.key, startedAt);
 
-      const unsynced = threads.filter((thread) => compareTs(thread.latest_ts, thread.synced_ts) > 0);
-      if (unsynced.length === 0) return slackDraft(item.key) !== null;
-      const existing = slackDraft(item.key);
-      // A waiting draft that already covers every new message needs no second AI call.
-      if (existing !== null && unsynced.every((thread) => compareTs(existing.marks[threadKey(thread)] ?? "", thread.latest_ts) >= 0)) return true;
-      if (aiBackend(bb, aiFallback()) === null) throw new UserError("Slack context needs AI to draft summaries; set up AI in Radar settings.");
-
-      const comment = await slackComment(item);
-      const current = comment ? extractSummary(comment.body) : "";
-      const texts = [];
-      for (const thread of threads.filter((row) => row.latest_ts !== "")) {
-        const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
-        texts.push({ channelName: thread.channel_name, text });
+      const live = threads.filter((thread) => thread.latest_ts !== "");
+      const context = slackContext(item.key);
+      const stale = live.filter((thread) => compareTs(thread.latest_ts, context.marks[threadKey(thread)] ?? "") > 0);
+      if (stale.length === 0) return;
+      const now = new Date().toISOString();
+      const marks = Object.fromEntries(live.map((row) => [threadKey(row), row.latest_ts]));
+      // A thread the summary has never covered is news on its own, AI or not.
+      const newThread = stale.some((thread) => context.marks[threadKey(thread)] === undefined);
+      const next: SlackContext = { ...context, marks, updatedAt: newThread ? now : context.updatedAt };
+      if (aiBackend(bb, aiFallback()) !== null) {
+        try {
+          const texts = [];
+          for (const thread of live) {
+            const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
+            texts.push({ channelName: thread.channel_name, text });
+          }
+          const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, context.summary, texts), 700));
+          next.summaryError = "";
+          next.summarizedAt = now;
+          if (reply.changed || context.summary === "") {
+            next.summary = reply.summary;
+            next.updatedAt = now;
+          }
+        } catch (error) {
+          if (error instanceof ToolAborted || error instanceof SlackRateLimited || error instanceof SlackAuthError) throw error;
+          // Keep the threads visible; the summary catches up on the next check.
+          next.marks = context.marks;
+          next.summaryError = error instanceof Error ? error.message : String(error);
+        }
       }
-      const marks = Object.fromEntries(threads.filter((row) => row.latest_ts !== "").map((row) => [threadKey(row), row.latest_ts]));
-      const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, current, texts), 700));
-      if (!reply.changed) {
-        // Nothing material: mark read so the same messages don't draft again.
-        markSynced(item.key, marks);
-        db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(item.key);
-        return false;
-      }
-      const draft: SlackDraft = { repo: item.repo, number: item.number, title: item.title, url: item.url, summary: reply.summary, current, at: new Date().toISOString(), marks };
-      db.prepare("INSERT INTO slack_drafts (issue_key, draft) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET draft = excluded.draft").run(item.key, JSON.stringify(draft));
-      return true;
+      saveSlackContext(item.key, next);
     });
   }
-
   function sweepSlack(): Promise<void> {
     if (!slackEnabled() || disposed) return Promise.resolve();
     if (slackSweep !== null) return slackSweep;
@@ -2134,37 +2112,47 @@ export default async function plugin(bb: BbPluginApi) {
     return item;
   }
 
-  function slackDraftView(key: string): SlackDraftView {
-    const draft = slackDraft(key);
-    if (draft === null) throw new UserError("No Slack context draft for this issue. It may have been posted or dismissed.");
-    const sources = slackThreads(key)
-      .filter((thread) => thread.latest_ts !== "" && draft.marks[threadKey(thread)] !== undefined)
-      .map((thread) => ({ channelName: thread.channel_name, permalink: thread.permalink }));
-    return { key, repo: draft.repo, number: draft.number, title: draft.title, url: draft.url, summary: draft.summary, current: draft.current, sources, at: draft.at };
+  function slackContextView(key: string): SlackContextView {
+    const item = slackItem(key);
+    const context = slackContext(key);
+    const checked = db.prepare("SELECT checked_at FROM slack_issues WHERE issue_key = ?").get(key) as { checked_at: string } | undefined;
+    return {
+      key,
+      kind: item.kind,
+      repo: item.repo,
+      number: item.number,
+      title: item.title,
+      url: item.url,
+      summary: context.summary,
+      summaryError: context.summaryError,
+      summarizedAt: context.summarizedAt,
+      checkedAt: checked?.checked_at ?? "",
+      sources: liveThreads(key).map((thread) => ({ channelName: thread.channel_name, permalink: thread.permalink })),
+      posted: context.posted,
+      isNew: context.updatedAt !== "" && context.updatedAt > context.seenAt,
+    };
   }
 
-  function publishSlack(key: string, summary: string): Promise<{ url: string }> {
+  /** Opening the context in the panel clears its "new" mark. */
+  function seeSlack(key: string): SlackContextView {
+    const view = slackContextView(key);
+    if (view.isNew) {
+      saveSlackContext(key, { ...slackContext(key), seenAt: new Date().toISOString() });
+      publish();
+    }
+    return view;
+  }
+
+  /** "Post to issue/PR": a new comment with your text and links to the threads. Never automatic. */
+  function postSlack(key: string, summary: string): Promise<{ url: string }> {
     return slackLocked(key, async () => {
-      const view = slackDraftView(key);
-      const draft = slackDraft(key)!;
+      const view = slackContextView(key);
+      if (view.sources.length === 0) throw new UserError("No Slack threads link this item any more.");
       const body = renderComment(summary, view.sources, new Date().toISOString().slice(0, 10));
-      const target: SlackTarget = { source: key.startsWith("delta:") ? "delta" : "github", repo: view.repo, number: view.number };
-      const existing = await slackComment(target);
-      const url = await writeSlackComment(target, existing?.id ?? null, body);
-      markSynced(key, draft.marks);
-      db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(key);
+      const url = (await postComment({ source: key.startsWith("delta:") ? "delta" : "github", repo: view.repo, number: view.number }, body)) || view.url;
+      saveSlackContext(key, { ...slackContext(key), posted: { url, at: new Date().toISOString() } });
       publish();
-      return { url: url || existing?.url || view.url };
-    });
-  }
-
-  function dismissSlack(key: string): Promise<RadarSnapshot> {
-    return slackLocked(key, async () => {
-      const draft = slackDraft(key);
-      if (draft !== null) markSynced(key, draft.marks);
-      db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(key);
-      publish();
-      return snapshot();
+      return { url };
     });
   }
 
@@ -2240,14 +2228,13 @@ export default async function plugin(bb: BbPluginApi) {
     radar_review_context: ({ key }) => reviewContext(key),
     radar_review_start: ({ key, request }) => startReview(key, request),
     radar_rebase: ({ source, repo, number }) => rebase({ source, repo, number }),
-    radar_slack_draft: ({ key }) => slackDraftView(key),
-    radar_slack_publish: ({ key, summary }) => publishSlack(key, summary),
-    radar_slack_dismiss: ({ key }) => dismissSlack(key),
+    radar_slack_context: ({ key }) => seeSlack(key),
+    radar_slack_post: ({ key, summary }) => postSlack(key, summary),
     radar_slack_check: async ({ key }) => {
       if (!slackEnabled()) throw new UserError("Slack context is off. Set the Slack endpoint and token command in Radar settings.");
       await checkSlackIssue(slackItem(key));
       publish();
-      return snapshot();
+      return seeSlack(key);
     },
   });
 
@@ -2317,8 +2304,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb radar hide-item <url|key> [--json]     hide one PR or issue everywhere until unhidden",
     "  bb radar unhide-item <url|key> | --all [--json]  bring hidden items back",
     "  bb radar hidden [--json]                  list items hidden one by one",
-    "  bb radar slack [--json]                   Slack context drafts waiting for approval",
-    "  bb radar slack-check <url|key> [--json]   check one GitHub issue against Slack now (drafts only; never posts)",
+    "  bb radar slack [<url|key>] [--json]       Slack context: board items linked from public Slack threads, with Radar's summary",
+    "  bb radar slack-check <url|key> [--json]   check one open issue/PR against Slack now (reads only; never posts)",
     "  bb radar rebase <url|owner/repo#n> [--source github|delta] --yes [--json]",
     "                                            rebase your own open PR (GitHub server-side; Delta via git)",
     "",
@@ -2357,8 +2344,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "hide-item", summary: "Hide one PR or issue everywhere", usage: "bb radar hide-item <url|key|owner/repo#n> [--json]" },
       { name: "unhide-item", summary: "Unhide one item, or all", usage: "bb radar unhide-item <url|key|owner/repo#n> | --all [--json]" },
       { name: "hidden", summary: "List items hidden one by one", usage: "bb radar hidden [--json]" },
-      { name: "slack", summary: "Slack context drafts waiting for approval (approve them in the panel)", usage: "bb radar slack [--json]" },
-      { name: "slack-check", summary: "Check one GitHub issue against Slack now", usage: "bb radar slack-check <url|key|owner/repo#n> [--json]" },
+      { name: "slack", summary: "Slack context for board items: linked public threads and Radar's summary", usage: "bb radar slack [<url|key|owner/repo#n>] [--json]" },
+      { name: "slack-check", summary: "Check one open issue or PR against Slack now (never posts)", usage: "bb radar slack-check <url|key|owner/repo#n> [--json]" },
       {
         name: "rebase",
         summary: "Rebase your own open PR onto its base (GitHub server-side, Delta via git replay + leased push; needs --yes)",
@@ -2588,17 +2575,22 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "slack": {
             const state = slackState();
-            const drafts = Object.keys(state.drafts).map((key) => slackDraftView(key));
-            if (json) return { exitCode: 0, stdout: JSON.stringify({ ...state, drafts }) };
             if (!state.enabled) return { exitCode: 0, stdout: "Slack context is off (set the Slack endpoint and token command in Radar settings)." };
+            const positional = rest.filter((arg) => !arg.startsWith("--"));
+            if (fetchedAt === "") await refreshAll();
+            const keys = positional[0] !== undefined ? [cliItemKey(positional[0], slackCandidates())] : Object.keys(state.items);
+            const views = keys.map((key) => slackContextView(key));
+            if (json) return { exitCode: 0, stdout: JSON.stringify(positional[0] !== undefined ? views[0] : { enabled: state.enabled, error: state.error, sweptAt: state.sweptAt, items: views }) };
             const head = [`last sweep ${state.sweptAt || "(not yet)"}${state.error ? `  ERROR: ${state.error}` : ""}`];
-            if (drafts.length === 0) return { exitCode: 0, stdout: [...head, "No drafts waiting."].join("\n") };
+            if (views.length === 0) return { exitCode: 0, stdout: [...head, "No board items are linked from public Slack threads yet."].join("\n") };
             return {
               exitCode: 0,
               stdout: [
                 ...head,
-                ...drafts.map((draft) => `${draft.repo}#${draft.number}  ${draft.title.slice(0, 70)}\n  ${draft.summary.replace(/\n/g, "\n  ")}\n  sources: ${draft.sources.map((source) => `#${source.channelName}`).join(", ")}`),
-                "Approve, edit or dismiss them in the Radar panel.",
+                ...views.map((view) => {
+                  const summary = view.summary !== "" ? view.summary : view.summaryError !== "" ? `(no summary: ${view.summaryError})` : "(no summary yet)";
+                  return `${view.repo}#${view.number}${view.isNew ? "  [new]" : ""}  ${view.title.slice(0, 70)}\n  ${summary.replace(/\n/g, "\n  ")}\n  threads: ${view.sources.map((source) => source.permalink || `#${source.channelName}`).join("  ")}${view.posted ? `\n  posted: ${view.posted.url}` : ""}`;
+                }),
               ].join("\n"),
             };
           }
@@ -2607,11 +2599,13 @@ export default async function plugin(bb: BbPluginApi) {
             if (rest[0] === undefined) return { exitCode: 1, stderr: "Usage: bb radar slack-check <url|key|owner/repo#n>" };
             if (fetchedAt === "") await refreshAll();
             const key = cliItemKey(rest[0], slackCandidates());
-            const drafted = await checkSlackIssue(slackItem(key));
+            await checkSlackIssue(slackItem(key));
             publish();
-            if (json) return { exitCode: 0, stdout: JSON.stringify({ key, draft: drafted ? slackDraftView(key) : null, threads: slackThreads(key).length }) };
-            const threads = slackThreads(key).length;
-            return { exitCode: 0, stdout: drafted ? `Draft ready (${threads} thread${threads === 1 ? "" : "s"}); review it in the Radar panel.` : `No new Slack context (${threads} linked thread${threads === 1 ? "" : "s"}).` };
+            const view = slackContextView(key);
+            if (json) return { exitCode: 0, stdout: JSON.stringify(view) };
+            if (view.sources.length === 0) return { exitCode: 0, stdout: "No public Slack threads link it." };
+            const count = `${view.sources.length} linked thread${view.sources.length === 1 ? "" : "s"}`;
+            return { exitCode: 0, stdout: `${count}.\n${view.summary || view.summaryError || "(no summary)"}` };
           }
           case "rebase": {
             const sourceIndex = rest.indexOf("--source");

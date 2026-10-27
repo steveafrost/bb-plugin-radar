@@ -1,13 +1,11 @@
 /**
- * Slack context for issues and PRs (GitHub and Delta): pure helpers (no clock, no disk, network only through an
- * injected fetch). Radar finds public Slack messages that link an issue by URL, follows their
- * threads, and has the AI draft a short "Slack context" summary. Nothing is posted until you
- * approve the draft; then Radar keeps one marked comment per issue and edits it in place.
+ * Slack context for issues and PRs (GitHub and Delta): pure helpers (no clock, no disk, network
+ * only through an injected fetch). Radar finds public Slack messages that link an item by URL,
+ * follows their threads, and keeps a short AI summary that it shows on the board. The summary is
+ * Radar's own; posting it to the issue or PR is a one-off action you take, never automatic.
  */
 import { z } from "zod";
 
-/** Hidden marker that identifies Radar's one Slack-context comment on an issue. */
-export const SLACK_MARKER = "<!-- radar:slack-context -->";
 export const SLACK_HEADING = "### Slack context";
 /** Threads followed per issue (newest first); older links stay stored but are not re-read. */
 export const MAX_THREADS_PER_ISSUE = 5;
@@ -152,40 +150,29 @@ export function compareTs(a: string, b: string): number {
   return x === y ? 0 : x > y ? 1 : -1;
 }
 
-// ---- the issue comment -----------------------------------------------------
+// ---- posting to the issue or PR ----------------------------------------------
 
-/** The full comment body Radar posts: marker, heading, your approved summary, then the sources. */
+/** The comment body for "Post to issue": heading, the text you approved, then the sources. */
 export function renderComment(summary: string, sources: SlackSource[], date: string): string {
   const links = sources
     .filter((source) => source.permalink !== "")
     .map((source) => `[#${source.channelName.replace(/[[\]]/g, "")}](${source.permalink})`);
   return [
-    SLACK_MARKER,
     SLACK_HEADING,
     "",
     summary.trim(),
     "",
-    `<sub>From public Slack threads${links.length ? `: ${links.join(" · ")}` : ""}. Updated ${date} with Radar.</sub>`,
+    `<sub>From public Slack threads${links.length ? `: ${links.join(" · ")}` : ""}, as of ${date}.</sub>`,
   ].join("\n");
-}
-
-/** The summary part of an existing Radar comment (what you approved last time). */
-export function extractSummary(body: string): string {
-  if (!body.includes(SLACK_MARKER)) return "";
-  return body
-    .replace(SLACK_MARKER, "")
-    .replace(SLACK_HEADING, "")
-    .replace(/\n*<sub>From public Slack threads[\s\S]*?<\/sub>\s*$/, "")
-    .trim();
 }
 
 // ---- the AI draft ------------------------------------------------------------
 
 export const SUMMARY_SYSTEM = [
-  "You maintain a short \"Slack context\" comment on an issue or pull request, written from public Slack threads that link it.",
+  "You keep a short \"Slack context\" summary for an issue or pull request, written from public Slack threads that link it.",
   "Readers are engineers who did not see the Slack conversation. Capture what changes their understanding of the work:",
   "decisions, agreed scope, open questions, blockers, owners and next steps. Leave out greetings, thanks and chatter.",
-  "Write GitHub markdown: at most 6 short bullets, under 150 words. Name people only by the names shown. Never invent facts.",
+  "It is shown on the engineer's dashboard and may be posted to the issue, so write GitHub markdown: at most 6 short bullets, under 150 words. Name people only by the names shown. Never invent facts.",
   "Do not copy secrets, tokens, customer or merchant data, or anything that reads as personal.",
   "If a current summary is given, return an updated version of it: keep what still holds, fix what changed, add what is new.",
   "Answer with JSON only: {\"changed\": boolean, \"summary\": string}. changed is false when the threads add nothing",

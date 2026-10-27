@@ -27,8 +27,8 @@ bb radar hide <repo|area>… / show <…> [--json]  # hide or unhide whole repos
 bb radar hide-item <url|key> [--json]      # hide ONE PR/issue everywhere until unhidden (key: github:owner/repo#12; owner/repo#12 if unique)
 bb radar unhide-item <url|key> | --all [--json]  # bring one (or every) hidden item back
 bb radar hidden [--json]                   # items hidden one by one, newest first
-bb radar slack [--json]                    # Slack context drafts waiting for approval (approval is in the panel only)
-bb radar slack-check <url|key> [--json]    # check one open issue/PR (GitHub, or a Delta PR) against public Slack now; drafts only, never posts
+bb radar slack [<url|key>] [--json]        # Slack context: board items linked from public Slack threads, Radar's summary and thread links
+bb radar slack-check <url|key> [--json]    # check one open issue/PR (GitHub, or a Delta PR) against public Slack now; reads only, never posts
 bb radar focus --off | --on                # Focus off = normal board (focus is kept); --on resumes it
 bb radar scopes [--json]                   # repos + area-repo areas in results, counts, focus state
 bb radar list --all                        # ignore the focus filter
@@ -42,7 +42,7 @@ Scope keys: repos are `owner/name`; areas of the `areaRepo` setting (a monorepo)
 
 Hidden items (`hide-item`) are separate from Focus: one PR or issue, by key, gone from every lane, view, the badge, `status` and `list` (even `list --all`), never marked seen. A hide lasts until `unhide-item`; an entry whose item has been in no lane for 30 days is pruned. Only hide or unhide when the user asks.
 
-Slack context (on when `slackMcpUrl` and `slackTokenCommand` are set): Radar searches public Slack channels for human messages that link an open GitHub issue or PR, or an open Delta PR, on the board (in Focus), follows those threads, and has the AI draft a short summary. Drafts are only posted when the user approves them in the panel, as one marked comment that later approvals edit in place. Agents can list and check drafts but cannot post them.
+Slack context (on when `slackMcpUrl` and `slackTokenCommand` are set): Radar searches public Slack channels for human messages that link an open GitHub issue or PR, or an open Delta PR, on the board (in Focus), follows those threads, and keeps a short AI summary that the board shows (a Slack icon on the row, dotted when new). Use `bb radar slack <item>` to bring that context into a review or triage. Radar never writes it to GitHub or Delta by itself; "Post to issue/PR" is a panel-only action the user takes, which adds one new comment. Agents can read and check context but cannot post it.
 
 `add` sends the description through BB’s configured-provider text completion API, validates the drafted lane,
 runs it once, and prints how many items match. Use `--dry-run` to preview first.

@@ -1392,13 +1392,13 @@ header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   position: relative;
   display: inline-flex;
 }
-.radar-item .radar-item__actions > .radar-act-wrap[data-slack-draft] {
+.radar-item .radar-item__actions > .radar-act-wrap[data-slack-context] {
   opacity: 1;
 }
-.radar-act-wrap[data-slack-draft] .radar-act {
+.radar-act-wrap[data-slack-context] .radar-act {
   color: var(--r-accent);
 }
-.radar-act-wrap[data-slack-draft]::before {
+.radar-act-wrap[data-slack-new]::before {
   content: "";
   position: absolute;
   top: 3px;
@@ -1417,10 +1417,35 @@ header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   overflow-y: auto;
   padding: 12px 14px 14px;
 }
-.radar-slack__hint,
-.radar-slack__sources {
+.radar-slack__hint {
   margin: 0;
   color: var(--r-muted);
+}
+.radar-slack__summary {
+  line-height: 1.5;
+}
+.radar-slack__summary ul {
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+}
+.radar-slack__summary li + li {
+  margin-top: 4px;
+}
+.radar-slack__summary p {
+  margin: 0 0 6px;
+}
+.radar-slack__summary code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.92em;
+}
+.radar-slack__sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 .radar-slack__text {
   width: 100%;
@@ -1432,18 +1457,6 @@ header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   font-size: 12px;
   line-height: 1.5;
   box-sizing: border-box;
-}
-.radar-slack__current summary {
-  cursor: pointer;
-  color: var(--r-muted);
-}
-.radar-slack__current pre {
-  margin: 6px 0 0;
-  padding: 8px 10px;
-  border-radius: var(--r-radius-sm);
-  background: var(--r-fill);
-  white-space: pre-wrap;
-  font-size: 12px;
 }
 .radar-slack .radar-error {
   margin: 0;

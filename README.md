@@ -103,8 +103,8 @@ one row per item: lowercased key → JSON
 bad rows dropped), mention-acknowledgement tracking (`mention_accounts`, `mention_items`,
 `mention_candidates`) and the last refresh's results (`results_cache`, one row per lane, and
 `results_meta`), so a restart shows what Radar last knew. Slack context keeps the threads
-linked to each issue with the newest message seen and summarised (`slack_threads`), when each issue
-was last searched (`slack_issues`) and drafts waiting for approval (`slack_drafts`). Older kv copies of the mention
+linked to each item with the newest human message seen (`slack_threads`), when each item was last
+searched (`slack_issues`) and Radar's summary with its seen and posted marks (`slack_context`). Older kv copies of the mention
 state and results cache are moved into the database on load and their kv keys deleted.
 
 AI execution uses a BB build exposing `experimental_ai.complete`. On other hosts, the AI fallback (`aiBaseUrl` https only, `aiKeyEnv`, `aiModel`; all three required) sends the key from that bb server environment variable to that endpoint; with neither, Radar reports that AI is unavailable, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced. Focus also falls back to name matching after a provider error.

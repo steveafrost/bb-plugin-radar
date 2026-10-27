@@ -9,7 +9,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract, SlackDraftView } from "./server";
+import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract, SlackContextView } from "./server";
 import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { mountRailBadge } from "./badge";
 import type { AiOverride } from "./ai";
@@ -170,8 +170,8 @@ const ReviewActions = createContext<{
   viewer: Viewer;
   rebase: (item: RadarItem) => Promise<RebaseResult>;
   skills: SkillSettings;
-  /** Slack context: off, or whether a draft waits for this item. */
-  slack: (item: RadarItem) => "off" | "draft" | "check";
+  /** Slack context: off, none found yet (offer a check), found, or found with something you haven't opened. */
+  slack: (item: RadarItem) => { mode: "off" | "check" | "context" | "new"; threads: number };
   openSlack: (item: RadarItem) => void;
   checkSlack: (item: RadarItem) => Promise<void>;
 } | null>(null);
@@ -242,16 +242,23 @@ function RebaseAction({ item, rebase, onActive }: { item: RadarItem; rebase: (it
   }
 }
 
-/** Slack context on an issue or PR row: a marked icon when a draft waits, else "check now". */
+/** Slack context on an issue or PR row: shown when public threads link it (dotted when new), else a hover "check now". */
 function SlackAction({ item }: { item: RadarItem }) {
   const actions = useContext(ReviewActions);
   const [busy, setBusy] = useState(false);
-  const mode = actions?.slack(item) ?? "off";
+  const { mode, threads } = actions?.slack(item) ?? { mode: "off", threads: 0 };
   if (actions === null || mode === "off") return null;
-  if (mode === "draft") {
+  const noun = item.kind === "pr" ? "PR" : "issue";
+  if (mode === "context" || mode === "new") {
+    const count = `${threads} public Slack thread${threads === 1 ? "" : "s"}`;
     return (
-      <span className="radar-act-wrap" data-slack-draft="">
-        <ActionIcon icon="slack" label="Review Slack context update" tip="Slack context update ready: review before it posts" onClick={() => actions.openSlack(item)} />
+      <span className="radar-act-wrap" data-slack-context="" data-slack-new={mode === "new" ? "" : undefined}>
+        <ActionIcon
+          icon="slack"
+          label={`Slack context (${count})`}
+          tip={mode === "new" ? `New Slack context from ${count}` : `Slack context from ${count}`}
+          onClick={() => actions.openSlack(item)}
+        />
       </span>
     );
   }
@@ -262,8 +269,8 @@ function SlackAction({ item }: { item: RadarItem }) {
   ) : (
     <ActionIcon
       icon="slack"
-      label={`Check Slack for this ${item.kind === "pr" ? "PR" : "issue"}`}
-      tip={`Check public Slack threads that link this ${item.kind === "pr" ? "PR" : "issue"} (drafts only; nothing posts)`}
+      label={`Check Slack for this ${noun}`}
+      tip={`Look for public Slack threads that link this ${noun} (reads only)`}
       onClick={() => {
         setBusy(true);
         void actions.checkSlack(item).finally(() => setBusy(false));
@@ -1280,92 +1287,170 @@ function useReturnFocus() {
   }, []);
 }
 
+/** Inline `code` and **bold** as elements (never HTML), for the AI's short markdown summaries. */
+function inlineMarkdown(text: string): React.ReactNode[] {
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, index) =>
+    part.startsWith("`") && part.endsWith("`") && part.length > 2 ? (
+      <code key={index}>{part.slice(1, -1)}</code>
+    ) : part.startsWith("**") && part.endsWith("**") && part.length > 4 ? (
+      <strong key={index}>{part.slice(2, -2)}</strong>
+    ) : (
+      part
+    ),
+  );
+}
+
+/** Bullets become a list, other lines paragraphs. */
+function SummaryText({ text }: { text: string }) {
+  const blocks: React.ReactNode[] = [];
+  let bullets: string[] = [];
+  const flush = () => {
+    if (bullets.length > 0) blocks.push(<ul key={blocks.length}>{bullets.map((line, index) => <li key={index}>{inlineMarkdown(line)}</li>)}</ul>);
+    bullets = [];
+  };
+  for (const line of text.split("\n")) {
+    const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+    if (bullet) bullets.push(bullet[1]!);
+    else {
+      flush();
+      if (line.trim() !== "") blocks.push(<p key={blocks.length}>{inlineMarkdown(line.trim())}</p>);
+    }
+  }
+  flush();
+  return <div className="radar-slack__summary">{blocks}</div>;
+}
+
 /**
- * Approve, edit or dismiss a Slack-context draft. Posting creates Radar's one marked comment
- * on the issue, or edits it if it exists; the sources line is added on post.
+ * Slack context for one item: Radar's summary and the threads it came from. "Post to issue/PR"
+ * is a separate, explicit step: you edit the text, then it posts one new comment under your name.
  */
 function SlackSheet({
-  draft,
-  onPublish,
-  onDismiss,
+  context,
+  onCheck,
+  onPost,
   onClose,
 }: {
-  draft: SlackDraftView;
-  onPublish: (summary: string) => Promise<void>;
-  onDismiss: () => Promise<void>;
+  context: SlackContextView;
+  onCheck: () => Promise<void>;
+  onPost: (summary: string) => Promise<string>;
   onClose: () => void;
 }) {
-  const [summary, setSummary] = useState(draft.summary);
-  const [busy, setBusy] = useState<"" | "post" | "dismiss">("");
+  const [composing, setComposing] = useState(false);
+  const [text, setText] = useState(context.summary);
+  const [busy, setBusy] = useState<"" | "post" | "check">("");
   const [failure, setFailure] = useState("");
-  const noun = /\/pull\/\d+/.test(draft.url) ? "PR" : "issue";
-  useEscape(busy === "", onClose);
+  const [postedUrl, setPostedUrl] = useState("");
+  const noun = context.kind === "pr" ? "PR" : "issue";
+  useEscape(busy === "", () => (composing ? setComposing(false) : onClose()));
   useReturnFocus();
-  const act = (kind: "post" | "dismiss", work: () => Promise<void>) => {
+  const act = (kind: "post" | "check", work: () => Promise<void>) => {
     setBusy(kind);
     setFailure("");
-    work().catch((cause) => {
-      setFailure(errorText(cause));
-      setBusy("");
-    });
+    work()
+      .then(() => setBusy(""))
+      .catch((cause) => {
+        setFailure(errorText(cause));
+        setBusy("");
+      });
   };
+  const threads = `${context.sources.length} public Slack thread${context.sources.length === 1 ? "" : "s"}`;
   return (
     <div className="radar-sheet" role="dialog" aria-modal="true" aria-label="Slack context" onMouseDown={(event) => event.target === event.currentTarget && busy === "" && onClose()}>
       <div className="radar-sheet__panel" onKeyDown={trapTab}>
         <header className="radar-sheet__head">
           <div className="radar-sheet__title">
             <strong>Slack context</strong>
-            <UrlLink className="radar-mono" href={draft.url}>
-              {draft.repo}#{draft.number}
+            <UrlLink className="radar-mono" href={context.url}>
+              {context.repo}#{context.number}
             </UrlLink>
-            <span className="radar-sheet__subject">{draft.title}</span>
+            <span className="radar-sheet__subject">{context.title}</span>
           </div>
           <button type="button" className="radar-btn" onClick={onClose} disabled={busy !== ""}>
-            Cancel
+            Close
           </button>
         </header>
         <div className="radar-slack">
-          <p className="radar-slack__hint">
-            Drafted from {draft.sources.length} public Slack thread{draft.sources.length === 1 ? "" : "s"}. Edit it, then{" "}
-            {draft.current ? `update Radar's comment on the ${noun}` : `post it as a comment on the ${noun}`}. Nothing has been posted yet.
-          </p>
-          <textarea
-            className="radar-input radar-slack__text"
-            value={summary}
-            onChange={(event) => setSummary(event.target.value)}
-            rows={10}
-            maxLength={4000}
-            aria-label="Summary to post"
-            autoFocus
-          />
-          <div className="radar-slack__sources">
-            Sources:{" "}
-            {draft.sources.map((source, index) => (
-              <span key={source.permalink || index}>
-                {index > 0 ? " · " : ""}
+          {composing ? (
+            <>
+              <p className="radar-slack__hint">
+                Posts a new comment on the {noun} under your name, with links to the threads. Edit it first if you like.
+              </p>
+              <textarea
+                className="radar-input radar-slack__text"
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                rows={10}
+                maxLength={4000}
+                aria-label="Comment to post"
+                autoFocus
+              />
+            </>
+          ) : (
+            <>
+              <p className="radar-slack__hint">
+                From {threads}
+                {context.checkedAt ? `, checked ${relative(context.checkedAt)} ago` : ""}.
+              </p>
+              {context.summary ? (
+                <SummaryText text={context.summary} />
+              ) : (
+                <p className="radar-slack__hint">
+                  {context.summaryError ? `No summary: ${context.summaryError}` : "No AI summary yet. Set up AI in Radar settings to get one; the threads are below."}
+                </p>
+              )}
+            </>
+          )}
+          <ul className="radar-slack__sources">
+            {context.sources.map((source, index) => (
+              <li key={source.permalink || index}>
                 {source.permalink ? <UrlLink href={source.permalink}>#{source.channelName}</UrlLink> : `#${source.channelName}`}
-              </span>
+              </li>
             ))}
-          </div>
-          {draft.current ? (
-            <details className="radar-slack__current">
-              <summary>On the {noun} now</summary>
-              <pre>{draft.current}</pre>
-            </details>
+          </ul>
+          {postedUrl || context.posted ? (
+            <p className="radar-slack__hint">
+              <UrlLink href={postedUrl || context.posted!.url}>{postedUrl ? "Posted" : `Posted ${relative(context.posted!.at)} ago`}</UrlLink> to the {noun}.
+            </p>
           ) : null}
           {failure ? <p className="radar-error" role="alert">{failure}</p> : null}
           <footer className="radar-slack__foot">
-            <button type="button" className="radar-btn" disabled={busy !== ""} title="Drop this draft; only newer Slack messages will draft again" onClick={() => act("dismiss", onDismiss)}>
-              {busy === "dismiss" ? "Dismissing…" : "Dismiss"}
-            </button>
-            <button
-              type="button"
-              className="radar-btn radar-btn--primary"
-              disabled={busy !== "" || summary.trim() === ""}
-              onClick={() => act("post", () => onPublish(summary.trim()))}
-            >
-              {busy === "post" ? "Posting…" : draft.current ? "Update comment" : "Post comment"}
-            </button>
+            {composing ? (
+              <>
+                <button type="button" className="radar-btn" disabled={busy !== ""} onClick={() => setComposing(false)}>
+                  Back
+                </button>
+                <button
+                  type="button"
+                  className="radar-btn radar-btn--primary"
+                  disabled={busy !== "" || text.trim() === ""}
+                  onClick={() =>
+                    act("post", async () => {
+                      setPostedUrl(await onPost(text.trim()));
+                      setComposing(false);
+                    })
+                  }
+                >
+                  {busy === "post" ? "Posting…" : "Post comment"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="radar-btn" disabled={busy !== ""} title="Search Slack for this item again now" onClick={() => act("check", onCheck)}>
+                  {busy === "check" ? "Checking…" : "Check again"}
+                </button>
+                <button
+                  type="button"
+                  className="radar-btn radar-btn--primary"
+                  disabled={busy !== "" || context.sources.length === 0}
+                  onClick={() => {
+                    setText(context.summary);
+                    setComposing(true);
+                  }}
+                >
+                  Post to {noun}…
+                </button>
+              </>
+            )}
           </footer>
         </div>
       </div>
@@ -1421,7 +1506,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const { rpc, snapshot, error, setError, mutate, call, optimistic } = useRadar();
   const navigate = useBbNavigate();
   const [reviewing, setReviewing] = useState<{ item: RadarItem; context: ReviewContext } | null>(null);
-  const [slackDraft, setSlackDraft] = useState<SlackDraftView | null>(null);
+  const [slackView, setSlackView] = useState<SlackContextView | null>(null);
   const [undo, setUndo] = useState<{ key: string; title: string } | null>(null);
   /** In-flight hides, so an Undo can't reach the server before its hide. */
   const hiding = useRef(new Map<string, Promise<unknown>>());
@@ -1477,23 +1562,19 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       // Errors stay on the row, not the page banner.
       rebase: (item: RadarItem) =>
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
-      slack: (item: RadarItem) =>
-        snapshot?.slack?.enabled !== true || (item.source !== "github" && item.source !== "delta") || item.state.toLowerCase() !== "open"
-          ? "off"
-          : snapshot.slack.drafts[item.key] !== undefined
-            ? "draft"
-            : "check",
+      slack: (item: RadarItem) => {
+        if (snapshot?.slack?.enabled !== true || (item.source !== "github" && item.source !== "delta") || item.state.toLowerCase() !== "open") return { mode: "off" as const, threads: 0 };
+        const found = snapshot.slack.items[item.key];
+        return found === undefined ? { mode: "check" as const, threads: 0 } : { mode: found.isNew ? ("new" as const) : ("context" as const), threads: found.threads };
+      },
       openSlack: (item: RadarItem) => {
-        void call(rpc.call("radar_slack_draft", { key: item.key }) as Promise<SlackDraftView>).then((draft) => {
-          if (draft !== null) setSlackDraft(draft);
+        void call(rpc.call("radar_slack_context", { key: item.key }) as Promise<SlackContextView>).then((view) => {
+          if (view !== null) setSlackView(view);
         });
       },
       checkSlack: async (item: RadarItem) => {
-        const next = (await mutate(rpc.call("radar_slack_check", { key: item.key }))) as RadarSnapshot | null;
-        if (next?.slack?.drafts[item.key] !== undefined) {
-          const draft = (await call(rpc.call("radar_slack_draft", { key: item.key }) as Promise<SlackDraftView>));
-          if (draft !== null) setSlackDraft(draft);
-        }
+        const view = (await call(rpc.call("radar_slack_check", { key: item.key }) as Promise<SlackContextView>));
+        if (view !== null && view.sources.length > 0) setSlackView(view);
       },
     }),
     [snapshot, navigate, call, rpc, mutate, optimistic],
@@ -1693,19 +1774,13 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       </div>
     </div>
 
-        {slackDraft !== null ? (
+        {slackView !== null ? (
           <SlackSheet
-            key={slackDraft.key}
-            draft={slackDraft}
-            onClose={() => setSlackDraft(null)}
-            onDismiss={async () => {
-              await rpc.call("radar_slack_dismiss", { key: slackDraft.key });
-              setSlackDraft(null);
-            }}
-            onPublish={async (summary) => {
-              await rpc.call("radar_slack_publish", { key: slackDraft.key, summary });
-              setSlackDraft(null);
-            }}
+            key={slackView.key}
+            context={slackView}
+            onClose={() => setSlackView(null)}
+            onCheck={async () => setSlackView((await rpc.call("radar_slack_check", { key: slackView.key })) as SlackContextView)}
+            onPost={async (summary) => (await rpc.call("radar_slack_post", { key: slackView.key, summary })).url}
           />
         ) : null}
         {reviewing !== null ? (
