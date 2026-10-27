@@ -27,11 +27,11 @@ Radar threads get skills attached:
 - `radar-review` or `radar-triage`, Radar's own skills, describe how to read the item on each host and how to report. They never post, approve or edit until you say so.
 - Optionally, one installed skill (for example a code-review skill) is invoked in the opening message; pick it per kind in settings.
 
-## Slack context
+## Context from Slack
 
-Point Radar at a Slack MCP endpoint and it follows public Slack threads that link your open GitHub issues and PRs and your open Delta PRs (whatever Focus shows). Each sweep checks a few issues (least recently checked first), keeps only messages by people that link that exact issue or PR, and when a thread has something new, bb's AI refreshes that thread's short summary: decisions, owners, open questions, next steps.
+Point Radar at a Slack MCP endpoint and it follows the public Slack threads that link your open GitHub issues and PRs and Delta PRs (in Focus), counting only messages by people. When a thread changes, bb's AI refreshes its short summary: decisions, owners, open questions, next steps.
 
-The context lives in Radar. The Slack icon on a row opens "Context from Slack", a popover with one row per thread: channel, who started it, replies, and the summary (or the opening message without AI). The icon is accented when threads link the item and dotted when there is something you haven't opened; on other items it searches Slack when you open it. Radar does not keep issues up to date. Hover a thread and "Post to issue/PR" (click again to confirm) adds one new comment under your name with that thread's context and link. Private channels and DMs are never searched.
+The Slack icon on a row opens a popover with one row per thread: channel, who started it, replies and the summary. The icon is accented when threads link the item and dotted when something is new. Radar never updates issues by itself; hover a thread and "Post to issue/PR" (click twice) adds one comment with its context and link. Private channels and DMs are never searched.
 
 ## CLI and agent skill
 
