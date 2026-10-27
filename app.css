@@ -46,18 +46,6 @@
   font-family: var(--font-sans, -apple-system, sans-serif);
   font-size: var(--text-sm, 0.8125rem);
 }
-/* Scope the host-owned title row to Radar only. Match the body's
-   980px border box and 24px inner gutters without moving host controls. */
-header:has(.radar-header-anchor) {
-  padding-inline: 0;
-}
-header:has(.radar-header-anchor) [data-testid="app-page-header-content-row"] {
-  box-sizing: border-box;
-  width: 100%;
-  max-width: 980px;
-  margin-inline: auto;
-  padding-inline: 24px;
-}
 .radar__inner {
   max-width: 980px;
   margin: 0 auto;
