@@ -268,7 +268,7 @@ function SlackAction({ item }: { item: RadarItem }) {
   ) : (
     <ActionIcon
       icon="slack"
-      label="Find context from Slack"
+      label="Context from Slack"
       onClick={() => {
         setBusy(true);
         void actions.checkSlack(item).finally(() => setBusy(false));
