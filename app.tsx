@@ -248,7 +248,6 @@ function SlackAction({ item }: { item: RadarItem }) {
   const [busy, setBusy] = useState(false);
   const { mode, threads } = actions?.slack(item) ?? { mode: "off", threads: 0 };
   if (actions === null || mode === "off") return null;
-  const noun = item.kind === "pr" ? "PR" : "issue";
   if (mode === "context" || mode === "new") {
     const count = `${threads} public Slack thread${threads === 1 ? "" : "s"}`;
     return (
@@ -269,8 +268,7 @@ function SlackAction({ item }: { item: RadarItem }) {
   ) : (
     <ActionIcon
       icon="slack"
-      label={`Check Slack for this ${noun}`}
-      tip={`Look for public Slack threads that link this ${noun} (reads only)`}
+      label="Find context from Slack"
       onClick={() => {
         setBusy(true);
         void actions.checkSlack(item).finally(() => setBusy(false));
