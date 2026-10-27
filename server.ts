@@ -1938,7 +1938,8 @@ export default async function plugin(bb: BbPluginApi) {
   let slackError = "";
   let slackSweptAt = "";
   let slackToken: { value: string; at: number } | null = null;
-  let slackLastCall = 0;
+  /** When the next Slack call may start; reserved before sleeping so concurrent callers queue up. */
+  let slackNextCallAt = 0;
   let slackSweep: Promise<void> | null = null;
   let wakeSlack: (() => void) | undefined;
   /** Per-issue lock, so a manual check, a sweep and an approval never interleave on one issue. */
@@ -2015,9 +2016,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** One Tool Gateway call, spaced out from the last; an expired token is re-fetched once. */
   async function slackCall(name: string, args: Record<string, unknown>): Promise<string> {
-    await slackSleep(slackLastCall + SLACK_CALL_GAP_MS - Date.now());
+    // Reserve a slot synchronously: a sweep and a manual check can call at once, and each must
+    // wait for the slot the other took, not for the same stale timestamp.
+    const startAt = Math.max(Date.now(), slackNextCallAt);
+    slackNextCallAt = startAt + SLACK_CALL_GAP_MS;
+    await slackSleep(startAt - Date.now());
     if (controller.signal.aborted) throw new ToolAborted("Slack");
-    slackLastCall = Date.now();
     try {
       return await mcpTool(config.slackMcpUrl, await slackTokenValue(false), name, args, controller.signal);
     } catch (error) {

@@ -63,5 +63,10 @@ describe("heuristicFocus by clause", () => {
     expect(heuristicFocus("only widget.js", ["acme/widget.js", "acme/billing"])).toMatchObject({ focus: ["acme/widget.js"], hidden: [] });
     expect(heuristicFocus("no billing. only widget.js.", ["acme/widget.js", "acme/billing"])).toMatchObject({ focus: ["acme/widget.js"], hidden: ["acme/billing"] });
   });
+  it("does not split names that contain and/or/but", () => {
+    const names = ["acme/billing-and-payments", "//foo/or/payments", "acme/docs"];
+    expect(heuristicFocus("only billing-and-payments", names)).toMatchObject({ focus: ["acme/billing-and-payments"], hidden: [] });
+    expect(heuristicFocus("only //foo/or/payments and no docs", names)).toMatchObject({ focus: ["//foo/or/payments"], hidden: ["acme/docs"] });
+  });
 });
 afterEach(() => setHosts(NO_HOSTS));

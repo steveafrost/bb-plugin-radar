@@ -237,6 +237,11 @@ describe("Tool Gateway transport", () => {
     await expect(
       mcpTool("https://g/mcp", "t", "x", {}, signal, respond(ok({ result: { content: [{ type: "text", text: "ratelimited" }, { type: "text", text: "wait" }] } }, { status: 429 }))),
     ).rejects.toBeInstanceOf(SlackRateLimited);
+    await expect(mcpTool("https://g/mcp", "t", "x", {}, signal, respond(new Response("Too Many Requests", { status: 429, headers: { "content-type": "text/plain" } })))).rejects.toBeInstanceOf(SlackRateLimited);
+    await expect(mcpTool("https://g/mcp", "t", "x", {}, signal, respond(new Response("", { status: 429 })))).rejects.toBeInstanceOf(SlackRateLimited);
+    await expect(
+      mcpTool("https://g/mcp", "t", "x", {}, signal, respond(ok({ result: { content: [{ type: "text", text: "ratelimited" }] } }))),
+    ).rejects.toBeInstanceOf(SlackRateLimited);
     await expect(
       mcpTool("https://g/mcp", "t", "x", {}, signal, respond(ok({ result: { isError: true, content: [{ type: "text", text: "channel_not_found" }] } }))),
     ).rejects.toThrow("channel_not_found");

@@ -364,9 +364,11 @@ export async function mcpTool(
     throw new Error("Slack (Tool Gateway) could not be reached.");
   }
   if (response.status === 401 || response.status === 403) throw new SlackAuthError(`Slack (Tool Gateway) refused the token (HTTP ${response.status}).`);
+  // A 429 may carry a plain-text or empty body, so classify it before parsing.
+  if (response.status === 429) throw new SlackRateLimited("Slack rate limit hit; Radar will retry next sweep.");
   const reply = parseRpcBody(await response.text(), response.headers.get("content-type") ?? "");
   const texts = (reply.result?.content ?? []).map((part) => part.text ?? "").filter(Boolean);
-  if (response.status === 429 || texts[0] === "ratelimited") throw new SlackRateLimited("Slack rate limit hit; Radar will retry next sweep.");
+  if (texts[0] === "ratelimited") throw new SlackRateLimited("Slack rate limit hit; Radar will retry next sweep.");
   if (reply.error) throw new Error(`Slack (Tool Gateway): ${reply.error.message.slice(0, 200)}`);
   if (!response.ok) throw new Error(`Slack (Tool Gateway) returned HTTP ${response.status}.`);
   if (reply.result?.isError) throw new Error(`Slack: ${(texts.join(" ") || "tool error").slice(0, 200)}`);

@@ -335,7 +335,8 @@ const POSITIVE = /\b(only|just|show|showing|focus|focusing|include|including|kee
 
 /**
  * Offline fallback when no AI is configured: scopes whose last path segment appears in the
- * text. The text splits into clauses at , ; and/or/but (not at ".", which repo names use).
+ * text. The text splits into clauses at , ; and spaced-out and/or/but (not at ".", which repo
+ * names use, nor inside names like billing-and-payments).
  * A negation hides the hits of its clause and of the clauses after it ("hide billing and
  * payments"), until a clause says only/show/focus/...; otherwise hits are focused.
  */
@@ -345,7 +346,7 @@ export function heuristicFocus(description: string, known: string[]): FocusChoic
   const focus: string[] = [];
   const hidden: string[] = [];
   let negated = false;
-  for (const clause of description.toLowerCase().split(/[,;]|\.(?=\s|$)|\b(?:and|or|but)\b/)) {
+  for (const clause of description.toLowerCase().split(/[,;]|\.(?=\s|$)|(?<=^|\s)(?:and|or|but)(?=\s|$)/)) {
     // "no-area" is a name, not a negation.
     const words = clause.replace(/no-area/g, " ");
     if (NEGATION.test(words)) negated = true;
