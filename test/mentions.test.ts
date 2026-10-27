@@ -231,6 +231,15 @@ describe("mention candidates (audit)", () => {
     expect(f.tracker.prune(new Set())).toBe(false);
   });
 
+  it("prune keeps items outside the current set, but they can't be acknowledged until they return", async () => {
+    const f = fixture();
+    await f.tracker.reconcile([item], "alice");
+    expect(f.tracker.metadata(item.key).canAck).toBe(true);
+    expect(f.tracker.prune(new Set([item.key]), new Set())).toBe(false);
+    expect(f.tracker.metadata(item.key)).toMatchObject({ generation: 1, canAck: false });
+    expect(f.tracker.acknowledge(item.key)).toBe(false);
+  });
+
   it("skips the notifications read when nothing is tracked", async () => {
     const f = fixture();
     await f.tracker.reconcile([], "alice");

@@ -101,7 +101,8 @@ in the plugin database: the cached label list (`label_index`), hidden items (`hi
 one row per item: lowercased key → JSON
 `{ key, source, kind, repo, number, title, url, hiddenAt, lastSeenAt }`, validated on load,
 bad rows dropped), mention-acknowledgement tracking (`mention_accounts`, `mention_items`,
-`mention_candidates`) and the last refresh's results (`results_cache`, one row per lane, and
+`mention_candidates`; a mention that leaves the Mentions lane keeps its acknowledgement for
+30 days, pruned only after every Mentions lane read cleanly) and the last refresh's results (`results_cache`, one row per lane, and
 `results_meta`), so a restart shows what Radar last knew. Slack context keeps the threads
 linked to each item with the newest human message seen (`slack_threads`), when each item was last
 searched (`slack_issues`), with each thread's opening message, AI summary and last post, and per-item seen marks (`slack_context`). Older kv copies of the mention

@@ -129,11 +129,73 @@ describe("audit: integration", () => {
     clearCalls();
     await harness.runCli(["refresh"]);
     expect(scanned()).toEqual([]);
-    // The lane now returns a single, different item: only it is scanned, the rest are pruned.
+    // The lane now returns a single, different item: only it is scanned. The others left the
+    // lane but stay tracked (for 30 days), so their acknowledgements survive a return.
     setState({ searches: [{ match: "mentions:@me", nodes: [node("o/r", 6)] }] });
     clearCalls();
     await harness.runCli(["refresh"]);
     expect(scanned()).toEqual(["6"]);
+    expect(Object.keys(await trackedKeys(bb)).sort()).toEqual([1, 2, 3, 4, 5, 6].map((n) => `github:o/r#${n}`));
+    // Over 30 days out of the lane: pruned on the next clean read.
+    for (const n of [1, 2, 3, 4, 5]) {
+      const key = `github:o/r#${n}`;
+      const row = (await trackedKeys(bb))[key] as Record<string, unknown>;
+      db(bb).prepare("UPDATE mention_candidates SET candidate = ? WHERE key = ?").run(JSON.stringify({ ...row, seenAt: new Date(Date.now() - 31 * 86_400_000).toISOString() }), key);
+    }
+    const file = join(mkdtempSync(join(tmpdir(), "radar-prune-")), "data.db");
+    await db(bb).backup(file);
+    await harness.dispose();
+    const second = await restartOn(file, {}, [ml, lane("other", "is:open other")]);
+    await second.harness.runCli(["refresh"]);
+    expect(Object.keys(await trackedKeys(second.bb))).toEqual(["github:o/r#6"]);
+    await second.harness.dispose();
+  });
+
+  it("F3b an acknowledged mention that leaves the lane and comes back is not new again", async () => {
+    const ml = lane("mentions", "is:open mentions:@me");
+    const one = node("o/r", 1, { __typename: "Issue" });
+    setState({ login: "steve", issueBody: "hey @steve please look", searches: [{ match: "mentions:@me", nodes: [one] }] });
+    const { bb, harness } = await boot({}, [ml]);
+    await harness.runCli(["refresh"]);
+    await harness.callRpc("radar_acknowledge", { key: "github:o/r#1" });
+    // #1 falls out of the lane's page for a refresh...
+    setState({ login: "steve", issueBody: "hey @steve please look", searches: [{ match: "mentions:@me", nodes: [node("o/r", 2, { __typename: "Issue" })] }] });
+    await harness.runCli(["refresh"]);
+    // ...then returns after an unrelated update, with no new mention.
+    setState({ login: "steve", issueBody: "hey @steve please look", searches: [{ match: "mentions:@me", nodes: [{ ...one, updatedAt: new Date().toISOString() }] }] });
+    await harness.runCli(["refresh"]);
+    const snap = (await harness.callRpc("radar_snapshot", null)) as { results: Record<string, { items: { number: number }[] }> };
+    expect(snap.results.mentions!.items.map((i) => i.number)).toEqual([]);
+    const entry = JSON.parse((db(bb).prepare("SELECT entry FROM mention_items WHERE key = ?").get("github:o/r#1") as { entry: string }).entry);
+    expect(entry).toMatchObject({ generation: 1, acknowledged: 1 });
+    await harness.dispose();
+  });
+
+  it("F3c a Mentions lane that fails to load keeps every tracked mention", async () => {
+    const ml = lane("mentions", "is:open mentions:@me");
+    setState({ login: "steve", issueBody: "hey @steve", searches: [{ match: "mentions:@me", nodes: [1, 2].map((n) => node("o/r", n, { __typename: "Issue" })) }] });
+    const { bb, harness } = await boot({}, [ml]);
+    await harness.runCli(["refresh"]);
+    await harness.callRpc("radar_acknowledge", { key: "github:o/r#1" });
+    // Restart with no results cache and GitHub search down: the lane loads nothing.
+    db(bb).exec("DELETE FROM results_cache");
+    const file = join(mkdtempSync(join(tmpdir(), "radar-fail-")), "data.db");
+    await db(bb).backup(file);
+    await harness.dispose();
+    setState({ login: "steve", searchFail: true });
+    const second = await restartOn(file, {}, [ml]);
+    await second.harness.runCli(["refresh"]);
+    expect(Object.keys(await trackedKeys(second.bb)).sort()).toEqual(["github:o/r#1", "github:o/r#2"]);
+    const rows = db(second.bb).prepare("SELECT key, entry FROM mention_items").all() as { key: string; entry: string }[];
+    expect(Object.fromEntries(rows.map((r) => [r.key, JSON.parse(r.entry).acknowledged]))).toEqual({ "github:o/r#1": 1, "github:o/r#2": 0 });
+    await second.harness.dispose();
+  });
+
+  it("F3d deleting the Mentions lane drops what was tracked", async () => {
+    const ml = lane("mentions", "is:open mentions:@me");
+    setState({ searches: [{ match: "mentions:@me", nodes: [node("o/r", 6)] }] });
+    const { bb, harness } = await boot({}, [ml, lane("other", "is:open other")]);
+    await harness.runCli(["refresh"]);
     expect(Object.keys(await trackedKeys(bb))).toEqual(["github:o/r#6"]);
     // Delete the Mentions lane: no mention calls at all, and nothing stays tracked.
     await harness.runCli(["remove", "mentions"]);
@@ -200,7 +262,7 @@ describe("audit: integration", () => {
     expect(await bb.storage.kv.get("mentionCandidates")).toBeUndefined();
     const item = db(bb).prepare("SELECT entry FROM mention_items WHERE key = ?").get("github:o/r#1") as { entry: string };
     expect(JSON.parse(item.entry)).toEqual(entry);
-    expect(await trackedKeys(bb)).toEqual({ "github:o/r#1": { key: "github:o/r#1", repo: "o/r", number: 1, kind: "issue", updatedAt: "" } });
+    expect(await trackedKeys(bb)).toEqual({ "github:o/r#1": { key: "github:o/r#1", repo: "o/r", number: 1, kind: "issue", updatedAt: "", seenAt: "" } });
     await harness.dispose();
   });
 

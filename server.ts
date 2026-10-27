@@ -162,6 +162,7 @@ const TOOL_TIMEOUT_MS = 30_000;
 const AI_TIMEOUT_MS = 45_000;
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const LANE_CONCURRENCY = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const CLI_ROW_LIMIT = 80;
 /** markSeen keeps up to this many lane-limits of seen keys that are not in the current result. */
 const SEEN_CARRY_FACTOR = 4;
@@ -563,7 +564,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Mention tracker: one row per account, one per tracked item (entry = the item's state as JSON).
     "CREATE TABLE mention_accounts (account TEXT PRIMARY KEY, scope TEXT NOT NULL, login TEXT NOT NULL, error TEXT) WITHOUT ROWID",
     "CREATE TABLE mention_items (account TEXT NOT NULL, key TEXT NOT NULL, entry TEXT NOT NULL, PRIMARY KEY (account, key)) WITHOUT ROWID",
-    // Mention candidates: key = item key, candidate = { key, repo, number, kind, updatedAt } as JSON.
+    // Mention candidates: key = item key, candidate = { key, repo, number, kind, updatedAt, seenAt } as JSON.
     "CREATE TABLE mention_candidates (key TEXT PRIMARY KEY, candidate TEXT NOT NULL) WITHOUT ROWID",
     // Last refresh's lane results (result = LaneResult as JSON), so a restart shows what Radar knew.
     "CREATE TABLE results_cache (lane_id TEXT PRIMARY KEY, query_key TEXT NOT NULL, result TEXT NOT NULL) WITHOUT ROWID",
@@ -657,7 +658,7 @@ export default async function plugin(bb: BbPluginApi) {
   }, "github.com", async () => { saveMentionRows(mentions.state); });
   const persistMentions = async () => { saveMentionRows(mentions.state); };
   // Candidates last scanned: updatedAt is the item's when it was last scanned successfully ("" = due).
-  const candidateSchema = z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]), updatedAt: z.string().default("") });
+  const candidateSchema = z.object({ key: z.string(), repo: z.string(), number: z.number(), kind: z.enum(["pr", "issue"]), updatedAt: z.string().default(""), seenAt: z.string().default("") });
   type Candidate = z.infer<typeof candidateSchema>;
   const saveCandidateRows = db.transaction((candidates: Record<string, Candidate>) => {
     db.prepare("DELETE FROM mention_candidates").run();
@@ -685,9 +686,13 @@ export default async function plugin(bb: BbPluginApi) {
   const isMentionLane = (lane: Lane) => lane.sources.includes("github") && /(?:^|\s)mentions:@me(?:\s|$)/i.test(lane.query ?? "");
   let mentionSync: Promise<void> = Promise.resolve();
   /**
-   * Candidates are exactly the GitHub items in the current Mentions-lane results: anything
-   * else is pruned from the tracked list and the tracker. Only items whose updatedAt moved
-   * since their last successful scan are re-scanned; every current item stays visible.
+   * Candidates are the GitHub items in the current Mentions-lane results, plus items that
+   * left those results in the last HIDDEN_STALE_DAYS days: the lane is a capped, recent page,
+   * so an acknowledged mention can drop out and come back, and its tracker state must still
+   * be there or its old @mention reads as new. Items gone longer are pruned, but only after
+   * every Mentions lane read cleanly (an errored or unloaded lane says nothing about absence).
+   * Deleting every Mentions lane drops everything. Only items whose updatedAt moved since
+   * their last successful scan are re-scanned; every current item stays visible.
    */
   function syncMentions(): Promise<void> {
     mentionSync = mentionSync.catch(() => {}).then(async () => {
@@ -697,16 +702,30 @@ export default async function plugin(bb: BbPluginApi) {
       for (const lane of mentionLanes) {
         for (const item of results[lane.id]?.items ?? []) if (item.source === "github") current.set(item.key, item);
       }
-      const prunedTracker = mentions.prune(new Set(current.keys()));
+      const complete = mentionLanes.every((lane) => {
+        const result = results[lane.id];
+        return result !== undefined && !result.loading && result.fetchedAt !== "" && result.error === "";
+      });
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
       const next: typeof trackedMentions = {};
       for (const [key, item] of current) {
-        next[key] = { key, repo: item.repo, number: item.number, kind: item.kind, updatedAt: trackedMentions[key]?.updatedAt ?? "" };
+        next[key] = { key, repo: item.repo, number: item.number, kind: item.kind, updatedAt: trackedMentions[key]?.updatedAt ?? "", seenAt: nowIso };
       }
+      if (mentionLanes.length > 0) {
+        for (const [key, candidate] of Object.entries(trackedMentions)) {
+          if (next[key] !== undefined) continue;
+          // Rows from before 0.4.10 have no seenAt: start their clock now.
+          const seenAt = candidate.seenAt || nowIso;
+          if (!complete || now - Date.parse(seenAt) < HIDDEN_STALE_DAYS * DAY_MS) next[key] = { ...candidate, seenAt };
+        }
+      }
+      const prunedTracker = mentions.prune(new Set(Object.keys(next)), new Set(current.keys()));
       const due = [...current.values()].filter((item) => next[item.key]!.updatedAt !== item.updatedAt);
       const trackedChanged = JSON.stringify(Object.keys(next).sort()) !== JSON.stringify(Object.keys(trackedMentions).sort());
       trackedMentions = next;
       if (current.size === 0) {
-        // No Mentions lane (or nothing in it): nothing to scan, just drop what was tracked.
+        // No Mentions lane (or nothing in it): nothing to scan, just keep or drop what was tracked.
         if (trackedChanged) await persistTracked();
         if (prunedTracker) await persistMentions();
         if (trackedChanged || prunedTracker) publish();

@@ -51,5 +51,17 @@ describe("heuristicFocus by clause", () => {
     expect(heuristicFocus("only no-area", known)).toMatchObject({ focus: ["//no-area"], hidden: [] });
     expect(heuristicFocus("no billing", known)).toMatchObject({ focus: [], hidden: ["acme/billing"] });
   });
+  it("a negation covers the names after it until a clause focuses again", () => {
+    expect(heuristicFocus("hide billing and docs", known)).toMatchObject({ focus: [], hidden: ["acme/billing", "acme/docs"] });
+    expect(heuristicFocus("no billing, docs", known)).toMatchObject({ focus: [], hidden: ["acme/billing", "acme/docs"] });
+    expect(heuristicFocus("not billing or docs", known)).toMatchObject({ focus: [], hidden: ["acme/billing", "acme/docs"] });
+    expect(heuristicFocus("no billing, only mobile", known)).toMatchObject({ focus: ["acme/mobile"], hidden: ["acme/billing"] });
+    expect(heuristicFocus("only mobile and no billing", known)).toMatchObject({ focus: ["acme/mobile"], hidden: ["acme/billing"] });
+    expect(heuristicFocus("show mobile and docs", known)).toMatchObject({ focus: ["acme/mobile", "acme/docs"], hidden: [] });
+  });
+  it("matches repo names with a dot", () => {
+    expect(heuristicFocus("only widget.js", ["acme/widget.js", "acme/billing"])).toMatchObject({ focus: ["acme/widget.js"], hidden: [] });
+    expect(heuristicFocus("no billing. only widget.js.", ["acme/widget.js", "acme/billing"])).toMatchObject({ focus: ["acme/widget.js"], hidden: ["acme/billing"] });
+  });
 });
 afterEach(() => setHosts(NO_HOSTS));

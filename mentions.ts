@@ -113,15 +113,19 @@ export class MentionTracker {
     return match ? `${match[1]!.toLowerCase()}#${Number(match[2])}` : null;
   }
 
-  /** Drops tracked items (in every account) whose key is not in `keep`; true when any went. */
-  prune(keep: ReadonlySet<string>): boolean {
+  /**
+   * Drops tracked items (in every account) whose key is not in `keep`; true when any went.
+   * `current` (default `keep`) is what the lanes show now: kept items outside it can't be
+   * acknowledged until they return.
+   */
+  prune(keep: ReadonlySet<string>, current: ReadonlySet<string> = keep): boolean {
     let changed = false;
     for (const account of Object.values(this.state.accounts)) {
       for (const key of Object.keys(account.items)) {
         if (!keep.has(key)) { delete account.items[key]; changed = true; }
       }
     }
-    for (const key of this.current) if (!keep.has(key)) this.current.delete(key);
+    for (const key of this.current) if (!current.has(key)) this.current.delete(key);
     return changed;
   }
 

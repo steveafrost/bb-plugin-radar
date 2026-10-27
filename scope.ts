@@ -330,25 +330,31 @@ export function parseFocusReply(text: string, known: string[]): FocusChoice {
 
 const NEGATION = /\b(no|not|don'?t|dont|without|hide|hiding|except|exclude|excluding|minus|skip|ignore|less)\b/i;
 
+/** Words that start focusing again after a negation ("no billing, only mobile"). */
+const POSITIVE = /\b(only|just|show|showing|focus|focusing|include|including|keep)\b/i;
+
 /**
  * Offline fallback when no AI is configured: scopes whose last path segment appears in the
- * text. Each clause ("only mobile, no billing") decides on its own: a negation in that
- * clause hides its hits, otherwise they're focused.
+ * text. The text splits into clauses at , ; and/or/but (not at ".", which repo names use).
+ * A negation hides the hits of its clause and of the clauses after it ("hide billing and
+ * payments"), until a clause says only/show/focus/...; otherwise hits are focused.
  */
 export function heuristicFocus(description: string, known: string[]): FocusChoice {
   const unique = [...new Set(known)];
   const tailOf = (key: string) => lower(key === NO_AREA ? "no-area" : key.split("/").filter(Boolean).pop() ?? key);
   const focus: string[] = [];
   const hidden: string[] = [];
-  for (const clause of description.toLowerCase().split(/[,;.]|\bbut\b|\band\b/)) {
+  let negated = false;
+  for (const clause of description.toLowerCase().split(/[,;]|\.(?=\s|$)|\b(?:and|or|but)\b/)) {
+    // "no-area" is a name, not a negation.
+    const words = clause.replace(/no-area/g, " ");
+    if (NEGATION.test(words)) negated = true;
+    else if (POSITIVE.test(words)) negated = false;
     const text = ` ${clause.replace(/[^a-z0-9/_.-]+/g, " ")} `;
     const hits = unique.filter((key) => {
       const tail = tailOf(key);
       return tail.length >= 4 && (text.includes(` ${tail} `) || text.includes(` ${lower(key)} `));
     });
-    if (hits.length === 0) continue;
-    // "no-area" is a name, not a negation.
-    const negated = NEGATION.test(clause.replace(/no-area/g, " "));
     for (const key of hits) {
       const target = negated ? hidden : focus;
       if (!focus.includes(key) && !hidden.includes(key)) target.push(key);

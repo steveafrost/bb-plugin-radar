@@ -25,6 +25,7 @@ if (argv[0] === "api" && argv[1] === "graphql") {
   const n = Number(argv.find((a) => a.startsWith("n="))?.slice(2) ?? 30);
   const hit = (state.searches ?? []).find((s) => q.includes(s.match));
   if (hit?.delayMs) await new Promise((r) => setTimeout(r, hit.delayMs));
+  if (state.searchFail) fail("gh: 502 bad gateway");
   if (state.partialError) {
     process.stdout.write(JSON.stringify({ data: { search: { nodes: [...(hit?.nodes ?? []).slice(0, n), null] } }, errors: [{ type: "FORBIDDEN", message: "Resource protected by organization SAML enforcement." }] }));
     fail("gh: Resource protected by organization SAML enforcement.");
