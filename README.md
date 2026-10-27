@@ -102,7 +102,9 @@ one row per item: lowercased key → JSON
 `{ key, source, kind, repo, number, title, url, hiddenAt, lastSeenAt }`, validated on load,
 bad rows dropped), mention-acknowledgement tracking (`mention_accounts`, `mention_items`,
 `mention_candidates`) and the last refresh's results (`results_cache`, one row per lane, and
-`results_meta`), so a restart shows what Radar last knew. Older kv copies of the mention
+`results_meta`), so a restart shows what Radar last knew. Slack context keeps the threads
+linked to each issue with the newest message seen and summarised (`slack_threads`), when each issue
+was last searched (`slack_issues`) and drafts waiting for approval (`slack_drafts`). Older kv copies of the mention
 state and results cache are moved into the database on load and their kv keys deleted.
 
 AI execution uses a BB build exposing `experimental_ai.complete`. On other hosts, the AI fallback (`aiBaseUrl` https only, `aiKeyEnv`, `aiModel`; all three required) sends the key from that bb server environment variable to that endpoint; with neither, Radar reports that AI is unavailable, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced. Focus also falls back to name matching after a provider error.
@@ -135,6 +137,7 @@ Radar needs `gh` signed in on the bb host. Everything else is in
 | `draftNotes` | Plain-words context for the drafter: which repos live where, team names, label conventions. |
 | `maxAgeDays`, `refreshSeconds` | Hide items not updated in N days (default 60, 0 = no limit); poll interval (min 30s). |
 | `reviewSection`, `reviewSkill`, `gitstreamReviewSkill`, `triageSkill` | Thread section for Radar threads, and an installed skill to invoke per kind. |
+| `slackMcpUrl`, `slackTokenCommand`, `slackSweepMinutes` | Slack context: an MCP endpoint exposing `slack_search_public` and `slack_read_thread` (https), a command that prints its bearer token (run without a shell; last line wins), and the sweep interval (default 30, min 10). Both of the first two set = on. At Shopify: `https://tool-gateway.shopify.io/mcp` and `dev tokens get tool_gateway/personal`. |
 
 Example for a monorepo on Delta:
 

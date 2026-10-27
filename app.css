@@ -1386,3 +1386,75 @@ header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+/* Slack context: a dot on the row action while a draft waits, and the approval sheet. */
+.radar-act-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.radar-item .radar-item__actions > .radar-act-wrap[data-slack-draft] {
+  opacity: 1;
+}
+.radar-act-wrap[data-slack-draft] .radar-act {
+  color: var(--r-accent);
+}
+.radar-act-wrap[data-slack-draft]::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--r-accent);
+  pointer-events: none;
+}
+.radar-slack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 14px;
+}
+.radar-slack__hint,
+.radar-slack__sources {
+  margin: 0;
+  color: var(--r-muted);
+}
+.radar-slack__text {
+  width: 100%;
+  height: auto;
+  min-height: 160px;
+  padding: 8px 10px;
+  resize: vertical;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  box-sizing: border-box;
+}
+.radar-slack__current summary {
+  cursor: pointer;
+  color: var(--r-muted);
+}
+.radar-slack__current pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--r-radius-sm);
+  background: var(--r-fill);
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+.radar-slack .radar-error {
+  margin: 0;
+}
+.radar-slack__foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.radar-sheet__title > strong,
+.radar-sheet__title > .radar-mono {
+  flex: none;
+  white-space: nowrap;
+}

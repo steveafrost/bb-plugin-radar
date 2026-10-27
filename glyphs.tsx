@@ -21,6 +21,8 @@ const PATHS: Record<string, string[]> = {
   eye: ["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"],
   eyeOff: ["M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 7 10 7a17 17 0 0 1-2.2 3.2", "M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6", "M9.9 9.9a3 3 0 0 0 4.2 4.2", "m2 2 20 20"],
   x: ["M18 6 6 18", "m6 6 12 12"],
+  // lucide message-square-text: Slack context.
+  slack: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z", "M13 8H7", "M17 12H7"],
   // lucide bot: start an agent thread (same glyph as Pulse).
   bot: ["M12 8V4H8", "M2 14h2", "M20 14h2", "M15 13v2", "M9 13v2", "M6 8h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z"],
   // lucide external-link: open the thread already started.

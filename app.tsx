@@ -9,7 +9,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract } from "./server";
+import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract, SlackDraftView } from "./server";
 import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { mountRailBadge } from "./badge";
 import type { AiOverride } from "./ai";
@@ -170,6 +170,10 @@ const ReviewActions = createContext<{
   viewer: Viewer;
   rebase: (item: RadarItem) => Promise<RebaseResult>;
   skills: SkillSettings;
+  /** Slack context: off, or whether a draft waits for this item. */
+  slack: (item: RadarItem) => "off" | "draft" | "check";
+  openSlack: (item: RadarItem) => void;
+  checkSlack: (item: RadarItem) => Promise<void>;
 } | null>(null);
 
 /** Pulse-style row action: icon button with a hover/focus tooltip (data-tip). */
@@ -238,6 +242,36 @@ function RebaseAction({ item, rebase, onActive }: { item: RadarItem; rebase: (it
   }
 }
 
+/** Slack context on a GitHub issue row: a marked icon when a draft waits, else "check now". */
+function SlackAction({ item }: { item: RadarItem }) {
+  const actions = useContext(ReviewActions);
+  const [busy, setBusy] = useState(false);
+  const mode = actions?.slack(item) ?? "off";
+  if (actions === null || mode === "off") return null;
+  if (mode === "draft") {
+    return (
+      <span className="radar-act-wrap" data-slack-draft="">
+        <ActionIcon icon="slack" label="Review Slack context update" tip="Slack context update ready: review before it posts" onClick={() => actions.openSlack(item)} />
+      </span>
+    );
+  }
+  return busy ? (
+    <span className="radar-act" aria-busy="true" aria-label="Checking Slack">
+      <Glyph name="spinner" className="radar-act__icon radar-spin" />
+    </span>
+  ) : (
+    <ActionIcon
+      icon="slack"
+      label="Check Slack for this issue"
+      tip="Check public Slack threads that link this issue (drafts only; nothing posts)"
+      onClick={() => {
+        setBusy(true);
+        void actions.checkSlack(item).finally(() => setBusy(false));
+      }}
+    />
+  );
+}
+
 function ItemRow({ item }: { item: RadarItem }) {
   const labels = displayLabels(item.labels);
   const actions = useContext(ReviewActions);
@@ -272,6 +306,7 @@ function ItemRow({ item }: { item: RadarItem }) {
           <ActionIcon icon="eyeOff" label="Hide from Radar" tip="Hide from Radar" onClick={() => actions.hide(item)} />
           {item.canAcknowledge ? <ActionIcon icon="check" label="Acknowledge" tip="Clear this mention and mark its GitHub notification read" onClick={() => actions.acknowledge(item)} /> : null}
           {showRebase ? <RebaseAction item={item} rebase={actions.rebase} onActive={setRebaseActive} /> : null}
+          <SlackAction item={item} />
           {threadId !== undefined ? (
             <ActionIcon icon="external" label="Open thread" tip="Open the bb thread started for this" onClick={() => actions.open(threadId)} />
           ) : null}
@@ -1217,6 +1252,126 @@ function DraftPreview({
 
 // ---------------------------------------------------------------------------
 
+/** Keep Tab inside a sheet; the board behind it is only dimmed. */
+function trapTab(event: React.KeyboardEvent<HTMLDivElement>) {
+  if (event.key !== "Tab") return;
+  const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>(
+    'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => element.offsetParent !== null);
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (first === undefined || last === undefined) return;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+/** Gives focus back to whatever opened a sheet when it closes. */
+function useReturnFocus() {
+  useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
+}
+
+/**
+ * Approve, edit or dismiss a Slack-context draft. Posting creates Radar's one marked comment
+ * on the issue, or edits it if it exists; the sources line is added on post.
+ */
+function SlackSheet({
+  draft,
+  onPublish,
+  onDismiss,
+  onClose,
+}: {
+  draft: SlackDraftView;
+  onPublish: (summary: string) => Promise<void>;
+  onDismiss: () => Promise<void>;
+  onClose: () => void;
+}) {
+  const [summary, setSummary] = useState(draft.summary);
+  const [busy, setBusy] = useState<"" | "post" | "dismiss">("");
+  const [failure, setFailure] = useState("");
+  useEscape(busy === "", onClose);
+  useReturnFocus();
+  const act = (kind: "post" | "dismiss", work: () => Promise<void>) => {
+    setBusy(kind);
+    setFailure("");
+    work().catch((cause) => {
+      setFailure(errorText(cause));
+      setBusy("");
+    });
+  };
+  return (
+    <div className="radar-sheet" role="dialog" aria-modal="true" aria-label="Slack context" onMouseDown={(event) => event.target === event.currentTarget && busy === "" && onClose()}>
+      <div className="radar-sheet__panel" onKeyDown={trapTab}>
+        <header className="radar-sheet__head">
+          <div className="radar-sheet__title">
+            <strong>Slack context</strong>
+            <UrlLink className="radar-mono" href={draft.url}>
+              {draft.repo}#{draft.number}
+            </UrlLink>
+            <span className="radar-sheet__subject">{draft.title}</span>
+          </div>
+          <button type="button" className="radar-btn" onClick={onClose} disabled={busy !== ""}>
+            Cancel
+          </button>
+        </header>
+        <div className="radar-slack">
+          <p className="radar-slack__hint">
+            Drafted from {draft.sources.length} public Slack thread{draft.sources.length === 1 ? "" : "s"}. Edit it, then{" "}
+            {draft.current ? "update Radar's comment on the issue" : "post it as a comment on the issue"}. Nothing has been posted yet.
+          </p>
+          <textarea
+            className="radar-input radar-slack__text"
+            value={summary}
+            onChange={(event) => setSummary(event.target.value)}
+            rows={10}
+            maxLength={4000}
+            aria-label="Summary to post"
+            autoFocus
+          />
+          <div className="radar-slack__sources">
+            Sources:{" "}
+            {draft.sources.map((source, index) => (
+              <span key={source.permalink || index}>
+                {index > 0 ? " · " : ""}
+                {source.permalink ? <UrlLink href={source.permalink}>#{source.channelName}</UrlLink> : `#${source.channelName}`}
+              </span>
+            ))}
+          </div>
+          {draft.current ? (
+            <details className="radar-slack__current">
+              <summary>On the issue now</summary>
+              <pre>{draft.current}</pre>
+            </details>
+          ) : null}
+          {failure ? <p className="radar-error" role="alert">{failure}</p> : null}
+          <footer className="radar-slack__foot">
+            <button type="button" className="radar-btn" disabled={busy !== ""} title="Drop this draft; only newer Slack messages will draft again" onClick={() => act("dismiss", onDismiss)}>
+              {busy === "dismiss" ? "Dismissing…" : "Dismiss"}
+            </button>
+            <button
+              type="button"
+              className="radar-btn radar-btn--primary"
+              disabled={busy !== "" || summary.trim() === ""}
+              onClick={() => act("post", () => onPublish(summary.trim()))}
+            >
+              {busy === "post" ? "Posting…" : draft.current ? "Update comment" : "Post comment"}
+            </button>
+          </footer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ReviewSheet({
   item,
   context,
@@ -1229,30 +1384,7 @@ function ReviewSheet({
   onClose: () => void;
 }) {
   useEscape(true, onClose);
-  useEffect(() => {
-    // Give focus back to the row's action when the sheet closes.
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    return () => {
-      if (opener?.isConnected) opener.focus();
-    };
-  }, []);
-  /** Keep Tab inside the sheet; the board behind it is only dimmed. */
-  const trapTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Tab") return;
-    const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
-    )].filter((element) => element.offsetParent !== null);
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (first === undefined || last === undefined) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
+  useReturnFocus();
   return (
     <div className="radar-sheet" role="dialog" aria-modal="true" aria-label={context.title} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="radar-sheet__panel" onKeyDown={trapTab}>
@@ -1288,6 +1420,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   const { rpc, snapshot, error, setError, mutate, call, optimistic } = useRadar();
   const navigate = useBbNavigate();
   const [reviewing, setReviewing] = useState<{ item: RadarItem; context: ReviewContext } | null>(null);
+  const [slackDraft, setSlackDraft] = useState<SlackDraftView | null>(null);
   const [undo, setUndo] = useState<{ key: string; title: string } | null>(null);
   /** In-flight hides, so an Undo can't reach the server before its hide. */
   const hiding = useRef(new Map<string, Promise<unknown>>());
@@ -1343,6 +1476,24 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       // Errors stay on the row, not the page banner.
       rebase: (item: RadarItem) =>
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
+      slack: (item: RadarItem) =>
+        snapshot?.slack?.enabled !== true || item.source !== "github" || item.kind !== "issue"
+          ? "off"
+          : snapshot.slack.drafts[item.key] !== undefined
+            ? "draft"
+            : "check",
+      openSlack: (item: RadarItem) => {
+        void call(rpc.call("radar_slack_draft", { key: item.key }) as Promise<SlackDraftView>).then((draft) => {
+          if (draft !== null) setSlackDraft(draft);
+        });
+      },
+      checkSlack: async (item: RadarItem) => {
+        const next = (await mutate(rpc.call("radar_slack_check", { key: item.key }))) as RadarSnapshot | null;
+        if (next?.slack?.drafts[item.key] !== undefined) {
+          const draft = (await call(rpc.call("radar_slack_draft", { key: item.key }) as Promise<SlackDraftView>));
+          if (draft !== null) setSlackDraft(draft);
+        }
+      },
     }),
     [snapshot, navigate, call, rpc, mutate, optimistic],
   );
@@ -1541,6 +1692,21 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
       </div>
     </div>
 
+        {slackDraft !== null ? (
+          <SlackSheet
+            key={slackDraft.key}
+            draft={slackDraft}
+            onClose={() => setSlackDraft(null)}
+            onDismiss={async () => {
+              await rpc.call("radar_slack_dismiss", { key: slackDraft.key });
+              setSlackDraft(null);
+            }}
+            onPublish={async (summary) => {
+              await rpc.call("radar_slack_publish", { key: slackDraft.key, summary });
+              setSlackDraft(null);
+            }}
+          />
+        ) : null}
         {reviewing !== null ? (
           <ReviewSheet
             item={reviewing.item}

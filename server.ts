@@ -136,6 +136,24 @@ import {
   type RebaseResult,
   type RebaseTarget,
 } from "./rebase";
+import {
+  compareTs,
+  extractSummary,
+  MAX_SUMMARY,
+  MAX_THREADS_PER_ISSUE,
+  mcpTool,
+  parseSearchResults,
+  parseSummaryReply,
+  parseThreadJson,
+  renderComment,
+  searchArguments,
+  SlackAuthError,
+  SlackRateLimited,
+  SUMMARY_SYSTEM,
+  summaryPrompt,
+  unwrapText,
+  type SlackSource,
+} from "./slack-context";
 
 const run = promisify(execFile);
 
@@ -235,6 +253,13 @@ const snapshotSchema = z.object({
   skills: z.object({ reviewSkill: z.string(), gitstreamReviewSkill: z.string(), triageSkill: z.string() }),
   /** Items hidden one by one (radar_hidden_items lists them); already removed from `results`. */
   hiddenCount: z.number(),
+  /** Slack context: drafts waiting for your approval, by item key. */
+  slack: z.object({
+    enabled: z.boolean(),
+    error: z.string(),
+    sweptAt: z.string(),
+    drafts: z.record(z.string(), z.object({ at: z.string(), threads: z.number() })),
+  }),
 });
 
 export type RadarItem = z.infer<typeof itemSchema>;
@@ -242,6 +267,19 @@ export type ReviewContext = { title: string; prompt: string; defaultProjectId: s
 export type LaneResult = z.infer<typeof laneResultSchema>;
 export type RadarSnapshot = Omit<z.infer<typeof snapshotSchema>, "lanes"> & { lanes: Lane[] };
 export type { FocusState, HiddenEntry, Lane, RebaseResult, ScopeEntry, ScopeFilter };
+export type SlackDraftView = {
+  key: string;
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  /** The AI's proposed summary; you can edit it before posting. */
+  summary: string;
+  /** The summary in the comment on the issue now ("" if Radar has not posted one). */
+  current: string;
+  sources: SlackSource[];
+  at: string;
+};
 
 export const rpcContract = defineRpcContract({
   radar_snapshot: { input: z.null(), output: z.any() },
@@ -291,6 +329,17 @@ export const rpcContract = defineRpcContract({
     output: z.any(),
   },
   /** Server-side rebase of one of your open PRs; authorship and state are re-checked on the host. */
+  /** The pending Slack-context draft for one GitHub issue. */
+  radar_slack_draft: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
+  /** Posts (or edits Radar's existing) Slack-context comment with your approved summary. */
+  radar_slack_publish: {
+    input: z.object({ key: z.string().min(1).max(300), summary: z.string().trim().min(1).max(MAX_SUMMARY) }),
+    output: z.object({ url: z.string() }),
+  },
+  /** Drops the draft and marks the threads read, so only newer Slack messages draft again. */
+  radar_slack_dismiss: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
+  /** Checks one issue against Slack now instead of waiting for its turn. */
+  radar_slack_check: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
   radar_rebase: {
     input: z.object({
       source: z.enum(["github", "gitstream", "delta"]),
@@ -389,6 +438,26 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Review workflows · Issue triage skill (empty = none)",
       default: DEFAULT_SKILL_SETTINGS.triageSkill,
     },
+    slackMcpUrl: {
+      type: "string",
+      label: "Slack context · Slack MCP endpoint, https URL (empty = off)",
+      description:
+        "Radar searches public Slack channels for messages that link your GitHub issues, follows their threads and drafts a short \"Slack context\" comment. Nothing is posted until you approve it; Radar then edits its one comment in place.",
+      default: "",
+    },
+    slackTokenCommand: {
+      type: "string",
+      label: "Slack context · Command that prints the endpoint's bearer token",
+      description: "Run on the bb host without a shell; the last line it prints is the token. Re-run when the token expires.",
+      default: "",
+    },
+    slackSweepMinutes: {
+      type: "number",
+      label: "Slack context · Minutes between Slack sweeps (min 10)",
+      description: "Each sweep checks a few issues, least recently checked first, to stay inside Slack's rate limits.",
+      default: 30,
+      experimental_schema: z.number().finite().min(10).max(1440),
+    },
   });
   type Config = {
     refreshSeconds: number;
@@ -413,6 +482,9 @@ export default async function plugin(bb: BbPluginApi) {
     reviewSkill: string;
     gitstreamReviewSkill: string;
     triageSkill: string;
+    slackMcpUrl: string;
+    slackTokenCommand: string;
+    slackSweepMinutes: number;
   };
   const readConfig = (values: Config): Config => ({
     refreshSeconds: Number.isFinite(values.refreshSeconds) ? Math.max(30, values.refreshSeconds) : 90,
@@ -437,6 +509,10 @@ export default async function plugin(bb: BbPluginApi) {
     reviewSkill: (values.reviewSkill ?? DEFAULT_SKILL_SETTINGS.reviewSkill).trim(),
     gitstreamReviewSkill: (values.gitstreamReviewSkill ?? DEFAULT_SKILL_SETTINGS.gitstreamReviewSkill).trim(),
     triageSkill: (values.triageSkill ?? DEFAULT_SKILL_SETTINGS.triageSkill).trim(),
+    // Same https-only rule as the AI fallback: the token is sent there.
+    slackMcpUrl: fallbackBaseUrl(values.slackMcpUrl ?? ""),
+    slackTokenCommand: (values.slackTokenCommand ?? "").trim(),
+    slackSweepMinutes: Number.isFinite(values.slackSweepMinutes) ? Math.min(1440, Math.max(10, values.slackSweepMinutes)) : 30,
   });
   const savedAi = aiOverrideSchema.safeParse(await bb.storage.kv.get<unknown>("aiOverride"));
   let aiOverride: AiOverride = savedAi.success ? savedAi.data : null;
@@ -477,6 +553,11 @@ export default async function plugin(bb: BbPluginApi) {
     // Last refresh's lane results (result = LaneResult as JSON), so a restart shows what Radar knew.
     "CREATE TABLE results_cache (lane_id TEXT PRIMARY KEY, query_key TEXT NOT NULL, result TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE results_meta (id INTEGER PRIMARY KEY CHECK (id = 1), fetched_at TEXT NOT NULL)",
+    // Slack context: threads that link an issue (latest_ts = newest human message seen, synced_ts =
+    // newest one already summarised or dismissed), when each issue was last searched, and drafts.
+    "CREATE TABLE slack_threads (issue_key TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL, channel_name TEXT NOT NULL, permalink TEXT NOT NULL, latest_ts TEXT NOT NULL, synced_ts TEXT NOT NULL, PRIMARY KEY (issue_key, channel_id, thread_ts)) WITHOUT ROWID",
+    "CREATE TABLE slack_issues (issue_key TEXT PRIMARY KEY, checked_at TEXT NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE slack_drafts (issue_key TEXT PRIMARY KEY, draft TEXT NOT NULL) WITHOUT ROWID",
   ]);
   const parseRow = (value: unknown): unknown => {
     try {
@@ -794,6 +875,7 @@ export default async function plugin(bb: BbPluginApi) {
       hosts: hosts(),
       skills: { reviewSkill: config.reviewSkill, gitstreamReviewSkill: config.gitstreamReviewSkill, triageSkill: config.triageSkill },
       hiddenCount: hiddenItems.length,
+      slack: slackState(),
     };
   }
 
@@ -1767,6 +1849,303 @@ export default async function plugin(bb: BbPluginApi) {
     return { source, repo: parsed.repo, number: parsed.number };
   }
 
+  // ---- Slack context ------------------------------------------------------
+  //
+  // A slow background sweep (its own service, so the board's 90s poll never waits on Slack):
+  // a few open GitHub issues per sweep, least recently checked first, are searched for public
+  // Slack messages that link them. Their threads are followed; when a thread has human
+  // messages newer than the last summary, the AI drafts an update. Drafts wait for approval.
+
+  const SLACK_ISSUES_PER_SWEEP = 8;
+  const SLACK_CALL_GAP_MS = 1_200;
+  const SLACK_TOKEN_TTL_MS = 20 * 60_000;
+  const SLACK_MARK = "radar:slack-context";
+  type SlackThreadRow = {
+    issue_key: string;
+    channel_id: string;
+    thread_ts: string;
+    channel_name: string;
+    permalink: string;
+    latest_ts: string;
+    synced_ts: string;
+  };
+  const slackDraftSchema = z.object({
+    repo: z.string(),
+    number: z.number(),
+    title: z.string(),
+    url: z.string(),
+    summary: z.string(),
+    current: z.string(),
+    at: z.string(),
+    /** thread key (channel:ts) → the latest_ts the draft covers; approving marks exactly these read. */
+    marks: z.record(z.string(), z.string()),
+  });
+  type SlackDraft = z.infer<typeof slackDraftSchema>;
+  let slackError = "";
+  let slackSweptAt = "";
+  let slackToken: { value: string; at: number } | null = null;
+  let slackLastCall = 0;
+  let slackSweep: Promise<void> | null = null;
+  let wakeSlack: (() => void) | undefined;
+  /** Per-issue lock, so a manual check, a sweep and an approval never interleave on one issue. */
+  const slackBusy = new Map<string, Promise<unknown>>();
+
+  const slackEnabled = () => config.slackMcpUrl !== "" && config.slackTokenCommand !== "";
+  const threadKey = (row: Pick<SlackThreadRow, "channel_id" | "thread_ts">) => `${row.channel_id}:${row.thread_ts}`;
+
+  function slackThreads(key: string): SlackThreadRow[] {
+    return db.prepare("SELECT * FROM slack_threads WHERE issue_key = ? ORDER BY CAST(thread_ts AS REAL) DESC").all(key) as SlackThreadRow[];
+  }
+  function slackDraft(key: string): SlackDraft | null {
+    const row = db.prepare("SELECT draft FROM slack_drafts WHERE issue_key = ?").get(key) as { draft: string } | undefined;
+    const parsed = slackDraftSchema.safeParse(parseRow(row?.draft));
+    return parsed.success ? parsed.data : null;
+  }
+  function slackDrafts(): Map<string, SlackDraft> {
+    const rows = db.prepare("SELECT issue_key, draft FROM slack_drafts").all() as { issue_key: string; draft: string }[];
+    const drafts = new Map<string, SlackDraft>();
+    for (const row of rows) {
+      const parsed = slackDraftSchema.safeParse(parseRow(row.draft));
+      if (parsed.success) drafts.set(row.issue_key, parsed.data);
+    }
+    return drafts;
+  }
+
+  /** Open GitHub issues on the board (hidden items excluded); Slack context only touches these. */
+  function slackCandidates(): RadarItem[] {
+    const unique = new Map<string, RadarItem>();
+    for (const item of shownItems()) {
+      if (item.source === "github" && item.kind === "issue" && item.state.toLowerCase() !== "closed") unique.set(item.key, item);
+    }
+    return [...unique.values()];
+  }
+
+  function slackState() {
+    const board = new Set(slackCandidates().map((item) => item.key));
+    const drafts: Record<string, { at: string; threads: number }> = {};
+    for (const [key, draft] of slackDrafts()) if (board.has(key)) drafts[key] = { at: draft.at, threads: Object.keys(draft.marks).length };
+    return { enabled: slackEnabled(), error: slackEnabled() ? slackError : "", sweptAt: slackSweptAt, drafts };
+  }
+
+  function slackSleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (ms <= 0 || controller.signal.aborted) return resolve();
+      const done = () => {
+        clearTimeout(timer);
+        controller.signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      controller.signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  async function slackTokenValue(force: boolean): Promise<string> {
+    if (!force && slackToken !== null && Date.now() - slackToken.at < SLACK_TOKEN_TTL_MS) return slackToken.value;
+    const [bin, ...args] = config.slackTokenCommand.split(/\s+/);
+    if (bin === undefined || bin === "") throw new UserError("Set the Slack token command in Radar settings.");
+    const out = await tool(bin, args, "Slack token command");
+    const value = out.trim().split("\n").pop()?.trim() ?? "";
+    if (value === "" || /\s/.test(value)) throw new UserError("The Slack token command printed no token.");
+    slackToken = { value, at: Date.now() };
+    return value;
+  }
+
+  /** One Tool Gateway call, spaced out from the last; an expired token is re-fetched once. */
+  async function slackCall(name: string, args: Record<string, unknown>): Promise<string> {
+    await slackSleep(slackLastCall + SLACK_CALL_GAP_MS - Date.now());
+    if (controller.signal.aborted) throw new ToolAborted("Slack");
+    slackLastCall = Date.now();
+    try {
+      return await mcpTool(config.slackMcpUrl, await slackTokenValue(false), name, args, controller.signal);
+    } catch (error) {
+      if (!(error instanceof SlackAuthError)) throw error;
+      return mcpTool(config.slackMcpUrl, await slackTokenValue(true), name, args, controller.signal);
+    }
+  }
+
+  /** Radar's own Slack-context comment on the issue (yours, carrying the marker), newest wins. */
+  async function slackComment(repo: string, number: number): Promise<{ id: number; url: string; body: string } | null> {
+    if (githubLogin === "") throw new UserError("GitHub login unknown; is gh signed in?");
+    const filter = `.[] | select(.user.login == ${JSON.stringify(githubLogin)} and (.body | contains(${JSON.stringify(SLACK_MARK)}))) | {id, url: .html_url, body}`;
+    const out = await tool(config.ghPath, ["api", `repos/${repo}/issues/${number}/comments?per_page=100`, "--paginate", "--jq", filter], "GitHub comments");
+    const last = out.trim().split("\n").filter(Boolean).pop();
+    if (last === undefined) return null;
+    const parsed = z.object({ id: z.number(), url: z.string(), body: z.string() }).safeParse(parseRow(last));
+    return parsed.success ? parsed.data : null;
+  }
+
+  function markSynced(key: string, marks: Record<string, string>) {
+    const update = db.prepare("UPDATE slack_threads SET synced_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
+    for (const [thread, ts] of Object.entries(marks)) {
+      const [channel, threadTs] = thread.split(":");
+      if (channel !== undefined && threadTs !== undefined) update.run(ts, key, channel, threadTs);
+    }
+  }
+
+  function slackLocked<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const previous = slackBusy.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(work);
+    slackBusy.set(key, next);
+    void next.catch(() => undefined).finally(() => {
+      if (slackBusy.get(key) === next) slackBusy.delete(key);
+    });
+    return next;
+  }
+
+  /** Search, follow threads, and draft when there is something new. Returns whether a draft is waiting. */
+  function checkSlackIssue(item: RadarItem): Promise<boolean> {
+    return slackLocked(item.key, async () => {
+      const checked = db.prepare("SELECT checked_at FROM slack_issues WHERE issue_key = ?").get(item.key) as { checked_at: string } | undefined;
+      // Overlap two days so a message indexed late is still found.
+      const after = checked ? Date.parse(checked.checked_at) / 1000 - 2 * 86_400 : null;
+      const startedAt = new Date().toISOString();
+      const found = parseSearchResults(
+        unwrapText(await slackCall("slack_search_public", searchArguments(item.repo, item.number, Number.isFinite(after) ? after : null)), "results"),
+        item.repo,
+        item.number,
+      );
+      const upsert = db.prepare(
+        "INSERT INTO slack_threads (issue_key, channel_id, thread_ts, channel_name, permalink, latest_ts, synced_ts) VALUES (?, ?, ?, ?, ?, '', '') " +
+          "ON CONFLICT (issue_key, channel_id, thread_ts) DO UPDATE SET channel_name = excluded.channel_name, permalink = CASE WHEN excluded.permalink = '' THEN slack_threads.permalink ELSE excluded.permalink END",
+      );
+      for (const hit of found) upsert.run(item.key, hit.channelId, hit.threadTs, hit.channelName, hit.permalink);
+
+      const threads = slackThreads(item.key).slice(0, MAX_THREADS_PER_ISSUE);
+      const setLatest = db.prepare("UPDATE slack_threads SET latest_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
+      for (const thread of threads) {
+        const read = parseThreadJson(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, format: "json", limit: 200 }));
+        if (read.latestTs !== "" && compareTs(read.latestTs, thread.latest_ts) > 0) {
+          setLatest.run(read.latestTs, item.key, thread.channel_id, thread.thread_ts);
+          thread.latest_ts = read.latestTs;
+        }
+      }
+      db.prepare("INSERT INTO slack_issues (issue_key, checked_at) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET checked_at = excluded.checked_at").run(item.key, startedAt);
+
+      const unsynced = threads.filter((thread) => compareTs(thread.latest_ts, thread.synced_ts) > 0);
+      if (unsynced.length === 0) return slackDraft(item.key) !== null;
+      const existing = slackDraft(item.key);
+      // A waiting draft that already covers every new message needs no second AI call.
+      if (existing !== null && unsynced.every((thread) => compareTs(existing.marks[threadKey(thread)] ?? "", thread.latest_ts) >= 0)) return true;
+      if (aiBackend(bb, aiFallback()) === null) throw new UserError("Slack context needs AI to draft summaries; set up AI in Radar settings.");
+
+      const comment = await slackComment(item.repo, item.number);
+      const current = comment ? extractSummary(comment.body) : "";
+      const texts = [];
+      for (const thread of threads.filter((row) => row.latest_ts !== "")) {
+        const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
+        texts.push({ channelName: thread.channel_name, text });
+      }
+      const marks = Object.fromEntries(threads.filter((row) => row.latest_ts !== "").map((row) => [threadKey(row), row.latest_ts]));
+      const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, current, texts), 700));
+      if (!reply.changed) {
+        // Nothing material: mark read so the same messages don't draft again.
+        markSynced(item.key, marks);
+        db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(item.key);
+        return false;
+      }
+      const draft: SlackDraft = { repo: item.repo, number: item.number, title: item.title, url: item.url, summary: reply.summary, current, at: new Date().toISOString(), marks };
+      db.prepare("INSERT INTO slack_drafts (issue_key, draft) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET draft = excluded.draft").run(item.key, JSON.stringify(draft));
+      return true;
+    });
+  }
+
+  function sweepSlack(): Promise<void> {
+    if (!slackEnabled() || disposed) return Promise.resolve();
+    if (slackSweep !== null) return slackSweep;
+    slackSweep = (async () => {
+      try {
+        const checked = new Map(
+          (db.prepare("SELECT issue_key, checked_at FROM slack_issues").all() as { issue_key: string; checked_at: string }[]).map((row) => [row.issue_key, row.checked_at]),
+        );
+        const due = slackCandidates()
+          .sort((a, b) => (checked.get(a.key) ?? "").localeCompare(checked.get(b.key) ?? ""))
+          .slice(0, SLACK_ISSUES_PER_SWEEP);
+        let failure = "";
+        for (const item of due) {
+          if (disposed) return;
+          try {
+            await checkSlackIssue(item);
+          } catch (error) {
+            if (error instanceof ToolAborted) return;
+            failure = `${item.repo}#${item.number}: ${error instanceof Error ? error.message : String(error)}`;
+            if (error instanceof SlackRateLimited || error instanceof SlackAuthError) break;
+          }
+          publish();
+        }
+        slackError = failure;
+        slackSweptAt = new Date().toISOString();
+      } finally {
+        slackSweep = null;
+        publish();
+      }
+    })();
+    return slackSweep;
+  }
+
+  function slackItem(key: string): RadarItem {
+    const item = slackCandidates().find((candidate) => candidate.key === key);
+    if (item === undefined) throw new UserError("Slack context works on open GitHub issues on your board.");
+    return item;
+  }
+
+  function slackDraftView(key: string): SlackDraftView {
+    const draft = slackDraft(key);
+    if (draft === null) throw new UserError("No Slack context draft for this issue. It may have been posted or dismissed.");
+    const sources = slackThreads(key)
+      .filter((thread) => thread.latest_ts !== "" && draft.marks[threadKey(thread)] !== undefined)
+      .map((thread) => ({ channelName: thread.channel_name, permalink: thread.permalink }));
+    return { key, repo: draft.repo, number: draft.number, title: draft.title, url: draft.url, summary: draft.summary, current: draft.current, sources, at: draft.at };
+  }
+
+  function publishSlack(key: string, summary: string): Promise<{ url: string }> {
+    return slackLocked(key, async () => {
+      const view = slackDraftView(key);
+      const draft = slackDraft(key)!;
+      const body = renderComment(summary, view.sources, new Date().toISOString().slice(0, 10));
+      const existing = await slackComment(view.repo, view.number);
+      const args = existing !== null
+        ? ["api", "-X", "PATCH", `repos/${view.repo}/issues/comments/${existing.id}`, "-f", `body=${body}`, "--jq", ".html_url"]
+        : ["api", "-X", "POST", `repos/${view.repo}/issues/${view.number}/comments`, "-f", `body=${body}`, "--jq", ".html_url"];
+      const url = (await tool(config.ghPath, args, existing !== null ? "Updating the Slack context comment" : "Posting the Slack context comment")).trim();
+      markSynced(key, draft.marks);
+      db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(key);
+      publish();
+      return { url: url || existing?.url || view.url };
+    });
+  }
+
+  function dismissSlack(key: string): Promise<RadarSnapshot> {
+    return slackLocked(key, async () => {
+      const draft = slackDraft(key);
+      if (draft !== null) markSynced(key, draft.marks);
+      db.prepare("DELETE FROM slack_drafts WHERE issue_key = ?").run(key);
+      publish();
+      return snapshot();
+    });
+  }
+
+  bb.background.service("slack-context", {
+    async start(signal) {
+      // Let the board load first; Slack is never on the critical path.
+      await slackSleep(60_000);
+      while (!signal.aborted && !disposed) {
+        await sweepSlack().catch((error: unknown) => bb.log.warn(`slack sweep failed: ${String(error)}`));
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", finish);
+            if (wakeSlack === finish) wakeSlack = undefined;
+            resolve();
+          };
+          const timer = setTimeout(finish, config.slackSweepMinutes * 60_000);
+          wakeSlack = finish;
+          signal.addEventListener("abort", finish, { once: true });
+        });
+      }
+    },
+  });
+
   // Read by the rail-badge content script; local auth keeps it to bb app origins.
   bb.http.route("GET", "/badge", (c) => c.json({ new: newCount(), fetchedAt }));
 
@@ -1818,6 +2197,15 @@ export default async function plugin(bb: BbPluginApi) {
     radar_review_context: ({ key }) => reviewContext(key),
     radar_review_start: ({ key, request }) => startReview(key, request),
     radar_rebase: ({ source, repo, number }) => rebase({ source, repo, number }),
+    radar_slack_draft: ({ key }) => slackDraftView(key),
+    radar_slack_publish: ({ key, summary }) => publishSlack(key, summary),
+    radar_slack_dismiss: ({ key }) => dismissSlack(key),
+    radar_slack_check: async ({ key }) => {
+      if (!slackEnabled()) throw new UserError("Slack context is off. Set the Slack endpoint and token command in Radar settings.");
+      await checkSlackIssue(slackItem(key));
+      publish();
+      return snapshot();
+    },
   });
 
   settings.onChange((values) => {
@@ -1828,8 +2216,10 @@ export default async function plugin(bb: BbPluginApi) {
     applyHosts(config);
     if (JSON.stringify(hosts().delta) !== hadDelta) deltaMe = "";
     if (labelRepo() !== "" && labelRepo() !== hadLabels) void buildLabelIndex();
+    slackToken = null;
     publish();
     wakeSleep?.();
+    wakeSlack?.();
   });
 
   bb.background.service("poll", {
@@ -1884,6 +2274,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb radar hide-item <url|key> [--json]     hide one PR or issue everywhere until unhidden",
     "  bb radar unhide-item <url|key> | --all [--json]  bring hidden items back",
     "  bb radar hidden [--json]                  list items hidden one by one",
+    "  bb radar slack [--json]                   Slack context drafts waiting for approval",
+    "  bb radar slack-check <url|key> [--json]   check one GitHub issue against Slack now (drafts only; never posts)",
     "  bb radar rebase <url|owner/repo#n> [--source github|delta] --yes [--json]",
     "                                            rebase your own open PR (GitHub server-side; Delta via git)",
     "",
@@ -1922,6 +2314,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "hide-item", summary: "Hide one PR or issue everywhere", usage: "bb radar hide-item <url|key|owner/repo#n> [--json]" },
       { name: "unhide-item", summary: "Unhide one item, or all", usage: "bb radar unhide-item <url|key|owner/repo#n> | --all [--json]" },
       { name: "hidden", summary: "List items hidden one by one", usage: "bb radar hidden [--json]" },
+      { name: "slack", summary: "Slack context drafts waiting for approval (approve them in the panel)", usage: "bb radar slack [--json]" },
+      { name: "slack-check", summary: "Check one GitHub issue against Slack now", usage: "bb radar slack-check <url|key|owner/repo#n> [--json]" },
       {
         name: "rebase",
         summary: "Rebase your own open PR onto its base (GitHub server-side, Delta via git replay + leased push; needs --yes)",
@@ -2149,6 +2543,33 @@ export default async function plugin(bb: BbPluginApi) {
                 .join("\n"),
             };
           }
+          case "slack": {
+            const state = slackState();
+            const drafts = Object.keys(state.drafts).map((key) => slackDraftView(key));
+            if (json) return { exitCode: 0, stdout: JSON.stringify({ ...state, drafts }) };
+            if (!state.enabled) return { exitCode: 0, stdout: "Slack context is off (set the Slack endpoint and token command in Radar settings)." };
+            const head = [`last sweep ${state.sweptAt || "(not yet)"}${state.error ? `  ERROR: ${state.error}` : ""}`];
+            if (drafts.length === 0) return { exitCode: 0, stdout: [...head, "No drafts waiting."].join("\n") };
+            return {
+              exitCode: 0,
+              stdout: [
+                ...head,
+                ...drafts.map((draft) => `${draft.repo}#${draft.number}  ${draft.title.slice(0, 70)}\n  ${draft.summary.replace(/\n/g, "\n  ")}\n  sources: ${draft.sources.map((source) => `#${source.channelName}`).join(", ")}`),
+                "Approve, edit or dismiss them in the Radar panel.",
+              ].join("\n"),
+            };
+          }
+          case "slack-check": {
+            if (!slackEnabled()) return { exitCode: 1, stderr: "Slack context is off. Set the Slack endpoint and token command in Radar settings." };
+            if (rest[0] === undefined) return { exitCode: 1, stderr: "Usage: bb radar slack-check <url|key|owner/repo#n>" };
+            if (fetchedAt === "") await refreshAll();
+            const key = cliItemKey(rest[0], slackCandidates());
+            const drafted = await checkSlackIssue(slackItem(key));
+            publish();
+            if (json) return { exitCode: 0, stdout: JSON.stringify({ key, draft: drafted ? slackDraftView(key) : null, threads: slackThreads(key).length }) };
+            const threads = slackThreads(key).length;
+            return { exitCode: 0, stdout: drafted ? `Draft ready (${threads} thread${threads === 1 ? "" : "s"}); review it in the Radar panel.` : `No new Slack context (${threads} linked thread${threads === 1 ? "" : "s"}).` };
+          }
           case "rebase": {
             const sourceIndex = rest.indexOf("--source");
             const sourceFlag = sourceIndex >= 0 ? rest[sourceIndex + 1] : undefined;
@@ -2184,7 +2605,9 @@ export default async function plugin(bb: BbPluginApi) {
     disposed = true;
     controller.abort();
     wakeSleep?.();
+    wakeSlack?.();
     if (publishTimer !== undefined) clearTimeout(publishTimer);
     await inFlight?.catch(() => undefined);
+    await slackSweep?.catch(() => undefined);
   });
 }

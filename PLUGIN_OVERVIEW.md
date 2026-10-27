@@ -27,6 +27,12 @@ Radar threads get skills attached:
 - `radar-review` or `radar-triage`, Radar's own skills, describe how to read the item on each host and how to report. They never post, approve or edit until you say so.
 - Optionally, one installed skill (for example a code-review skill) is invoked in the opening message; pick it per kind in settings.
 
+## Slack context
+
+Point Radar at a Slack MCP endpoint and it follows public Slack threads that link your open GitHub issues. Each sweep checks a few issues (least recently checked first), keeps only messages by people that link the exact issue, and when a thread has something new, bb's AI drafts a short "Slack context" summary: decisions, owners, open questions, next steps.
+
+Nothing is posted on its own. A marked Slack icon on the issue row opens the draft. Edit it, then post it, or dismiss it. Radar keeps one comment per issue, with links to the threads, and later approvals edit that comment in place. Private channels and DMs are never searched.
+
 ## CLI and agent skill
 
 `bb radar` lists lanes and items, adds or edits lanes, sets focus and hides single items, so agents can answer "what needs my review?" through the bundled `radar` skill.

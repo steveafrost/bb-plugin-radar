@@ -27,6 +27,8 @@ bb radar hide <repo|area>… / show <…> [--json]  # hide or unhide whole repos
 bb radar hide-item <url|key> [--json]      # hide ONE PR/issue everywhere until unhidden (key: github:owner/repo#12; owner/repo#12 if unique)
 bb radar unhide-item <url|key> | --all [--json]  # bring one (or every) hidden item back
 bb radar hidden [--json]                   # items hidden one by one, newest first
+bb radar slack [--json]                    # Slack context drafts waiting for approval (approval is in the panel only)
+bb radar slack-check <url|key> [--json]    # check one open GitHub issue against public Slack now; drafts only, never posts
 bb radar focus --off | --on                # Focus off = normal board (focus is kept); --on resumes it
 bb radar scopes [--json]                   # repos + area-repo areas in results, counts, focus state
 bb radar list --all                        # ignore the focus filter
@@ -39,6 +41,8 @@ bb radar rebase <PR url|owner/repo#n> [--source github|delta] --yes [--json]  # 
 Scope keys: repos are `owner/name`; areas of the `areaRepo` setting (a monorepo) are `//<path>` keys from its `//...` labels, cut to three segments; `//no-area` is that repo with no area label. Focus = show only those; hidden = drop those (a PR touching several areas stays while any of its areas is shown). It applies to every lane, every view, the rail badge and `status`/`list`; hidden items are never counted new or marked seen. `bb radar status` prints the focus line and per-lane hidden counts.
 
 Hidden items (`hide-item`) are separate from Focus: one PR or issue, by key, gone from every lane, view, the badge, `status` and `list` (even `list --all`), never marked seen. A hide lasts until `unhide-item`; an entry whose item has been in no lane for 30 days is pruned. Only hide or unhide when the user asks.
+
+Slack context (on when `slackMcpUrl` and `slackTokenCommand` are set): Radar searches public Slack channels for human messages that link an open GitHub issue on the board, follows those threads, and has the AI draft a short summary. Drafts are only posted when the user approves them in the panel, as one marked comment that later approvals edit in place. Agents can list and check drafts but cannot post them.
 
 `add` sends the description through BB’s configured-provider text completion API, validates the drafted lane,
 runs it once, and prints how many items match. Use `--dry-run` to preview first.
