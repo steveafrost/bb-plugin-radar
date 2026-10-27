@@ -1396,6 +1396,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
     });
 
   return (
+    <div className="radar-frame">
     <div className="radar">
       <div className="radar__inner">
         <div className="radar-bar" role="group" aria-label="Radar tools">
@@ -1529,6 +1530,17 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
         ))}
         </ReviewActions.Provider>
 
+        {snapshot !== null && lanes.length === 0 ? (
+          <p className="radar-empty">
+            No lanes.{" "}
+            <button type="button" className="radar-link" onClick={() => void mutate(rpc.call("radar_lanes_reset", null))}>
+              Restore the defaults
+            </button>
+          </p>
+        ) : null}
+      </div>
+    </div>
+
         {reviewing !== null ? (
           <ReviewSheet
             item={reviewing.item}
@@ -1545,16 +1557,6 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
             }}
           />
         ) : null}
-
-        {snapshot !== null && lanes.length === 0 ? (
-          <p className="radar-empty">
-            No lanes.{" "}
-            <button type="button" className="radar-link" onClick={() => void mutate(rpc.call("radar_lanes_reset", null))}>
-              Restore the defaults
-            </button>
-          </p>
-        ) : null}
-      </div>
     </div>
   );
 }
