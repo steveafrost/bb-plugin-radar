@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   compareTs,
   itemPath,
+  focusThread,
+  itemPaths,
   linksItem,
   mcpTool,
   parseRpcBody,
@@ -238,5 +240,50 @@ describe("Tool Gateway transport", () => {
     await expect(
       mcpTool("https://g/mcp", "t", "x", {}, signal, respond(ok({ result: { isError: true, content: [{ type: "text", text: "channel_not_found" }] } }))),
     ).rejects.toThrow("channel_not_found");
+  });
+});
+
+describe("itemPaths", () => {
+  const meteorite = { gitstreamWebUrl: "https://meteorite.example.dev", gitstreamRepo: "acme/mono" };
+  it("adds a Delta PR's Meteorite and GitHub URLs", () => {
+    expect(itemPaths("https://delta.example.dev/acme/mono/pull/42", meteorite)).toEqual([
+      "delta.example.dev/acme/mono/pull/42",
+      "github.com/acme/mono/pull/42",
+      "meteorite.example.dev/repos/acme/mono/pulls/42",
+    ]);
+  });
+  it("skips Meteorite when it serves another repo or is not set", () => {
+    expect(itemPaths("https://delta.example.dev/acme/other/pull/7", meteorite)).toEqual(["delta.example.dev/acme/other/pull/7", "github.com/acme/other/pull/7"]);
+    expect(itemPaths("https://delta.example.dev/acme/mono/pull/7", { gitstreamWebUrl: "", gitstreamRepo: "" })).toHaveLength(2);
+  });
+  it("keeps GitHub items to their own URL", () => {
+    expect(itemPaths("https://github.com/acme/issues/issues/3", null)).toEqual(["github.com/acme/issues/issues/3"]);
+    expect(itemPaths("not a url", null)).toEqual([]);
+  });
+  it("matches a Meteorite link with a trailing view, not a longer number", () => {
+    const path = "meteorite.example.dev/repos/acme/mono/pulls/42";
+    expect(linksItem("see <https://meteorite.example.dev/repos/acme/mono/pulls/42/timeline|#42>", path)).toBe(true);
+    expect(linksItem("https://meteorite.example.dev/repos/acme/mono/pulls/421", path)).toBe(false);
+  });
+});
+
+describe("parseSummaryReply line breaks", () => {
+  it("accepts raw newlines inside the summary string", () => {
+    expect(parseSummaryReply('{"changed": true, "summary": "- one\n- two"}')).toEqual({ changed: true, summary: "- one\n- two" });
+  });
+});
+
+describe("focusThread", () => {
+  const message = (name: string, body: string) => `> ${name} <${name.toLowerCase()}@x.dev>: ${body}\n`;
+  it("keeps the opening and the reply that links the item when a thread is too long", () => {
+    const text = message("Bot", "standup") + message("Ann", "a".repeat(300)) + message("Bo", "b".repeat(300)) + message("Cy", "QA'd <https://m.dev/repos/o/r/pulls/7|#7>");
+    const out = focusThread(text, ["m.dev/repos/o/r/pulls/7"], 200);
+    expect(out).toContain("standup");
+    expect(out).toContain("[…]");
+    expect(out).toContain("QA'd");
+    expect(out).not.toContain("aaaa");
+  });
+  it("returns short threads unchanged", () => {
+    expect(focusThread("short", [], 100)).toBe("short");
   });
 });

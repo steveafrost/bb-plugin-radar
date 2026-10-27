@@ -146,6 +146,7 @@ import {
   parseThreadJson,
   renderComment,
   itemPath,
+  itemPaths,
   searchArguments,
   SlackAuthError,
   SlackRateLimited,
@@ -153,6 +154,7 @@ import {
   summaryPrompt,
   unwrapText,
   type SlackSource,
+  type SlackHit,
 } from "./slack-context";
 
 const run = promisify(execFile);
@@ -586,6 +588,8 @@ export default async function plugin(bb: BbPluginApi) {
     "ALTER TABLE slack_threads ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''",
     // Item-level summaries became per-thread ones; the summaries are rebuilt on the next check.
     "UPDATE slack_threads SET synced_ts = ''",
+    // Delta PRs now also match their Meteorite and GitHub URLs; search every item in full once more.
+    "DELETE FROM slack_issues",
   ]);
   const parseRow = (value: unknown): unknown => {
     try {
@@ -2059,11 +2063,11 @@ export default async function plugin(bb: BbPluginApi) {
       // Overlap two days so a message indexed late is still found.
       const after = checked ? Date.parse(checked.checked_at) / 1000 - 2 * 86_400 : null;
       const startedAt = new Date().toISOString();
-      const path = itemPath(item.url);
-      const found = parseSearchResults(
-        unwrapText(await slackCall("slack_search_public", searchArguments(path, Number.isFinite(after) ? after : null)), "results"),
-        path,
-      );
+      const found: SlackHit[] = [];
+      const paths = itemPaths(item.url, item.source === "delta" ? { gitstreamWebUrl: config.gitstreamWebUrl, gitstreamRepo: config.gitstreamRepo } : null);
+      for (const path of paths) {
+        found.push(...parseSearchResults(unwrapText(await slackCall("slack_search_public", searchArguments(path, Number.isFinite(after) ? after : null)), "results"), path));
+      }
       const upsert = db.prepare(
         "INSERT INTO slack_threads (issue_key, channel_id, thread_ts, channel_name, permalink, latest_ts, synced_ts) VALUES (?, ?, ?, ?, ?, '', '') " +
           "ON CONFLICT (issue_key, channel_id, thread_ts) DO UPDATE SET channel_name = excluded.channel_name, permalink = CASE WHEN excluded.permalink = '' THEN slack_threads.permalink ELSE excluded.permalink END",
@@ -2091,7 +2095,7 @@ export default async function plugin(bb: BbPluginApi) {
         for (const thread of stale) {
           try {
             const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
-            const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, thread.summary, { channelName: thread.channel_name, text }), 500));
+            const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, thread.summary, { channelName: thread.channel_name, text }, paths), 900));
             const summary = reply.changed || thread.summary === "" ? reply.summary : thread.summary;
             if (summary !== thread.summary) gained = true;
             setSummary.run(summary, thread.latest_ts, item.key, thread.channel_id, thread.thread_ts);

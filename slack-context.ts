@@ -71,6 +71,27 @@ export function itemPath(url: string): string {
 }
 
 /** Arguments for slack_search_public. Public channels only, so nothing private can reach an issue. */
+/**
+ * Every URL path Slack may use for an item: its own, plus for a Delta PR the URLs the same PR had
+ * before the move (Delta kept the numbers): Meteorite's `/repos/o/r/pulls/N` and GitHub's.
+ */
+export function itemPaths(url: string, before: { gitstreamWebUrl: string; gitstreamRepo: string } | null): string[] {
+  const own = itemPath(url);
+  const match = /^[^/]+\/([^/]+\/[^/]+)\/pull\/(\d+)$/.exec(own);
+  if (before === null || match === null) return own === "" ? [] : [own];
+  const [, repo, number] = match;
+  const paths = [own, `github.com/${repo}/pull/${number}`];
+  try {
+    const origin = new URL(before.gitstreamWebUrl);
+    if (origin.protocol === "https:" && before.gitstreamRepo.toLowerCase() === repo!.toLowerCase()) {
+      paths.push(`${origin.host.toLowerCase()}/repos/${repo}/pulls/${number}`);
+    }
+  } catch {
+    // No Gitstream origin set: Meteorite links are not followed.
+  }
+  return [...new Set(paths)];
+}
+
 export function searchArguments(path: string, afterUnix: number | null): Record<string, unknown> {
   return {
     query: path,
@@ -208,24 +229,60 @@ export const SUMMARY_SYSTEM = [
   "Leave out greetings, thanks and chatter. It is shown on the engineer's dashboard and may be posted to the issue, so write",
   "GitHub markdown: at most 4 short bullets, under 90 words. Name people only by the names shown. Never invent facts.",
   "Do not copy secrets, tokens, customer or merchant data, or anything that reads as personal.",
+  "Messages link the item by one of the URLs given. When the thread is broader than the item (a standup, a digest, a",
+  "status round-up), summarise only the messages that link or discuss it, saying who said what; never say it is not discussed.",
+  "When there is little more than the link, write one bullet saying who shared it, where and why (for example a review ask).",
+  "Never comment on how much the thread contains.",
   "If a current summary is given, return an updated version of it: keep what still holds, fix what changed, add what is new.",
   "Answer with JSON only: {\"changed\": boolean, \"summary\": string}. changed is false when the thread adds nothing",
   "material to the current summary; then summary repeats the current one.",
 ].join(" ");
 
+/**
+ * A concise thread cut to `limit` characters, keeping its opening message and every message that
+ * links one of `paths` first (a 20-reply standup buries the one reply about this item), then the
+ * rest in order. Messages stay in thread order; "[…]" marks a gap.
+ */
+export function focusThread(text: string, paths: string[], limit: number): string {
+  if (text.length <= limit) return text;
+  const starts = [...text.matchAll(/^(?:> )?[^\n<>]{2,80} <[^>\s]+@[^>\s]+>: /gm)].map((match) => match.index!);
+  if (starts.length < 2) return text.slice(0, limit);
+  const messages = starts.map((start, index) => text.slice(start, starts[index + 1] ?? text.length));
+  const links = (message: string) => paths.some((path) => linksItem(message, path));
+  const order = messages.map((_, index) => index).sort((a, b) => Number(b === 0 || links(messages[b]!)) - Number(a === 0 || links(messages[a]!)) || a - b);
+  const kept = new Set<number>();
+  let budget = limit;
+  for (const index of order) {
+    const size = Math.min(messages[index]!.length, 4000);
+    if (size > budget) continue;
+    kept.add(index);
+    budget -= size;
+  }
+  let previous = -1;
+  const out: string[] = [];
+  for (const index of [...kept].sort((a, b) => a - b)) {
+    if (index !== previous + 1) out.push("[…]\n");
+    out.push(messages[index]!.slice(0, 4000));
+    previous = index;
+  }
+  return out.join("");
+}
+
 export function summaryPrompt(
   issue: { kind: "issue" | "pr"; repo: string; number: number; title: string },
   current: string,
   thread: { channelName: string; text: string },
+  paths: string[] = [],
 ): string {
   return [
     `${issue.kind === "pr" ? "Pull request" : "Issue"}: ${issue.repo}#${issue.number} — ${issue.title}`,
+    ...(paths.length > 0 ? [`Linked as: ${paths.join(", ")}`] : []),
     "",
     "Current summary:",
     current.trim() === "" ? "(none yet)" : current.trim(),
     "",
     `Slack thread in #${thread.channelName}:`,
-    thread.text.trim().slice(0, THREAD_CHARS),
+    focusThread(thread.text.trim(), paths, THREAD_CHARS),
   ].join("\n");
 }
 
@@ -237,10 +294,16 @@ export function parseSummaryReply(text: string): { changed: boolean; summary: st
   const end = text.lastIndexOf("}");
   if (start === -1 || end <= start) throw new Error("The AI answer had no JSON.");
   let parsed: unknown;
+  const body = text.slice(start, end + 1);
   try {
-    parsed = JSON.parse(text.slice(start, end + 1));
+    parsed = JSON.parse(body);
   } catch {
-    throw new Error("The AI answer was not valid JSON.");
+    // Models often put raw line breaks inside the summary string; escape them and try once more.
+    try {
+      parsed = JSON.parse(body.replace(/"(?:[^"\\]|\\.)*"/gs, (string) => string.replace(/\r?\n/g, "\\n").replace(/\t/g, "\\t")));
+    } catch {
+      throw new Error(end === text.trimEnd().length - 1 ? "The AI answer was not valid JSON." : "The AI answer was cut off.");
+    }
   }
   const reply = replySchema.safeParse(parsed);
   if (!reply.success) throw new Error("The AI answer did not match {changed, summary}.");
