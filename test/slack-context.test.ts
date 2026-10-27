@@ -143,14 +143,14 @@ describe("parseThreadJson", () => {
     const text = JSON.stringify({
       ok: true,
       messages: [
-        { ts: "1787160840.378779", user: "U1", text: "parent" },
+        { ts: "1787160840.378779", user: "U1", user_name: "Ada", text: "parent <https://x.dev/a|the doc> for <@U9> in <#C1|eng> &amp; co", reply_count: "4" },
         { ts: "1787177368.806139", user: "U2", text: "reply" },
         { ts: "1787999999.000000", bot_id: "B1", text: "GitHub bot echo" },
         { ts: "1787999998.000000", subtype: "channel_join", text: "joined" },
         { ts: "1787177369.000001", subtype: "thread_broadcast", user: "U3", text: "also sent to channel" },
       ],
     });
-    expect(parseThreadJson(text)).toEqual({ latestTs: "1787177369.000001", count: 3 });
+    expect(parseThreadJson(text)).toEqual({ latestTs: "1787177369.000001", count: 3, author: "Ada", opening: "parent the doc for @someone in #eng & co", replies: 4 });
   });
   it("throws on Slack errors and junk", () => {
     expect(() => parseThreadJson(JSON.stringify({ ok: false, error: "thread_not_found" }))).toThrow("thread_not_found");
@@ -182,17 +182,14 @@ describe("renderComment", () => {
 
 describe("summaryPrompt", () => {
   it("includes the current summary and caps thread text", () => {
-    const prompt = summaryPrompt({ kind: "issue", repo: "acme/issues", number: 12, title: "Thing" }, "", [
-      { channelName: "team-dev", text: "x".repeat(10_000) },
-      { channelName: "help", text: "short" },
-    ]);
+    const prompt = summaryPrompt({ kind: "issue", repo: "acme/issues", number: 12, title: "Thing" }, "", { channelName: "help", text: "x".repeat(50_000) });
     expect(prompt).toContain("acme/issues#12 — Thing");
     expect(prompt).toContain("(none yet)");
-    expect(prompt).toContain("--- #help ---\nshort");
-    expect(prompt.length).toBeLessThan(7_000);
+    expect(prompt).toContain("Slack thread in #help:");
+    expect(prompt.length).toBeLessThan(13_000);
   });
   it("names a pull request as one", () => {
-    expect(summaryPrompt({ kind: "pr", repo: "shop/world", number: 9, title: "Fix" }, "", [])).toContain("Pull request: shop/world#9 — Fix");
+    expect(summaryPrompt({ kind: "pr", repo: "shop/world", number: 9, title: "Fix" }, "- old", { channelName: "x", text: "y" })).toContain("Pull request: shop/world#9 — Fix\n\nCurrent summary:\n- old");
   });
 });
 

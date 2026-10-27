@@ -10,8 +10,7 @@ export const SLACK_HEADING = "### Slack context";
 /** Threads followed per issue (newest first); older links stay stored but are not re-read. */
 export const MAX_THREADS_PER_ISSUE = 5;
 /** Per-thread and total caps on the Slack text sent to the AI. */
-const THREAD_CHARS = 6000;
-const TOTAL_CHARS = 18000;
+const THREAD_CHARS = 12000;
 export const MAX_SUMMARY = 4000;
 
 export type SlackHit = {
@@ -27,7 +26,30 @@ export type SlackThreadRead = {
   latestTs: string;
   /** Human messages in the thread. */
   count: number;
+  /** Who opened the thread and what they said (Slack markup cleaned, trimmed). */
+  author: string;
+  opening: string;
+  /** Replies Slack reports for the parent (all of them, not just the page read). */
+  replies: number;
 };
+
+const OPENING_CHARS = 400;
+
+/** Slack mrkdwn as plain text: links show their label, mentions and channels their names. */
+export function slackPlainText(text: string): string {
+  return text
+    .replace(/<([^<>|]+)\|([^<>]+)>/g, (_, target: string, label: string) => (target.startsWith("#C") ? `#${label}` : target.startsWith("@") ? `@${label}` : label))
+    .replace(/<@[A-Z0-9]+>/g, "@someone")
+    .replace(/<#[A-Z0-9]+>/g, "#channel")
+    .replace(/<!(here|channel|everyone)>/g, "@$1")
+    .replace(/<(https?:[^<>]+)>/g, "$1")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 export type SlackSource = { channelName: string; permalink: string };
 
@@ -126,6 +148,9 @@ const threadJson = z.object({
     ts: z.string(),
     bot_id: z.string().optional(),
     subtype: z.string().optional(),
+    text: z.string().optional(),
+    user_name: z.string().optional(),
+    reply_count: z.union([z.string(), z.number()]).optional(),
   }).passthrough()).optional(),
 }).passthrough();
 
@@ -140,7 +165,16 @@ export function parseThreadJson(text: string): SlackThreadRead {
   if (parsed.ok === false) throw new Error(`Slack: ${parsed.error ?? "thread read failed"}`);
   const human = (parsed.messages ?? []).filter((message) => message.bot_id === undefined && (message.subtype === undefined || message.subtype === "thread_broadcast"));
   const latestTs = human.reduce((latest, message) => (compareTs(message.ts, latest) > 0 ? message.ts : latest), "");
-  return { latestTs, count: human.length };
+  const parent = parsed.messages?.[0];
+  const opening = slackPlainText(parent?.text ?? "");
+  const replies = Number(parent?.reply_count ?? 0);
+  return {
+    latestTs,
+    count: human.length,
+    author: (parent?.user_name ?? "").slice(0, 80),
+    opening: opening.length > OPENING_CHARS ? `${opening.slice(0, OPENING_CHARS - 1).trimEnd()}…` : opening,
+    replies: Number.isFinite(replies) ? replies : 0,
+  };
 }
 
 /** Slack ts strings compared numerically ("" sorts first). */
@@ -152,7 +186,7 @@ export function compareTs(a: string, b: string): number {
 
 // ---- posting to the issue or PR ----------------------------------------------
 
-/** The comment body for "Post to issue": heading, the text you approved, then the sources. */
+/** The comment body for "Post to issue/PR": heading, the thread's context, then a link to it. */
 export function renderComment(summary: string, sources: SlackSource[], date: string): string {
   const links = sources
     .filter((source) => source.permalink !== "")
@@ -169,33 +203,29 @@ export function renderComment(summary: string, sources: SlackSource[], date: str
 // ---- the AI draft ------------------------------------------------------------
 
 export const SUMMARY_SYSTEM = [
-  "You keep a short \"Slack context\" summary for an issue or pull request, written from public Slack threads that link it.",
-  "Readers are engineers who did not see the Slack conversation. Capture what changes their understanding of the work:",
-  "decisions, agreed scope, open questions, blockers, owners and next steps. Leave out greetings, thanks and chatter.",
-  "It is shown on the engineer's dashboard and may be posted to the issue, so write GitHub markdown: at most 6 short bullets, under 150 words. Name people only by the names shown. Never invent facts.",
+  "You summarise one public Slack thread that links an issue or pull request, for an engineer who did not see it.",
+  "Capture what changes their understanding of the work: decisions, agreed scope, open questions, blockers, owners and next steps.",
+  "Leave out greetings, thanks and chatter. It is shown on the engineer's dashboard and may be posted to the issue, so write",
+  "GitHub markdown: at most 4 short bullets, under 90 words. Name people only by the names shown. Never invent facts.",
   "Do not copy secrets, tokens, customer or merchant data, or anything that reads as personal.",
   "If a current summary is given, return an updated version of it: keep what still holds, fix what changed, add what is new.",
-  "Answer with JSON only: {\"changed\": boolean, \"summary\": string}. changed is false when the threads add nothing",
+  "Answer with JSON only: {\"changed\": boolean, \"summary\": string}. changed is false when the thread adds nothing",
   "material to the current summary; then summary repeats the current one.",
 ].join(" ");
 
-export type ThreadText = { channelName: string; text: string };
-
-export function summaryPrompt(issue: { kind: "issue" | "pr"; repo: string; number: number; title: string }, current: string, threads: ThreadText[]): string {
-  let budget = TOTAL_CHARS;
-  const parts = threads.map((thread) => {
-    const text = thread.text.trim().slice(0, Math.min(THREAD_CHARS, Math.max(0, budget)));
-    budget -= text.length;
-    return `--- #${thread.channelName} ---\n${text}`;
-  }).filter((part) => !part.endsWith("---\n"));
+export function summaryPrompt(
+  issue: { kind: "issue" | "pr"; repo: string; number: number; title: string },
+  current: string,
+  thread: { channelName: string; text: string },
+): string {
   return [
     `${issue.kind === "pr" ? "Pull request" : "Issue"}: ${issue.repo}#${issue.number} — ${issue.title}`,
     "",
     "Current summary:",
     current.trim() === "" ? "(none yet)" : current.trim(),
     "",
-    "Slack threads:",
-    ...parts,
+    `Slack thread in #${thread.channelName}:`,
+    thread.text.trim().slice(0, THREAD_CHARS),
   ].join("\n");
 }
 

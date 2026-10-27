@@ -267,6 +267,23 @@ export type ReviewContext = { title: string; prompt: string; defaultProjectId: s
 export type LaneResult = z.infer<typeof laneResultSchema>;
 export type RadarSnapshot = Omit<z.infer<typeof snapshotSchema>, "lanes"> & { lanes: Lane[] };
 export type { FocusState, HiddenEntry, Lane, RebaseResult, ScopeEntry, ScopeFilter };
+export type SlackThreadView = {
+  /** channel_id:thread_ts */
+  id: string;
+  channelName: string;
+  permalink: string;
+  /** Who opened the thread, and their opening message (plain text, trimmed). */
+  author: string;
+  opening: string;
+  replies: number;
+  /** Newest human message. */
+  latestAt: string;
+  /** Radar's AI summary of the thread ("" when AI is off or has not run yet). */
+  summary: string;
+  /** Your last "Post to issue/PR" of this thread, if any. */
+  posted: { url: string; at: string } | null;
+};
+
 export type SlackContextView = {
   key: string;
   kind: "pr" | "issue";
@@ -274,15 +291,10 @@ export type SlackContextView = {
   number: number;
   title: string;
   url: string;
-  /** Radar's AI summary of the linked threads ("" when AI is off or has not run yet). */
-  summary: string;
-  summaryError: string;
-  summarizedAt: string;
   checkedAt: string;
+  summaryError: string;
   /** Linked threads with human messages, newest first. */
-  sources: SlackSource[];
-  /** Your last "Post to issue/PR", if any. */
-  posted: { url: string; at: string } | null;
+  threads: SlackThreadView[];
   isNew: boolean;
 };
 
@@ -336,9 +348,9 @@ export const rpcContract = defineRpcContract({
   /** Server-side rebase of one of your open PRs; authorship and state are re-checked on the host. */
   /** Slack context for one item (opening it clears its "new" mark). */
   radar_slack_context: { input: z.object({ key: z.string().min(1).max(300) }), output: z.any() },
-  /** "Post to issue/PR": a new comment with your text and the thread links. Panel only. */
+  /** "Post to issue/PR": a new comment with one thread's context and its link. Panel only. */
   radar_slack_post: {
-    input: z.object({ key: z.string().min(1).max(300), summary: z.string().trim().min(1).max(MAX_SUMMARY) }),
+    input: z.object({ key: z.string().min(1).max(300), thread: z.string().min(1).max(100) }),
     output: z.object({ url: z.string() }),
   },
   /** Checks one item against Slack now instead of waiting for its turn; returns its context. */
@@ -556,14 +568,23 @@ export default async function plugin(bb: BbPluginApi) {
     // Last refresh's lane results (result = LaneResult as JSON), so a restart shows what Radar knew.
     "CREATE TABLE results_cache (lane_id TEXT PRIMARY KEY, query_key TEXT NOT NULL, result TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE results_meta (id INTEGER PRIMARY KEY CHECK (id = 1), fetched_at TEXT NOT NULL)",
-    // Slack context: threads that link an item (latest_ts = newest human message seen; synced_ts is
-    // unused since the summary records what it covers), when each item was last searched, and
-    // Radar's context per item (context = summary, coverage, seen and posted marks as JSON).
+    // Slack context: threads that link an item (latest_ts = newest human message seen, synced_ts =
+    // the latest_ts the thread's summary covers; later: who opened it, the opening message, reply
+    // count, the AI summary and your last post of it), when each item was last searched, and seen
+    // marks per item (slack_context.context as JSON).
     "CREATE TABLE slack_threads (issue_key TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL, channel_name TEXT NOT NULL, permalink TEXT NOT NULL, latest_ts TEXT NOT NULL, synced_ts TEXT NOT NULL, PRIMARY KEY (issue_key, channel_id, thread_ts)) WITHOUT ROWID",
     "CREATE TABLE slack_issues (issue_key TEXT PRIMARY KEY, checked_at TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE slack_drafts (issue_key TEXT PRIMARY KEY, draft TEXT NOT NULL) WITHOUT ROWID",
     "DROP TABLE slack_drafts",
     "CREATE TABLE slack_context (issue_key TEXT PRIMARY KEY, context TEXT NOT NULL) WITHOUT ROWID",
+    "ALTER TABLE slack_threads ADD COLUMN author TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slack_threads ADD COLUMN opening TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slack_threads ADD COLUMN replies INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE slack_threads ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slack_threads ADD COLUMN posted_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slack_threads ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''",
+    // Item-level summaries became per-thread ones; the summaries are rebuilt on the next check.
+    "UPDATE slack_threads SET synced_ts = ''",
   ]);
   const parseRow = (value: unknown): unknown => {
     try {
@@ -1872,24 +1893,25 @@ export default async function plugin(bb: BbPluginApi) {
     channel_name: string;
     permalink: string;
     latest_ts: string;
+    /** latest_ts the summary covers. */
     synced_ts: string;
+    author: string;
+    opening: string;
+    replies: number;
+    summary: string;
+    posted_url: string;
+    posted_at: string;
   };
   const slackContextSchema = z.object({
-    /** Radar's AI summary of the linked threads ("" when AI is off or has not run yet). */
-    summary: z.string(),
-    summaryError: z.string(),
-    summarizedAt: z.string(),
-    /** thread key (channel:ts) → the latest_ts the summary covers. */
-    marks: z.record(z.string(), z.string()),
     /** When the context last gained something (a new thread or a changed summary)… */
-    updatedAt: z.string(),
+    updatedAt: z.string().default(""),
     /** …and when you last opened it; newer updatedAt shows as new on the row. */
-    seenAt: z.string(),
-    /** Your last "Post to issue/PR", if any. */
-    posted: z.object({ url: z.string(), at: z.string() }).nullable(),
+    seenAt: z.string().default(""),
+    /** The last check's summary failure, if any (threads still show). */
+    summaryError: z.string().default(""),
   });
   type SlackContext = z.infer<typeof slackContextSchema>;
-  const EMPTY_CONTEXT: SlackContext = { summary: "", summaryError: "", summarizedAt: "", marks: {}, updatedAt: "", seenAt: "", posted: null };
+  const EMPTY_CONTEXT: SlackContext = { updatedAt: "", seenAt: "", summaryError: "" };
   let slackError = "";
   let slackSweptAt = "";
   let slackToken: { value: string; at: number } | null = null;
@@ -2011,7 +2033,7 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
-  /** Search, follow threads, and refresh Radar's summary when there is something new. */
+  /** Search, follow threads, and refresh each thread's summary when it has something new. */
   function checkSlackIssue(item: RadarItem): Promise<void> {
     return slackLocked(item.key, async () => {
       const checked = db.prepare("SELECT checked_at FROM slack_issues WHERE issue_key = ?").get(item.key) as { checked_at: string } | undefined;
@@ -2030,49 +2052,41 @@ export default async function plugin(bb: BbPluginApi) {
       for (const hit of found) upsert.run(item.key, hit.channelId, hit.threadTs, hit.channelName, hit.permalink);
 
       const threads = slackThreads(item.key).slice(0, MAX_THREADS_PER_ISSUE);
-      const setLatest = db.prepare("UPDATE slack_threads SET latest_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
+      const setRead = db.prepare("UPDATE slack_threads SET latest_ts = ?, author = ?, opening = ?, replies = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
+      let gained = false;
       for (const thread of threads) {
         const read = parseThreadJson(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, format: "json", limit: 200 }));
-        if (read.latestTs !== "" && compareTs(read.latestTs, thread.latest_ts) > 0) {
-          setLatest.run(read.latestTs, item.key, thread.channel_id, thread.thread_ts);
-          thread.latest_ts = read.latestTs;
-        }
+        const latest = compareTs(read.latestTs, thread.latest_ts) > 0 ? read.latestTs : thread.latest_ts;
+        if (thread.latest_ts === "" && latest !== "") gained = true;
+        setRead.run(latest, read.author || thread.author, read.opening || thread.opening, Math.max(read.replies, thread.replies), item.key, thread.channel_id, thread.thread_ts);
+        Object.assign(thread, { latest_ts: latest, author: read.author || thread.author, opening: read.opening || thread.opening });
       }
       db.prepare("INSERT INTO slack_issues (issue_key, checked_at) VALUES (?, ?) ON CONFLICT (issue_key) DO UPDATE SET checked_at = excluded.checked_at").run(item.key, startedAt);
 
-      const live = threads.filter((thread) => thread.latest_ts !== "");
       const context = slackContext(item.key);
-      const stale = live.filter((thread) => compareTs(thread.latest_ts, context.marks[threadKey(thread)] ?? "") > 0);
-      if (stale.length === 0) return;
-      const now = new Date().toISOString();
-      const marks = Object.fromEntries(live.map((row) => [threadKey(row), row.latest_ts]));
-      // A thread the summary has never covered is news on its own, AI or not.
-      const newThread = stale.some((thread) => context.marks[threadKey(thread)] === undefined);
-      const next: SlackContext = { ...context, marks, updatedAt: newThread ? now : context.updatedAt };
-      if (aiBackend(bb, aiFallback()) !== null) {
-        try {
-          const texts = [];
-          for (const thread of live) {
+      let summaryError = context.summaryError;
+      const stale = threads.filter((thread) => thread.latest_ts !== "" && compareTs(thread.latest_ts, thread.synced_ts) > 0);
+      if (stale.length > 0 && aiBackend(bb, aiFallback()) !== null) {
+        summaryError = "";
+        const setSummary = db.prepare("UPDATE slack_threads SET summary = ?, synced_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
+        for (const thread of stale) {
+          try {
             const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
-            texts.push({ channelName: thread.channel_name, text });
+            const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, thread.summary, { channelName: thread.channel_name, text }), 500));
+            const summary = reply.changed || thread.summary === "" ? reply.summary : thread.summary;
+            if (summary !== thread.summary) gained = true;
+            setSummary.run(summary, thread.latest_ts, item.key, thread.channel_id, thread.thread_ts);
+          } catch (error) {
+            if (error instanceof ToolAborted || error instanceof SlackRateLimited || error instanceof SlackAuthError) throw error;
+            // Keep the thread visible with its opening message; the summary catches up next check.
+            summaryError = error instanceof Error ? error.message : String(error);
           }
-          const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, context.summary, texts), 700));
-          next.summaryError = "";
-          next.summarizedAt = now;
-          if (reply.changed || context.summary === "") {
-            next.summary = reply.summary;
-            next.updatedAt = now;
-          }
-        } catch (error) {
-          if (error instanceof ToolAborted || error instanceof SlackRateLimited || error instanceof SlackAuthError) throw error;
-          // Keep the threads visible; the summary catches up on the next check.
-          next.marks = context.marks;
-          next.summaryError = error instanceof Error ? error.message : String(error);
         }
       }
-      saveSlackContext(item.key, next);
+      saveSlackContext(item.key, { ...context, summaryError, updatedAt: gained ? new Date().toISOString() : context.updatedAt });
     });
   }
+
   function sweepSlack(): Promise<void> {
     if (!slackEnabled() || disposed) return Promise.resolve();
     if (slackSweep !== null) return slackSweep;
@@ -2123,12 +2137,19 @@ export default async function plugin(bb: BbPluginApi) {
       number: item.number,
       title: item.title,
       url: item.url,
-      summary: context.summary,
-      summaryError: context.summaryError,
-      summarizedAt: context.summarizedAt,
       checkedAt: checked?.checked_at ?? "",
-      sources: liveThreads(key).map((thread) => ({ channelName: thread.channel_name, permalink: thread.permalink })),
-      posted: context.posted,
+      summaryError: context.summaryError,
+      threads: liveThreads(key).map((thread) => ({
+        id: threadKey(thread),
+        channelName: thread.channel_name,
+        permalink: thread.permalink,
+        author: thread.author,
+        opening: thread.opening,
+        replies: thread.replies,
+        latestAt: new Date(Number(thread.latest_ts) * 1000).toISOString(),
+        summary: thread.summary,
+        posted: thread.posted_url !== "" ? { url: thread.posted_url, at: thread.posted_at } : null,
+      })),
       isNew: context.updatedAt !== "" && context.updatedAt > context.seenAt,
     };
   }
@@ -2143,14 +2164,18 @@ export default async function plugin(bb: BbPluginApi) {
     return view;
   }
 
-  /** "Post to issue/PR": a new comment with your text and links to the threads. Never automatic. */
-  function postSlack(key: string, summary: string): Promise<{ url: string }> {
+  /** "Post to issue/PR": one new comment with one thread's context and a link to it. Never automatic. */
+  function postSlack(key: string, threadId: string): Promise<{ url: string }> {
     return slackLocked(key, async () => {
       const view = slackContextView(key);
-      if (view.sources.length === 0) throw new UserError("No Slack threads link this item any more.");
-      const body = renderComment(summary, view.sources, new Date().toISOString().slice(0, 10));
+      const thread = view.threads.find((candidate) => candidate.id === threadId);
+      if (thread === undefined) throw new UserError("That Slack thread no longer links this item.");
+      const text = thread.summary || (thread.opening ? `> ${thread.opening.replace(/\n/g, "\n> ")}${thread.author ? `\n\n— ${thread.author}` : ""}` : "");
+      if (text === "") throw new UserError("That thread has nothing to post yet.");
+      const body = renderComment(text, [{ channelName: thread.channelName, permalink: thread.permalink }], new Date().toISOString().slice(0, 10));
       const url = (await postComment({ source: key.startsWith("delta:") ? "delta" : "github", repo: view.repo, number: view.number }, body)) || view.url;
-      saveSlackContext(key, { ...slackContext(key), posted: { url, at: new Date().toISOString() } });
+      const [channelId, threadTs] = threadId.split(":");
+      db.prepare("UPDATE slack_threads SET posted_url = ?, posted_at = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?").run(url, new Date().toISOString(), key, channelId, threadTs);
       publish();
       return { url };
     });
@@ -2229,7 +2254,7 @@ export default async function plugin(bb: BbPluginApi) {
     radar_review_start: ({ key, request }) => startReview(key, request),
     radar_rebase: ({ source, repo, number }) => rebase({ source, repo, number }),
     radar_slack_context: ({ key }) => seeSlack(key),
-    radar_slack_post: ({ key, summary }) => postSlack(key, summary),
+    radar_slack_post: ({ key, thread }) => postSlack(key, thread),
     radar_slack_check: async ({ key }) => {
       if (!slackEnabled()) throw new UserError("Slack context is off. Set the Slack endpoint and token command in Radar settings.");
       await checkSlackIssue(slackItem(key));
@@ -2587,10 +2612,15 @@ export default async function plugin(bb: BbPluginApi) {
               exitCode: 0,
               stdout: [
                 ...head,
-                ...views.map((view) => {
-                  const summary = view.summary !== "" ? view.summary : view.summaryError !== "" ? `(no summary: ${view.summaryError})` : "(no summary yet)";
-                  return `${view.repo}#${view.number}${view.isNew ? "  [new]" : ""}  ${view.title.slice(0, 70)}\n  ${summary.replace(/\n/g, "\n  ")}\n  threads: ${view.sources.map((source) => source.permalink || `#${source.channelName}`).join("  ")}${view.posted ? `\n  posted: ${view.posted.url}` : ""}`;
-                }),
+                ...views.map((view) =>
+                  [
+                    `${view.repo}#${view.number}${view.isNew ? "  [new]" : ""}  ${view.title.slice(0, 70)}`,
+                    ...view.threads.map((thread) => {
+                      const text = thread.summary || thread.opening || "(no text)";
+                      return `  #${thread.channelName}  ${thread.author}  ${thread.replies} repl${thread.replies === 1 ? "y" : "ies"}  ${thread.permalink}\n    ${text.replace(/\n/g, "\n    ")}${thread.posted ? `\n    posted: ${thread.posted.url}` : ""}`;
+                    }),
+                  ].join("\n"),
+                ),
               ].join("\n"),
             };
           }
@@ -2603,9 +2633,8 @@ export default async function plugin(bb: BbPluginApi) {
             publish();
             const view = slackContextView(key);
             if (json) return { exitCode: 0, stdout: JSON.stringify(view) };
-            if (view.sources.length === 0) return { exitCode: 0, stdout: "No public Slack threads link it." };
-            const count = `${view.sources.length} linked thread${view.sources.length === 1 ? "" : "s"}`;
-            return { exitCode: 0, stdout: `${count}.\n${view.summary || view.summaryError || "(no summary)"}` };
+            if (view.threads.length === 0) return { exitCode: 0, stdout: "No public Slack threads link it." };
+            return { exitCode: 0, stdout: view.threads.map((thread) => `#${thread.channelName}  ${thread.permalink}\n  ${(thread.summary || thread.opening).replace(/\n/g, "\n  ")}`).join("\n") };
           }
           case "rebase": {
             const sourceIndex = rest.indexOf("--source");
