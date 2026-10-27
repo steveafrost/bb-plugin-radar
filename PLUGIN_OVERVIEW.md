@@ -1,4 +1,4 @@
-Radar is a live panel of the pull requests and issues that need you, on **GitHub** and a **Delta** repo, plus optional read-only **Gitstream history**. Nothing is stored remotely: lanes are queried live from your own `gh` and `dt` (and, for history, `gs`) CLIs every 90 seconds, and only your configuration lives in bb.
+Radar is a live panel of the pull requests and issues that need you, on **GitHub** and a **Delta** repo, plus optional read-only **Gitstream history**. Nothing is stored remotely: lanes are queried live from your own `gh` and `dt` (and, for history, `gs`) CLIs every 90 seconds.
 
 ## Lanes
 
@@ -14,7 +14,7 @@ Hide repos across every lane ("no billing", "only the mobile app"). Type it in w
 
 ## Hide one item
 
-The eye-off action on any row hides that one PR or issue from every lane, view, count and the rail badge, with a brief Undo. The muted eye-off count in the toolbar lists hidden items to unhide one by one or all at once. A hide lasts until you undo it; one whose item has been in no lane for 30 days is dropped. Hides live in Radar's plugin database on your bb host.
+The eye-off action on any row hides that one PR or issue from every lane, view, count and the rail badge, with a brief Undo. The eye-off count in the toolbar lists hidden items to unhide. A hide lasts until you undo it or its item has been in no lane for 30 days.
 
 ## Review and triage threads
 
