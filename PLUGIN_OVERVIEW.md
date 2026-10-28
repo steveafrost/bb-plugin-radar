@@ -31,7 +31,7 @@ Radar threads get skills attached:
 
 Point Radar at a Slack MCP endpoint and it follows the public Slack threads that link your open GitHub issues and PRs and Delta PRs (in Focus), counting only messages by people. When a thread changes, bb's AI refreshes its short summary: decisions, owners, open questions, next steps.
 
-The Slack icon on a row opens a popover with one row per thread: channel, who started it, replies and the summary. The icon is accented when threads link the item and dotted when something is new. Radar never updates issues by itself; hover a thread and "Post to issue/PR" (click twice) adds one comment with its context and link. Private channels and DMs are never searched.
+The Slack icon on a row opens a popover with one row per thread: channel, who started it, replies and the summary. It shows on hover, badged with a check when threads link the item or a cross when none do. Radar never updates issues by itself; hover a thread and "Post to issue/PR" (click twice) adds one comment with its context and link. Private channels and DMs are never searched.
 
 ## CLI and agent skill
 

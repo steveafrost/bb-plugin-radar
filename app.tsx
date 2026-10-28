@@ -244,7 +244,7 @@ function RebaseAction({ item, rebase, onActive }: { item: RadarItem; rebase: (it
   }
 }
 
-/** Slack context on an issue or PR row: an icon (accented when threads link it, dotted when new) that opens SlackPopover. */
+/** Slack context on an issue or PR row: a bubble badged with a cross (none found) or a check (threads link it) that opens SlackPopover. */
 function SlackAction({ item }: { item: RadarItem }) {
   const actions = useContext(ReviewActions);
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
@@ -260,8 +260,6 @@ function SlackAction({ item }: { item: RadarItem }) {
     <span
       ref={button}
       className="radar-act-wrap"
-      data-slack-context={found ? "" : undefined}
-      data-slack-new={mode === "new" ? "" : undefined}
       data-open={anchor !== null ? "" : undefined}
     >
       <button
@@ -273,7 +271,7 @@ function SlackAction({ item }: { item: RadarItem }) {
         aria-expanded={anchor !== null}
         onClick={(event) => setAnchor(anchor === null ? event.currentTarget.getBoundingClientRect() : null)}
       >
-        <Glyph name="slack" className="radar-act__icon" />
+        <Glyph name={found ? "slackFound" : "slackNone"} className="radar-act__icon" />
       </button>
       {anchor !== null ? <SlackPopover item={item} anchor={anchor} check={!found} onClose={close} /> : null}
     </span>

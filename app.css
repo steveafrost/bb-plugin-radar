@@ -1387,27 +1387,14 @@ header:has(.radar-header-anchor) button[aria-label="Close pane"] {
   white-space: nowrap;
 }
 
-/* Slack context: a dot on the row action while a draft waits, and the approval sheet. */
+/* Slack context: a row action like the others (shown on hover or focus), kept visible while its
+   popover is open. The glyph's badge says whether threads link the item. */
 .radar-act-wrap {
   position: relative;
   display: inline-flex;
 }
-.radar-item .radar-item__actions > .radar-act-wrap:is([data-slack-context], [data-open]) {
+.radar-item .radar-item__actions > .radar-act-wrap[data-open] {
   opacity: 1;
-}
-.radar-act-wrap[data-slack-context] .radar-act {
-  color: var(--r-accent);
-}
-.radar-act-wrap[data-slack-new]::before {
-  content: "";
-  position: absolute;
-  top: 3px;
-  right: 3px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--r-accent);
-  pointer-events: none;
 }
 /* Context from Slack: a Filter-style popover fixed to the row's button (lanes clip overflow). */
 .radar-slackpop {
