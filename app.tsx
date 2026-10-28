@@ -30,6 +30,7 @@ import { displayLabels } from "./lanes";
 import { hosts, setHosts } from "./hosts";
 import { describeScope, EMPTY_SCOPE, isActive, scopeCatalog, scopePredicate, type FocusState, type ScopeEntry, type ScopeFilter, type ScopeOp } from "./scope";
 import { Glyph, type GlyphName } from "./glyphs";
+import { slackRowMode, type SlackRowMode } from "./slack-row";
 import { canRebase, rebaseHelp, type Viewer } from "./rebase";
 import { DEFAULT_SKILL_SETTINGS, threadSkills, type SkillSettings } from "./review-skills";
 import { summarizeLane } from "./lane-summary";
@@ -171,7 +172,7 @@ const ReviewActions = createContext<{
   rebase: (item: RadarItem) => Promise<RebaseResult>;
   skills: SkillSettings;
   /** Slack context: off, none found yet (offer a check), found, or found with something you haven't opened. */
-  slack: (item: RadarItem) => { mode: "off" | "check" | "context" | "new"; threads: number };
+  slack: (item: RadarItem) => { mode: "off" | SlackRowMode; threads: number };
   /** Radar's Slack context for the item; `check` searches Slack first. Throws on failure. */
   loadSlack: (item: RadarItem, check: boolean) => Promise<SlackContextView>;
   /** Posts one thread's context as a new comment; returns its URL. */
@@ -244,7 +245,10 @@ function RebaseAction({ item, rebase, onActive }: { item: RadarItem; rebase: (it
   }
 }
 
-/** Slack context on an issue or PR row: a bubble badged with a cross (none found) or a check (threads link it) that opens SlackPopover. */
+/**
+ * Slack context on an issue or PR row: a bubble badged with a check (threads link it) or a cross
+ * (searched, none found), plain until the sweep has searched the item. Opens SlackPopover.
+ */
 function SlackAction({ item }: { item: RadarItem }) {
   const actions = useContext(ReviewActions);
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
@@ -252,6 +256,12 @@ function SlackAction({ item }: { item: RadarItem }) {
   const { mode, threads } = actions?.slack(item) ?? { mode: "off", threads: 0 };
   if (actions === null || mode === "off") return null;
   const found = mode === "context" || mode === "new";
+  const glyph: GlyphName = found ? "slackFound" : mode === "none" ? "slackNone" : "slack";
+  const label = found
+    ? `Context from Slack (${threads} thread${threads === 1 ? "" : "s"})`
+    : mode === "none"
+      ? "Context from Slack (none found)"
+      : "Context from Slack (not searched yet)";
   const close = () => {
     setAnchor(null);
     button.current?.querySelector("button")?.focus();
@@ -265,13 +275,13 @@ function SlackAction({ item }: { item: RadarItem }) {
       <button
         type="button"
         className="radar-act"
-        aria-label={found ? `Context from Slack (${threads} thread${threads === 1 ? "" : "s"})` : "Context from Slack"}
+        aria-label={label}
         data-tip={anchor === null ? "Context from Slack" : undefined}
         aria-haspopup="dialog"
         aria-expanded={anchor !== null}
         onClick={(event) => setAnchor(anchor === null ? event.currentTarget.getBoundingClientRect() : null)}
       >
-        <Glyph name={found ? "slackFound" : "slackNone"} className="radar-act__icon" />
+        <Glyph name={glyph} className="radar-act__icon" />
       </button>
       {anchor !== null ? <SlackPopover item={item} anchor={anchor} check={!found} onClose={close} /> : null}
     </span>
@@ -1531,6 +1541,8 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   }, [undo, unhide]);
   useEffect(() => () => undoNotice.set(null), []);
   const loadHidden = useCallback(() => call(rpc.call("radar_hidden_items", null) as Promise<HiddenEntry[]>), [call, rpc]);
+  // Older servers send no `none`: every unlinked row then reads as not searched yet, never as a false "none found".
+  const slackNone = useMemo(() => new Set(snapshot?.slack?.none ?? []), [snapshot]);
   const reviewActions = useMemo(
     () => ({
       threadFor: (key: string) => snapshot?.reviews[key]?.threadId,
@@ -1560,14 +1572,13 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
         rpc.call("radar_rebase", { source: item.source, repo: item.repo, number: item.number }) as Promise<RebaseResult>,
       slack: (item: RadarItem) => {
         if (snapshot?.slack?.enabled !== true || (item.source !== "github" && item.source !== "delta") || item.state.toLowerCase() !== "open") return { mode: "off" as const, threads: 0 };
-        const found = snapshot.slack.items[item.key];
-        return found === undefined ? { mode: "check" as const, threads: 0 } : { mode: found.isNew ? ("new" as const) : ("context" as const), threads: found.threads };
+        return slackRowMode(snapshot.slack.items[item.key], slackNone.has(item.key));
       },
       loadSlack: async (item: RadarItem, check: boolean) =>
         (await rpc.call(check ? "radar_slack_check" : "radar_slack_context", { key: item.key })) as SlackContextView,
       postSlack: async (item: RadarItem, thread: string) => (await rpc.call("radar_slack_post", { key: item.key, thread })).url,
     }),
-    [snapshot, navigate, call, rpc, mutate, optimistic],
+    [snapshot, slackNone, navigate, call, rpc, mutate, optimistic],
   );
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [editing, setEditing] = useState<Draft | null>(null);

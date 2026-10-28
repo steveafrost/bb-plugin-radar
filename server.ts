@@ -64,6 +64,7 @@ import {
   type View,
 } from "./lanes";
 import { enabledSources } from "./lanes";
+import { slackBoardState } from "./slack-row";
 import { hosts, hostsSchema, readHosts, setHosts } from "./hosts";
 import {
   addHidden,
@@ -262,6 +263,8 @@ const snapshotSchema = z.object({
     error: z.string(),
     sweptAt: z.string(),
     items: z.record(z.string(), z.object({ threads: z.number(), isNew: z.boolean() })),
+    /** Board items a search has covered without finding a linked thread (not every unlinked item: some are not searched yet). */
+    none: z.array(z.string()),
   }),
 });
 
@@ -1980,14 +1983,17 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function slackState() {
-    const items: Record<string, { threads: number; isNew: boolean }> = {};
-    for (const item of slackCandidates()) {
-      const threads = liveThreads(item.key).length;
-      if (threads === 0) continue;
-      const context = slackContext(item.key);
-      items[item.key] = { threads, isNew: context.updatedAt !== "" && context.updatedAt > context.seenAt };
-    }
-    return { enabled: slackEnabled(), error: slackEnabled() ? slackError : "", sweptAt: slackSweptAt, items };
+    const searched = new Set((db.prepare("SELECT issue_key FROM slack_issues").all() as { issue_key: string }[]).map((row) => row.issue_key));
+    const { items, none } = slackBoardState(
+      slackCandidates().map((item) => item.key),
+      (key) => liveThreads(key).length,
+      searched,
+      (key) => {
+        const context = slackContext(key);
+        return context.updatedAt !== "" && context.updatedAt > context.seenAt;
+      },
+    );
+    return { enabled: slackEnabled(), error: slackEnabled() ? slackError : "", sweptAt: slackSweptAt, items, none };
   }
 
   function slackSleep(ms: number): Promise<void> {

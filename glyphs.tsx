@@ -21,7 +21,8 @@ const PATHS: Record<string, string[]> = {
   eye: ["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"],
   eyeOff: ["M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 7 10 7a17 17 0 0 1-2.2 3.2", "M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6", "M9.9 9.9a3 3 0 0 0 4.2 4.2", "m2 2 20 20"],
   x: ["M18 6 6 18", "m6 6 12 12"],
-  // lucide message-square-text: Slack context.
+  // lucide message-square-text: Slack context not searched yet.
+  slack: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z", "M13 8H7", "M17 12H7"],
   // The Slack bubble with its top-right corner open for a badge: a cross (no context) or a check.
   slackNone: ["M21 11v4a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h7", "M11 8H7", "M17 12H7", "m16.5 2.5 5 5", "m21.5 2.5-5 5"],
   slackFound: ["M21 11v4a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h7", "M11 8H7", "M17 12H7", "m15.5 5 2.5 2.5 4-4.5"],
