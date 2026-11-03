@@ -858,6 +858,23 @@ function HiddenControl({
   );
 }
 
+function LaneSources({ checked, missing }: { checked: Source[] | undefined; missing: Source[] }) {
+  if (checked === undefined && missing.length === 0) return null;
+  return (
+    <div className="radar-lane__sources">
+      {checked !== undefined ? (
+        <p>{checked.length > 0 ? `Last checked: ${checked.map((source) => SOURCE_LABEL[source]).join(", ")}.` : "No sources checked successfully."}</p>
+      ) : null}
+      {missing.map((source) => (
+        <p key={source} className="radar-lane__setup">
+          {source === "delta" ? "Delta isn’t connected. Add a host and repository in Radar settings." : "Gitstream history is off. Enable it and add a repository and web URL in Radar settings."}{" "}
+          <UrlLink className="radar-link" href="/settings/plugins/radar">Set up {SOURCE_LABEL[source]}</UrlLink>
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function LaneCard({
   lane,
   result,
@@ -908,6 +925,7 @@ function LaneCard({
   // New items first so a capped lane never hides an arrival.
   const ordered = useMemo(() => [...items.filter((item) => item.isNew), ...items.filter((item) => !item.isNew)], [items]);
   const shown = expanded || query !== "" ? ordered : ordered.slice(0, LANE_PREVIEW);
+  const missingSources = lane.sources.filter((source) => !enabledSources().includes(source));
   return (
     <section className="radar-lane" data-collapsed={collapsed || undefined}>
       <header className="radar-lane__head">
@@ -946,6 +964,7 @@ function LaneCard({
           </button>
         </span>
       </header>
+      <LaneSources checked={result?.checkedSources} missing={missingSources} />
       {collapsed ? null : (
         <>
           {result?.error ? <p className="radar-error">{result.error}</p> : null}
@@ -960,7 +979,7 @@ function LaneCard({
                   ? "Everything here is hidden by the focus filter."
                   : otherKind > 0
                     ? `No ${view === "prs" ? "pull requests" : "issues"} here; ${otherKind} ${view === "prs" ? (otherKind === 1 ? "issue shows" : "issues show") : otherKind === 1 ? "pull request shows" : "pull requests show"} in All.`
-                    : "Nothing needs you here."
+                    : "No items from the sources checked."
                 : "No matches."}
               {result.fetched > 0 && query === "" && hidden === 0 && otherKind === 0 ? ` (${result.fetched} fetched, all filtered out)` : ""}
             </p>
@@ -1391,6 +1410,7 @@ function DraftPreview({
           </button>
         </span>
       </header>
+      <LaneSources checked={preview.checkedSources} missing={lane.sources.filter((source) => !enabledSources().includes(source))} />
       {preview.error ? <p className="radar-error">{preview.error}</p> : null}
       {preview.items.length === 0 && !preview.error ? <p className="radar-empty">No items match right now.</p> : null}
       <ul className="radar-items">

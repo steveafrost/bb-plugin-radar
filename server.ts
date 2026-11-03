@@ -227,6 +227,8 @@ const laneResultSchema = z.object({
   error: z.string(),
   fetchedAt: z.string(),
   loading: z.boolean(),
+  /** Sources successfully read on the last completed attempt; absent in older cached results. */
+  checkedSources: z.array(z.enum(["github", "gitstream", "delta"])).optional(),
 });
 
 const resultsCacheSchema = z.object({
@@ -1143,7 +1145,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Every source in parallel; a failing host is reported without hiding the others' items. */
-  async function fetchLane(lane: Lane): Promise<{ items: Item[]; fetched: number; error: string }> {
+  async function fetchLane(lane: Lane): Promise<{ items: Item[]; fetched: number; error: string; checkedSources: Source[] }> {
     // Sources that are not configured are skipped, so default and shared lanes work anywhere.
     const enabled = enabledSources();
     const sources = lane.sources.filter((source) => enabled.includes(source));
@@ -1154,8 +1156,10 @@ export default async function plugin(bb: BbPluginApi) {
     const raw: Item[] = [];
     const errors: string[] = [];
     const warnings: string[] = [];
+    const checkedSources: Source[] = [];
     settled.forEach((outcome, index) => {
       if (outcome.status === "fulfilled") {
+        checkedSources.push(sources[index]!);
         raw.push(...outcome.value.items);
         if (outcome.value.warning !== "") warnings.push(outcome.value.warning);
       } else {
@@ -1169,7 +1173,7 @@ export default async function plugin(bb: BbPluginApi) {
     const sorted = applyFilter(raw, lane.filter, Date.now(), config.maxAgeDays)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, lane.limit ?? 30);
-    return { items: sorted, fetched: raw.length, error: [...errors, ...warnings].join(" · ") };
+    return { items: sorted, fetched: raw.length, error: [...errors, ...warnings].join(" · "), checkedSources };
   }
 
   function withNew(laneId: string, items: Item[], complete: boolean): RadarItem[] {
@@ -1212,10 +1216,11 @@ export default async function plugin(bb: BbPluginApi) {
       error: previous?.error ?? "",
       fetchedAt: previous?.fetchedAt ?? "",
       loading: true,
+      ...(previous?.checkedSources === undefined ? {} : { checkedSources: previous.checkedSources }),
     };
     publish();
     try {
-      const { items, fetched, error } = await fetchLane(lane);
+      const { items, fetched, error, checkedSources } = await fetchLane(lane);
       // An edit during the fetch starts its own refresh; this older result must not win.
       if (disposed || !stillCurrent(lane)) return;
       results[lane.id] = {
@@ -1225,12 +1230,13 @@ export default async function plugin(bb: BbPluginApi) {
         error,
         fetchedAt: new Date().toISOString(),
         loading: false,
+        checkedSources,
       };
     } catch (error) {
       if (disposed || !stillCurrent(lane)) return;
       const message = error instanceof UserError ? error.message : "Lane could not be read.";
       if (!(error instanceof UserError)) bb.log.warn(`lane ${lane.id} failed: ${String(error)}`);
-      results[lane.id] = { ...results[lane.id]!, error: message, loading: false };
+      results[lane.id] = { ...results[lane.id]!, error: message, loading: false, checkedSources: [] };
     }
     publish();
   }
@@ -1328,14 +1334,15 @@ export default async function plugin(bb: BbPluginApi) {
     // Run it once so the user sees what they would get before adding it.
     let preview: LaneResult;
     try {
-      const { items, fetched } = await fetchLane(lane);
+      const { items, fetched, error, checkedSources } = await fetchLane(lane);
       preview = {
         laneId: lane.id,
         items: items.map((item) => ({ ...item, isNew: false })),
         fetched,
-        error: "",
+        error,
         fetchedAt: new Date().toISOString(),
         loading: false,
+        checkedSources,
       };
     } catch (error) {
       preview = {
@@ -1345,6 +1352,7 @@ export default async function plugin(bb: BbPluginApi) {
         error: error instanceof UserError ? error.message : "Preview failed.",
         fetchedAt: "",
         loading: false,
+        checkedSources: [],
       };
     }
     return { lane, preview };

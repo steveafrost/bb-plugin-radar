@@ -16,6 +16,9 @@ shows whatever is current.
     the default lanes leave it out, and Radar never writes to it.
   A host that fails shows its error on the lane without hiding the others' items.
   Sources that are not set up are skipped, so the default lanes work with GitHub alone.
+  Each lane names the sources its last search checked successfully, including
+  searches with no matches. A selected source that is not configured shows a
+  setup notice and a link to Radar settings, even when the lane is collapsed.
   Optional client-side filters refine the merged list.
 - **Track something**: describe what you want in plain English; a
   BB-configured model drafts a lane, Radar runs it once and shows the live
