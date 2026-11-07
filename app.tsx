@@ -8,6 +8,7 @@ import {
   useBbNavigate,
   useRealtime,
   useRpc,
+  useSettings,
 } from "@get-bb/plugin-sdk/app";
 import type { DraftResult, HiddenEntry, Lane, LaneResult, RadarItem, RadarSnapshot, RebaseResult, ReviewContext, rpcContract, SlackContextView, SlackThreadView } from "./server";
 import type { NewThreadComposerProps, PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
@@ -27,7 +28,7 @@ const sourceHint = (source: Source): string => {
   return "github.com";
 };
 import { displayLabels } from "./lanes";
-import { hosts, setHosts } from "./hosts";
+import { hosts, readHosts, setHosts, type HostSettings } from "./hosts";
 import { describeScope, EMPTY_SCOPE, isActive, scopeCatalog, scopePredicate, type FocusState, type ScopeEntry, type ScopeFilter, type ScopeOp } from "./scope";
 import { Glyph, type GlyphName } from "./glyphs";
 import { slackRowMode, type SlackRowMode } from "./slack-row";
@@ -858,23 +859,6 @@ function HiddenControl({
   );
 }
 
-function LaneSources({ checked, missing }: { checked: Source[] | undefined; missing: Source[] }) {
-  if (checked === undefined && missing.length === 0) return null;
-  return (
-    <div className="radar-lane__sources">
-      {checked !== undefined ? (
-        <p>{checked.length > 0 ? `Last checked: ${checked.map((source) => SOURCE_LABEL[source]).join(", ")}.` : "No sources checked successfully."}</p>
-      ) : null}
-      {missing.map((source) => (
-        <p key={source} className="radar-lane__setup">
-          {source === "delta" ? "Delta isn’t connected. Add a host and repository in Radar settings." : "Gitstream history is off. Enable it and add a repository and web URL in Radar settings."}{" "}
-          <UrlLink className="radar-link" href="/settings/plugins/radar">Set up {SOURCE_LABEL[source]}</UrlLink>
-        </p>
-      ))}
-    </div>
-  );
-}
-
 function LaneCard({
   lane,
   result,
@@ -925,7 +909,6 @@ function LaneCard({
   // New items first so a capped lane never hides an arrival.
   const ordered = useMemo(() => [...items.filter((item) => item.isNew), ...items.filter((item) => !item.isNew)], [items]);
   const shown = expanded || query !== "" ? ordered : ordered.slice(0, LANE_PREVIEW);
-  const missingSources = lane.sources.filter((source) => !enabledSources().includes(source));
   return (
     <section className="radar-lane" data-collapsed={collapsed || undefined}>
       <header className="radar-lane__head">
@@ -964,7 +947,6 @@ function LaneCard({
           </button>
         </span>
       </header>
-      <LaneSources checked={result?.checkedSources} missing={missingSources} />
       {collapsed ? null : (
         <>
           {result?.error ? <p className="radar-error">{result.error}</p> : null}
@@ -1410,7 +1392,6 @@ function DraftPreview({
           </button>
         </span>
       </header>
-      <LaneSources checked={preview.checkedSources} missing={lane.sources.filter((source) => !enabledSources().includes(source))} />
       {preview.error ? <p className="radar-error">{preview.error}</p> : null}
       {preview.items.length === 0 && !preview.error ? <p className="radar-empty">No items match right now.</p> : null}
       <ul className="radar-items">
@@ -1816,6 +1797,31 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
   );
 }
 
+function SourcesSettings() {
+  const { values, isLoading } = useSettings();
+  if (values === undefined) return <section>{isLoading ? <p>Loading…</p> : <p>Settings unavailable.</p>}</section>;
+  // The panel reads the same settings the server does, so a status here can never disagree with what lanes see.
+  const { hosts: current, problems } = readHosts(values as HostSettings);
+  const deltaName = current.delta?.label ?? SOURCE_LABEL.delta;
+  const gitstreamName = current.gitstream?.label ?? SOURCE_LABEL.gitstream;
+  const rows: { name: string; status: string; detail: string }[] = [
+    { name: SOURCE_LABEL.github, status: "On", detail: "Reads github.com with the GitHub CLI." },
+    current.delta !== null
+      ? { name: deltaName, status: "On", detail: `Reads ${current.delta.repo} with dt --host ${current.delta.host}.` }
+      : { name: deltaName, status: "Off", detail: "Set the Delta host name and repo below to read a Delta repository." },
+    current.gitstream !== null
+      ? { name: gitstreamName, status: "On", detail: `Reads ${current.gitstream.repo} with gs as read-only history.` }
+      : values.gitstreamHistory !== true
+        ? { name: gitstreamName, status: "Off", detail: "Turn on the Gitstream history toggle below to read old Gitstream PRs." }
+        : { name: gitstreamName, status: "Off", detail: "Set the Gitstream history repo and web URL below to finish turning it on." },
+  ];
+  return <section>
+    <p>Lanes read GitHub always, and Delta and Gitstream history once each is set up below. A lane that names a source which is not set up skips it silently.</p>
+    {rows.map((row) => <p key={row.name}><strong>{row.name}</strong> — {row.status}. {row.detail}</p>)}
+    {problems.length > 0 ? <div role="alert"><p>These values switch a source off until they are fixed:</p>{problems.map((problem) => <p key={problem}>{problem}</p>)}</div> : null}
+  </section>;
+}
+
 function AiSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const [selection, setSelection] = useState<AiOverride>(null);
@@ -1866,6 +1872,7 @@ function AiSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.settingsSection({ id: "sources", title: "Sources", component: SourcesSettings });
   app.slots.settingsSection({ id: "ai-focus", title: "AI & focus", component: AiSettings });
   app.slots.navPanel({
     headerContent: RadarHeader,

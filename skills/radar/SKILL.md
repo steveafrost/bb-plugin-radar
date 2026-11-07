@@ -8,12 +8,12 @@ description: Read or configure the Radar panel — live queues of pull requests 
 Radar polls a list of *lanes* (saved queries) and shows the current results in a
 bb panel. Radar stores only its own state in bb: lanes, focus, seen keys and review-thread links in plugin kv, and the label index, single-item hides, mention-acknowledgement tracking and a cache of the last results in its plugin database; every refresh is a live read from `gh api graphql` search (GitHub; GraphQL budget, not the 30/min REST search limit) and, when set up in settings, `dt api search/issues` (Delta, the primary host for repos like shop/world; `author:@me` resolves server-side) and, only when the history toggle is on, `gs api repos/<repo>/pulls` (read-only Gitstream history). Delta labels are indexed weekly so the LLM picks exact label names. Lanes skip sources that are not set up.
 
-The board names the sources checked successfully by each lane’s last search.
-Selected sources that are not configured show a setup notice and a link to
-Radar settings, even in collapsed lanes. In `status --json`, each lane result’s
-`checkedSources` lists successful reads, including reads with zero matches;
-older cached results may omit it until refreshed. An empty array means no source
-completed successfully. Current setup is reported separately in `hosts`.
+The board does not report per-lane source coverage. In `status --json`, each lane
+result’s `checkedSources` lists the sources that read successfully, including
+reads with zero matches; older cached results may omit it until refreshed. An
+empty array means no source completed successfully. Current setup is reported
+separately in `hosts`, and Settings → Plugins → Radar → Sources shows which
+sources are on and what each needs.
 
 ## Commands
 

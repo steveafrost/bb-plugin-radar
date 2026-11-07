@@ -16,9 +16,8 @@ shows whatever is current.
     the default lanes leave it out, and Radar never writes to it.
   A host that fails shows its error on the lane without hiding the others' items.
   Sources that are not set up are skipped, so the default lanes work with GitHub alone.
-  Each lane names the sources its last search checked successfully, including
-  searches with no matches. A selected source that is not configured shows a
-  setup notice and a link to Radar settings, even when the lane is collapsed.
+  **Settings → Plugins → Radar → Sources** reports which sources Radar can read
+  right now, and what is missing for the ones it cannot.
   Optional client-side filters refine the merged list.
 - **Track something**: describe what you want in plain English; a
   BB-configured model drafts a lane, Radar runs it once and shows the live
@@ -113,7 +112,7 @@ state and results cache are moved into the database on load and their kv keys de
 
 AI execution uses a BB build exposing `experimental_ai.complete`. On other hosts, the AI fallback (`aiBaseUrl` https only, `aiKeyEnv`, `aiModel`; all three required) sends the key from that bb server environment variable to that endpoint; with neither, Radar reports that AI is unavailable, disables AI drafting, and keeps heuristic repo/area matching and manual focus controls. API availability is not a claim that every selectable model supports text completion. Provider failures are surfaced. Focus also falls back to name matching after a provider error.
 
-Settings use an **AI & focus** section for model selection and label prefixes for **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**. The current SDK has neither grouped nor provider/model setting descriptors. Its picker currently requires a concrete value, so Radar wraps it in an optional, explicitly saved override editor rather than passing `null` to the host component.
+Settings use a **Sources** section that reports which sources Radar can read right now and what each one still needs, and an **AI & focus** section for model selection. Setting labels carry prefixes for **AI & focus**, **Sources**, **Refresh & retention**, and **Review workflows**. The current SDK has neither grouped nor provider/model setting descriptors. Its picker currently requires a concrete value, so Radar wraps it in an optional, explicitly saved override editor rather than passing `null` to the host component.
 
 ## Develop
 

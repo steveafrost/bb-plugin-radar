@@ -308,20 +308,6 @@
   opacity: 1;
 }
 
-.radar-lane__sources {
-  padding: 0 2px 2px 26px;
-  color: var(--r-muted);
-  font-size: var(--text-xs, 0.75rem);
-  overflow-wrap: anywhere;
-}
-.radar-lane__sources p {
-  margin: 0;
-}
-.radar-lane__sources .radar-lane__setup {
-  margin-top: 4px;
-  color: var(--r-text);
-}
-
 /* items */
 .radar-items {
   list-style: none;
