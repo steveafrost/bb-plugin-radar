@@ -30,6 +30,29 @@ describe("BB native completion", () => {
     expect(fn).toHaveBeenCalledExactlyOnceWith({ prompt: "prompt", system: "system", providerId: "chosen", model: "chosen-model", maxTokens: 400, timeoutMs: 45000, signal });
   });
 
+  it("forwards reasoningLevel in experimental_ai.complete when set", async () => {
+    const fn = vi.fn<AiHost["experimental_ai"]["complete"]>().mockResolvedValue(result);
+    await complete(
+      { experimental_ai: { complete: fn } },
+      { providerId: "chosen", model: "chosen-model", reasoningLevel: "xhigh" },
+      "system",
+      "prompt",
+      400,
+      45000,
+      signal,
+    );
+    expect(fn).toHaveBeenCalledExactlyOnceWith({
+      prompt: "prompt",
+      system: "system",
+      providerId: "chosen",
+      model: "chosen-model",
+      reasoningLevel: "xhigh",
+      maxTokens: 400,
+      timeoutMs: 45000,
+      signal,
+    });
+  });
+
   it("surfaces provider failures and rejects empty responses", async () => {
     const fn = vi.fn<AiHost["experimental_ai"]["complete"]>().mockRejectedValue(new Error("Unsupported model"));
     const host = { experimental_ai: { complete: fn } };
@@ -41,6 +64,12 @@ describe("BB native completion", () => {
   it("validates optional overrides and rejects incomplete or legacy credential settings", () => {
     expect(aiOverrideSchema.parse(null)).toBeNull();
     expect(aiOverrideSchema.parse({ providerId: " p ", model: " m " })).toEqual({ providerId: "p", model: "m" });
+    expect(aiOverrideSchema.parse({ providerId: " p ", model: " m ", reasoningLevel: " high " })).toEqual({
+      providerId: "p",
+      model: "m",
+      reasoningLevel: "high",
+    });
+    expect(aiOverrideSchema.safeParse({ providerId: "p", model: "m", reasoningLevel: "   " }).success).toBe(false);
     expect(aiOverrideSchema.safeParse({ providerId: "p" }).success).toBe(false);
     expect(aiOverrideSchema.safeParse({ providerId: "p", model: "m", aiKeyEnv: "KEY" }).success).toBe(false);
   });
@@ -74,7 +103,40 @@ describe("fallback endpoint for hosts without experimental_ai", () => {
     const [url, init] = fetchImpl.mock.calls[0]!;
     expect(url).toBe("https://proxy.example.com/v1/chat/completions");
     expect((init!.headers as Record<string, string>).authorization).toBe("Bearer secret");
-    expect(JSON.parse(init!.body as string)).toMatchObject({ model: "fallback-model", max_tokens: 300, messages: [{ role: "system", content: "sys" }, { role: "user", content: "prompt" }] });
+    const body = JSON.parse(init!.body as string);
+    expect(body).toMatchObject({
+      model: "fallback-model",
+      max_tokens: 300,
+      messages: [
+        { role: "system", content: "sys" },
+        { role: "user", content: "prompt" },
+      ],
+    });
+    expect("reasoning_effort" in body).toBe(false);
+  });
+
+  it("includes reasoning_effort in fallback requests when reasoningLevel is set", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(ok("drafted"));
+    await expect(
+      complete(
+        Object.create(null),
+        { providerId: "p", model: "m", reasoningLevel: "high" },
+        "sys",
+        "prompt",
+        300,
+        45000,
+        signal,
+        fallback,
+        env,
+        fetchImpl,
+      ),
+    ).resolves.toBe("drafted");
+    const [, init] = fetchImpl.mock.calls[0]!;
+    expect(JSON.parse(init!.body as string)).toMatchObject({
+      model: "fallback-model",
+      reasoning_effort: "high",
+      max_tokens: 300,
+    });
   });
 
   it("reports HTTP errors and empty answers", async () => {

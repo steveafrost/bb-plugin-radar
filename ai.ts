@@ -4,6 +4,7 @@ import { z } from "zod";
 export const aiOverrideSchema = z.object({
   providerId: z.string().trim().min(1).max(200),
   model: z.string().trim().min(1).max(300),
+  reasoningLevel: z.string().trim().min(1).max(40).optional(),
 }).strict().nullable();
 export type AiOverride = z.infer<typeof aiOverrideSchema>;
 export const AI_UNSUPPORTED = "This BB host does not support configured-provider text completion. A development build with experimental_ai.complete is required, or set the AI fallback endpoint, key variable and model. Focus still supports repo/area name matching and manual controls.";
@@ -65,9 +66,27 @@ export async function complete(
 ): Promise<string> {
   const backend = aiBackend(bb, fallback, env);
   if (backend === null) throw new Error(aiDetail(bb, fallback, env));
-  const text = backend === "bb"
-    ? (await bb.experimental_ai.complete({ prompt, system, ...(override ?? {}), maxTokens, timeoutMs, signal })).text
-    : await completeFallback(fallback!, env[fallback!.keyEnv]!, system, prompt, maxTokens, timeoutMs, signal, fetchImpl);
+  const bbOverride = override
+    ? {
+        providerId: override.providerId,
+        model: override.model,
+        ...(override.reasoningLevel ? { reasoningLevel: override.reasoningLevel } : {}),
+      }
+    : {};
+  const text =
+    backend === "bb"
+      ? (await bb.experimental_ai.complete({ prompt, system, ...bbOverride, maxTokens, timeoutMs, signal })).text
+      : await completeFallback(
+          fallback!,
+          env[fallback!.keyEnv]!,
+          system,
+          prompt,
+          maxTokens,
+          timeoutMs,
+          signal,
+          fetchImpl,
+          override?.reasoningLevel,
+        );
   if (!text.trim()) throw new Error("BB returned an empty AI answer.");
   return text;
 }
@@ -81,6 +100,7 @@ async function completeFallback(
   timeoutMs: number,
   signal: AbortSignal,
   fetchImpl: typeof fetch,
+  reasoningLevel?: string,
 ): Promise<string> {
   const timeout = AbortSignal.timeout(timeoutMs);
   let response: Response;
@@ -93,6 +113,7 @@ async function completeFallback(
         model: fallback.model,
         temperature: 0,
         max_tokens: maxTokens,
+        ...(reasoningLevel ? { reasoning_effort: reasoningLevel } : {}),
         messages: [
           { role: "system", content: system },
           { role: "user", content: prompt },

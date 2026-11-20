@@ -140,8 +140,6 @@ function useRadar() {
   return { rpc, snapshot, error, setError, mutate, call, optimistic };
 }
 
-// ---------------------------------------------------------------------------
-
 /** "Describe what to track" box visibility, shared by the title-bar sparkle and the board. */
 const trackBox = (() => {
   let open = false;
@@ -515,9 +513,6 @@ function viewTotals(snapshot: RadarSnapshot | null): Record<View, { items: numbe
   return Object.fromEntries(VIEWS.map((view) => [view, total(view)])) as Record<View, { items: number; fresh: number; hidden: number }>;
 }
 
-// ---------------------------------------------------------------------------
-// Focus filter: hide repos (and area-repo areas) across every lane and view.
-
 function ScopeRow({
   entry,
   child,
@@ -733,7 +728,6 @@ function ScopeGroup({ entry, onOp }: { entry: ScopeEntry; onOp: (op: ScopeOp, ke
   );
 }
 
-// ---------------------------------------------------------------------------
 // The just-hidden item's Undo lives in the title bar (navPanel headerContent), a separate
 // component from the board, so the board publishes it through this small store.
 
@@ -762,7 +756,6 @@ function RadarHeader() {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Items hidden one by one (row "Hide from Radar"); separate from Focus, which hides repos/areas.
 
 function HiddenControl({
@@ -984,8 +977,6 @@ function LaneCard({
   );
 }
 
-// ---------------------------------------------------------------------------
-
 /** Label/value row. `tip` is the help text, shown on hover over the label. */
 function Row({ label, tip, children, note }: { label: string; tip?: string; children: React.ReactNode; note?: React.ReactNode }) {
   return (
@@ -1025,7 +1016,7 @@ function TokenInput({ value, onChange, placeholder, label }: { value: string[]; 
         placeholder={value.length ? "" : placeholder}
         onChange={(event) => (event.target.value.includes(",") ? commit(event.target.value) : setText(event.target.value))}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && text.trim()) {
+          if (event.key === "Enter" && !event.nativeEvent.isComposing && text.trim()) {
             event.preventDefault();
             commit(text);
           } else if (event.key === "Backspace" && text === "" && value.length) {
@@ -1298,8 +1289,6 @@ function LaneEditor({
   );
 }
 
-// ---------------------------------------------------------------------------
-
 function TrackBox({
   aiAvailable,
   aiDetail,
@@ -1340,7 +1329,7 @@ function TrackBox({
         }
         onChange={(event) => setText(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
             submit();
           }
@@ -1403,8 +1392,6 @@ function DraftPreview({
     </section>
   );
 }
-
-// ---------------------------------------------------------------------------
 
 /** Keep Tab inside a sheet; the board behind it is only dimmed. */
 function trapTab(event: React.KeyboardEvent<HTMLDivElement>) {
@@ -1580,7 +1567,7 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
         (await rpc.call(check ? "radar_slack_check" : "radar_slack_context", { key: item.key })) as SlackContextView,
       postSlack: async (item: RadarItem, thread: string) => (await rpc.call("radar_slack_post", { key: item.key, thread })).url,
     }),
-    [snapshot, slackNone, navigate, call, rpc, mutate, optimistic],
+    [snapshot, slackNone, navigate, call, rpc, optimistic],
   );
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [editing, setEditing] = useState<Draft | null>(null);
@@ -1853,22 +1840,54 @@ function AiSettings() {
     }
   }
   const [draft, setDraft] = useState<ExperimentalProviderModelPickerValue>({ providerId: "", model: "", reasoningLevel: "medium" });
-  return <section>
-    <p>Draft lanes and interpret focus using BB’s configured providers. On BB builds without that, Radar uses the AI fallback settings (endpoint, key variable, model).</p>
-    <p>{selection ? `${selection.providerId} / ${selection.model}` : "Use BB default"}</p>
-    <p>{status}</p>
-    <button className="radar-btn" disabled={!ready || saving} onClick={() => {
-      setDraft({ providerId: selection?.providerId ?? "", model: selection?.model ?? "", reasoningLevel: "medium" });
-      setEditing(true);
-    }}>Choose override</button>
-    {selection ? <button className="radar-btn" disabled={saving} onClick={() => void save(null)}>Use BB default</button> : null}
-    {editing ? <div>
-      <ProviderModelPicker value={draft} onChange={setDraft} disabled={saving} />
-      <button className="radar-btn" disabled={saving || !draft.providerId || !draft.model} onClick={() => void save({ providerId: draft.providerId, model: draft.model })}>Save override</button>
-      <button className="radar-btn" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
-    </div> : null}
-    {error ? <p role="alert">{error}</p> : null}
-  </section>;
+  return (
+    <section>
+      <p>Draft lanes and interpret focus using BB’s configured providers. On BB builds without that, Radar uses the AI fallback settings (endpoint, key variable, model).</p>
+      <p>
+        {selection
+          ? `${selection.providerId} / ${selection.model}${selection.reasoningLevel ? ` (${selection.reasoningLevel})` : ""}`
+          : "Use BB default"}
+      </p>
+      <p>{status}</p>
+      <button
+        className="radar-btn"
+        disabled={!ready || saving}
+        onClick={() => {
+          setDraft({
+            providerId: selection?.providerId ?? "",
+            model: selection?.model ?? "",
+            reasoningLevel:
+              (selection?.reasoningLevel as ExperimentalProviderModelPickerValue["reasoningLevel"] | undefined) ??
+              "medium",
+          });
+          setEditing(true);
+        }}
+      >
+        Choose override
+      </button>
+      {selection ? <button className="radar-btn" disabled={saving} onClick={() => void save(null)}>Use BB default</button> : null}
+      {editing ? (
+        <div>
+          <ProviderModelPicker value={draft} onChange={setDraft} disabled={saving} />
+          <button
+            className="radar-btn"
+            disabled={saving || !draft.providerId || !draft.model}
+            onClick={() =>
+              void save({
+                providerId: draft.providerId,
+                model: draft.model,
+                reasoningLevel: draft.reasoningLevel || undefined,
+              })
+            }
+          >
+            Save override
+          </button>
+          <button className="radar-btn" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+        </div>
+      ) : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </section>
+  );
 }
 
 export default definePluginApp((app) => {
