@@ -122,7 +122,7 @@ npx tsc --noEmit
 bb plugin build . && bb plugin reload radar
 ```
 
-The installed SDK is 0.6.37. `types/bb-ai-preview.d.ts` narrowly augments it with the new completion interfaces generated from the local BB SDK source; remove this shim when the published SDK includes the contract. No SDK lockfile bump is needed. Runtime support is feature-detected; a successful plugin build does not add host support.
+The plugin targets BB 0.49 or newer and Plugin SDK 0.6.132. The SDK does not declare the preview completion API, so `types/bb-ai-preview.d.ts` supplies that contract. Radar still detects completion support at runtime. An AI override can include a reasoning level.
 
 ## Setup
 

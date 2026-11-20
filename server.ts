@@ -197,10 +197,6 @@ class ToolAborted extends UserError {
   }
 }
 
-// ---------------------------------------------------------------------------
-// RPC contract (types shared with app.tsx)
-// ---------------------------------------------------------------------------
-
 const itemSchema = z.object({
   key: z.string(),
   source: z.enum(["gitstream", "delta", "github"]),
@@ -377,22 +373,20 @@ export const rpcContract = defineRpcContract({
 
 export type DraftResult = { lane: Lane; preview: LaneResult };
 
-// ---------------------------------------------------------------------------
-
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     refreshSeconds: {
       type: "number",
       label: "Refresh & retention · Refresh interval in seconds (min 30)",
       default: 90,
-      experimental_schema: z.number().finite().min(30),
+      experimental_schema: z.number().min(30),
     },
     maxAgeDays: {
       type: "number",
       label: "Refresh & retention · Maximum age in days (0 = no limit)",
       description: "Hide items not updated within this many days in every lane.",
       default: DEFAULT_MAX_AGE_DAYS,
-      experimental_schema: z.number().finite().int().min(0).max(3650),
+      experimental_schema: z.number().int().min(0).max(3650),
     },
     ghPath: { type: "string", label: "Sources · GitHub CLI executable", default: "gh" },
     deltaHost: { type: "string", label: "Sources · Delta host name (e.g. delta.example.com)", default: "" },
@@ -481,7 +475,7 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Slack context · Minutes between Slack sweeps (min 10)",
       description: "Each sweep checks a few issues, least recently checked first, to stay inside Slack's rate limits.",
       default: 30,
-      experimental_schema: z.number().finite().min(10).max(1440),
+      experimental_schema: z.number().min(10).max(1440),
     },
   });
   type Config = {
@@ -605,8 +599,6 @@ export default async function plugin(bb: BbPluginApi) {
       return null;
     }
   };
-
-  // ---- persisted configuration -------------------------------------------
 
   async function loadLanes(): Promise<Lane[]> {
     const stored = await bb.storage.kv.get<unknown>("lanes");
@@ -776,8 +768,6 @@ export default async function plugin(bb: BbPluginApi) {
   /** Repo → project last chosen in the review composer; beats remote-URL matching. */
   let reviewProjects: Record<string, string> =
     (await bb.storage.kv.get<Record<string, string>>("reviewProjects")) ?? {};
-
-  // ---- live state ---------------------------------------------------------
 
   const results: Record<string, LaneResult> = {};
   let fetchedAt = "";
@@ -1294,8 +1284,6 @@ export default async function plugin(bb: BbPluginApi) {
     return inFlight;
   }
 
-  // ---- AI drafting --------------------------------------------------------
-
   async function chat(system: string, user: string, maxTokens: number): Promise<string> {
     try {
       return await complete(bb, aiOverride, system, user, maxTokens, AI_TIMEOUT_MS, controller.signal, aiFallback());
@@ -1357,8 +1345,6 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return { lane, preview };
   }
-
-  // ---- mutations ----------------------------------------------------------
 
   async function upsertLane(input: unknown): Promise<RadarSnapshot> {
     await putLane(input);
@@ -1723,8 +1709,6 @@ export default async function plugin(bb: BbPluginApi) {
     publish();
   }
 
-  // ---- rebase ---------------------------------------------------------------
-
   /**
    * Like `tool`, but a non-zero exit returns stdout+stderr for classification instead of throwing.
    * `detached` runs without the shutdown signal (cleanup that must still happen during a reload).
@@ -1915,8 +1899,6 @@ export default async function plugin(bb: BbPluginApi) {
     return { source, repo: parsed.repo, number: parsed.number };
   }
 
-  // ---- Slack context ------------------------------------------------------
-  //
   // A slow background sweep (its own service, so the board's 90s poll never waits on Slack):
   // a few open issues and PRs per sweep, least recently checked first, are searched for public
   // Slack messages that link them. Their threads are followed; when a thread has human messages
@@ -2115,7 +2097,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (stale.length > 0 && aiBackend(bb, aiFallback()) !== null) {
         summaryError = "";
         const setSummary = db.prepare("UPDATE slack_threads SET summary = ?, synced_ts = ? WHERE issue_key = ? AND channel_id = ? AND thread_ts = ?");
-        for (const thread of stale) {
+        const failures = new Map<SlackThreadRow, string>();
+        await pool(stale, async (thread) => {
           try {
             const text = unwrapText(await slackCall("slack_read_thread", { channel_id: thread.channel_id, ts: thread.thread_ts, message_ts: thread.thread_ts, response_format: "concise", limit: 200 }), "messages");
             const reply = parseSummaryReply(await chat(SUMMARY_SYSTEM, summaryPrompt(item, thread.summary, { channelName: thread.channel_name, text }, paths), 900));
@@ -2125,9 +2108,10 @@ export default async function plugin(bb: BbPluginApi) {
           } catch (error) {
             if (error instanceof ToolAborted || error instanceof SlackRateLimited || error instanceof SlackAuthError) throw error;
             // Keep the thread visible with its opening message; the summary catches up next check.
-            summaryError = error instanceof Error ? error.message : String(error);
+            failures.set(thread, error instanceof Error ? error.message : String(error));
           }
-        }
+        });
+        for (const thread of stale) summaryError = failures.get(thread) ?? summaryError;
       }
       saveSlackContext(item.key, { ...context, summaryError, updatedAt: gained ? new Date().toISOString() : context.updatedAt });
     });
@@ -2350,8 +2334,6 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
   });
-
-  // ---- CLI ------------------------------------------------------------------
 
   const usage = [
     "Usage:",

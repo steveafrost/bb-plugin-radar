@@ -172,8 +172,12 @@ const threadJson = z.object({
     text: z.string().optional(),
     user_name: z.string().optional(),
     reply_count: z.union([z.string(), z.number()]).optional(),
-  }).passthrough()).optional(),
-}).passthrough();
+          })
+          .loose(),
+      )
+      .optional(),
+  })
+  .loose();
 
 /** Newest human message in a slack_read_thread `format: "json"` answer; bots and joins don't count. */
 export function parseThreadJson(text: string): SlackThreadRead {
@@ -205,8 +209,6 @@ export function compareTs(a: string, b: string): number {
   return x === y ? 0 : x > y ? 1 : -1;
 }
 
-// ---- posting to the issue or PR ----------------------------------------------
-
 /** The comment body for "Post to issue/PR": heading, the thread's context, then a link to it. */
 export function renderComment(summary: string, sources: SlackSource[], date: string): string {
   const links = sources
@@ -220,8 +222,6 @@ export function renderComment(summary: string, sources: SlackSource[], date: str
     `<sub>From public Slack threads${links.length ? `: ${links.join(" · ")}` : ""}, as of ${date}.</sub>`,
   ].join("\n");
 }
-
-// ---- the AI draft ------------------------------------------------------------
 
 export const SUMMARY_SYSTEM = [
   "You summarise one public Slack thread that links an issue or pull request, for an engineer who did not see it.",
@@ -311,18 +311,21 @@ export function parseSummaryReply(text: string): { changed: boolean; summary: st
   return { changed: reply.data.changed && summary !== "", summary };
 }
 
-// ---- Tool Gateway (MCP over HTTP) --------------------------------------------
-
 export class SlackAuthError extends Error {}
 export class SlackRateLimited extends Error {}
 
-const rpcReply = z.object({
-  result: z.object({
-    content: z.array(z.object({ type: z.string(), text: z.string().optional() }).passthrough()).optional(),
+const rpcReply = z
+  .object({
+    result: z
+      .object({
+        content: z.array(z.object({ type: z.string(), text: z.string().optional() }).loose()).optional(),
     isError: z.boolean().optional(),
-  }).passthrough().optional(),
-  error: z.object({ message: z.string() }).passthrough().optional(),
-}).passthrough();
+      })
+      .loose()
+      .optional(),
+    error: z.object({ message: z.string() }).loose().optional(),
+  })
+  .loose();
 
 /** Reads a JSON-RPC answer sent either as JSON or as one server-sent `data:` event. */
 export function parseRpcBody(body: string, contentType: string): z.infer<typeof rpcReply> {

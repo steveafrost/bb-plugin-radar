@@ -32,6 +32,20 @@ const comment = body.extend({ id });
 const thread = z.object({ id, unread: z.boolean().optional(), subject: z.object({ url: z.string().nullable() }) });
 type Thread = z.infer<typeof thread>;
 const LIMIT = 1000;
+const SCAN_CONCURRENCY = 4;
+
+async function mapLimit<T, R>(values: readonly T[], limit: number, work: (value: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(values.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (next < values.length) {
+      const index = next++;
+      out[index] = await work(values[index]!);
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
 
 /** Pure state machine apart from the injected API. No clock, timers, disk, or network client.
  * Persist tracker.state after acknowledge AND reconcile (including error results).
@@ -94,17 +108,21 @@ export class MentionTracker {
       result[key] = { fingerprint: createHash("sha256").update(text ?? "").digest("hex"),
         mentioned: pattern.test(text ?? "") };
     };
-    add("body", body.parse(await this.api(issue, "GET")).body);
     const paths = [["comment", `${issue}/comments`]];
     if (item.kind === "pr") paths.push(
       ["review-comment", `${base}/pulls/${item.number}/comments`],
       ["review", `${base}/pulls/${item.number}/reviews`]);
-    for (const [prefix, path] of paths) {
-      for (const row of await this.pages(path!)) {
+    const [main, ...collections] = await Promise.all([
+      this.api(issue, "GET"),
+      ...paths.map(([, path]) => this.pages(path!)),
+    ]);
+    add("body", body.parse(main).body);
+    paths.forEach(([prefix], index) => {
+      for (const row of collections[index] as unknown[]) {
         const c = comment.parse(row);
         add(`${prefix}:${c.id}`, c.body);
       }
-    }
+    });
     return result;
   }
 
@@ -149,20 +167,33 @@ export class MentionTracker {
       this.current = new Set(items.map(i => i.key));
       const scanned = new Map<string, MentionItem>();
       const failed = new Set<string>();
-      for (const item of due) {
-        if (!this.current.has(item.key)) continue;
-        try {
-          if (!/^[\w.-]+\/[\w.-]+$/.test(item.repo) || !Number.isSafeInteger(item.number) || item.number < 1
-            || !["pr", "issue"].includes(item.kind) || !item.key) throw new Error("Invalid candidate");
-          const content = await this.scan(item, login);
-          const e = account.items[item.key] ??= { generation: 0, acknowledged: 0,
-            content: {}, pending: null, readBarrier: false };
-          const fresh = Object.entries(content).some(([key, c]) => c.mentioned && !e.content[key]?.mentioned);
-          if (fresh) { e.generation++; e.pending = null; }
-          // Preserve tombstones: a temporarily missing/deleted ID is not a new ID.
-          Object.assign(e.content, content);
-          scanned.set(item.key, item);
-        } catch (error) { failed.add(item.key); errors.push(`${item.key}: ${String(error)}`); }
+      const outcomes = await mapLimit(
+        due.filter((item) => this.current.has(item.key)),
+        SCAN_CONCURRENCY,
+        async (item) => {
+          try {
+            if (!/^[\w.-]+\/[\w.-]+$/.test(item.repo) || !Number.isSafeInteger(item.number) || item.number < 1
+              || !["pr", "issue"].includes(item.kind) || !item.key) throw new Error("Invalid candidate");
+            return { item, content: await this.scan(item, login) };
+          } catch (error) {
+            return { item, error };
+          }
+        },
+      );
+      for (const outcome of outcomes) {
+        const { item } = outcome;
+        if ("error" in outcome) {
+          failed.add(item.key);
+          errors.push(`${item.key}: ${String(outcome.error)}`);
+          continue;
+        }
+        const e = account.items[item.key] ??= { generation: 0, acknowledged: 0,
+          content: {}, pending: null, readBarrier: false };
+        const fresh = Object.entries(outcome.content).some(([key, c]) => c.mentioned && !e.content[key]?.mentioned);
+        if (fresh) { e.generation++; e.pending = null; }
+        // Preserve tombstones: a temporarily missing/deleted ID is not a new ID.
+        Object.assign(e.content, outcome.content);
+        scanned.set(item.key, item);
       }
       // Tracked, current items whose scan did not fail this cycle (unchanged ones keep their generation).
       const handled = items.filter(i => !failed.has(i.key) && Object.hasOwn(account.items, i.key));
@@ -204,6 +235,8 @@ export class MentionTracker {
       const message = String(error);
       if (this.account) this.account.error = message;
       return { visibleKeys: items.filter(i => this.metadata(i.key).canAck).map(i => i.key), error: message, scannedKeys: [] };
-    } finally { this.running = false; }
+    } finally {
+      this.running = false;
+    }
   }
 }

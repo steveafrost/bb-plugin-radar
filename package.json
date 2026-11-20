@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-radar",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "private": true,
   "description": "Live queues of the PRs and issues that need you on GitHub and Delta (plus optional read-only Gitstream history), with one-click review threads.",
@@ -14,8 +14,8 @@
     "test": "vitest run"
   },
   "engines": {
-    "bb": ">=0.46",
-    "bbPluginSdk": ">=0.6.37"
+    "bb": ">=0.49",
+    "bbPluginSdk": ">=0.6.132"
   },
   "bb": {
     "name": "Radar",
@@ -30,10 +30,10 @@
     ]
   },
   "dependencies": {
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.6.37",
+    "@get-bb/plugin-sdk": "0.6.132",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "better-sqlite3": "12.11.1",

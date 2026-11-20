@@ -7,6 +7,7 @@ export interface ExperimentalPluginAiCompleteInput {
   system?: string;
   providerId?: string;
   model?: string;
+  reasoningLevel?: string;
   maxTokens?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
