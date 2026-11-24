@@ -1787,26 +1787,43 @@ function RadarPage({ subPath }: PluginNavPanelProps) {
 function SourcesSettings() {
   const { values, isLoading } = useSettings();
   if (values === undefined) return <section>{isLoading ? <p>Loading…</p> : <p>Settings unavailable.</p>}</section>;
-  // The panel reads the same settings the server does, so a status here can never disagree with what lanes see.
-  const { hosts: current, problems } = readHosts(values as HostSettings);
-  const deltaName = current.delta?.label ?? SOURCE_LABEL.delta;
-  const gitstreamName = current.gitstream?.label ?? SOURCE_LABEL.gitstream;
-  const rows: { name: string; status: string; detail: string }[] = [
-    { name: SOURCE_LABEL.github, status: "On", detail: "Reads github.com with the GitHub CLI." },
-    current.delta !== null
-      ? { name: deltaName, status: "On", detail: `Reads ${current.delta.repo} with dt --host ${current.delta.host}.` }
-      : { name: deltaName, status: "Off", detail: "Set the Delta host name and repo below to read a Delta repository." },
-    current.gitstream !== null
-      ? { name: gitstreamName, status: "On", detail: `Reads ${current.gitstream.repo} with gs as read-only history.` }
-      : values.gitstreamHistory !== true
-        ? { name: gitstreamName, status: "Off", detail: "Turn on the Gitstream history toggle below to read old Gitstream PRs." }
-        : { name: gitstreamName, status: "Off", detail: "Set the Gitstream history repo and web URL below to finish turning it on." },
+  // Use current settings, not labels from the board's last snapshot.
+  const { hosts: { delta, gitstream }, problems } = readHosts(values as HostSettings);
+  const gitstreamHint =
+    values.gitstreamHistory === true
+      ? "Set the Gitstream history repo and web URL to finish turning it on."
+      : "Turn on the Gitstream history toggle to read old Gitstream PRs.";
+  const rows: { id: Source; name: string; enabled: boolean; detail: string }[] = [
+    { id: "github", name: SOURCE_LABEL.github, enabled: true, detail: "Reads github.com with the GitHub CLI." },
+    {
+      id: "delta",
+      name: delta?.label ?? "Delta",
+      enabled: delta !== null,
+      detail: delta
+        ? `Reads ${delta.repo} with dt --host ${delta.host}.`
+        : "Set the Delta host name and repo to read a Delta repository.",
+    },
+    {
+      id: "gitstream",
+      name: gitstream?.label ?? "Gitstream history",
+      enabled: gitstream !== null,
+      detail: gitstream ? `Reads ${gitstream.repo} with gs as read-only history.` : gitstreamHint,
+    },
   ];
-  return <section>
-    <p>Lanes read GitHub always, and Delta and Gitstream history once each is set up below. A lane that names a source which is not set up skips it silently.</p>
-    {rows.map((row) => <p key={row.name}><strong>{row.name}</strong> — {row.status}. {row.detail}</p>)}
-    {problems.length > 0 ? <div role="alert"><p>These values switch a source off until they are fixed:</p>{problems.map((problem) => <p key={problem}>{problem}</p>)}</div> : null}
-  </section>;
+  return (
+    <section>
+      <p>GitHub is always enabled. Lanes skip Delta and Gitstream history until each is configured.</p>
+      {rows.map((row) => (
+        <p key={row.id}><strong>{row.name}</strong> — {row.enabled ? "On" : "Off"}. {row.detail}</p>
+      ))}
+      {problems.length > 0 ? (
+        <div role="alert">
+          <p>Fix these settings to finish setup:</p>
+          {problems.map((problem) => <p key={problem}>{problem}</p>)}
+        </div>
+      ) : null}
+    </section>
+  );
 }
 
 function AiSettings() {
