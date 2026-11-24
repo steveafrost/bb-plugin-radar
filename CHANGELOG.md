@@ -2,6 +2,15 @@
 
 Notable changes to Radar, newest first. Source releases are tagged `vX.Y.Z`.
 
+## 0.5.6 (2026-11-24)
+
+### Fixed
+
+- The **Sources** settings section uses stable source IDs as row keys, so custom labels can match without collisions. When a source is off, the section shows its default name instead of a label from the last board refresh.
+- The **Sources** setup instructions match BB’s settings layout and no longer point to fields below the section.
+
+This version matches the Shopify Marketplace Radar 0.5.6 release.
+
 ## 0.5.5 (2026-11-19)
 
 ### Added
